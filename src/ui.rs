@@ -14,7 +14,11 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::actions_log::{Kind, ParsedLog, ansi_spans};
-use crate::app::{Action, App, DetailRow, LogView, RepoItem, Tab, TreeNode, repo_items, ComposeKind, Focus, Hits, Modal, Screen, ToastKind, scope_matches};
+use crate::app::{
+    Action, App, ComposeKind, DetailRow, Focus, Hits, Item, LogView, Marks, Modal, RepoItem, Screen, Tab, ToastKind, TreeNode, repo_items,
+    scope_matches, search_items,
+};
+use crate::search::Command;
 use crate::state::Density;
 use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, WorkflowRunInfo, login_of};
 use crate::images::{self, ImagePlacement, ImageStore, Look};
@@ -82,6 +86,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Modal::Composer(_)) => draw_composer(f, app),
         Some(Modal::Help) => draw_help(f, app),
         Some(Modal::Image { .. }) => draw_image_modal(f, app),
+        Some(Modal::Search) => draw_search(f, app),
         None => {}
     }
     sanitize(f.buffer_mut());
@@ -339,14 +344,21 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let w = repo_label.width() as u16;
     app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::OpenRepos));
     spans.push(Span::styled(repo_label, Style::new().fg(Color::Blue).bold().add_modifier(Modifier::UNDERLINED)));
+    x += w;
     if app.repo.is_some() {
-        app.hits.buttons.push((Rect::new(x + w, area.y, 3, 1), Action::SetRepo(None)));
+        app.hits.buttons.push((Rect::new(x, area.y, 3, 1), Action::SetRepo(None)));
         spans.push(Span::styled(" ✕ ", Style::new().fg(Color::Black).bg(Color::Blue)));
+        x += 3;
     }
+    spans.push(Span::raw(" "));
+    x += 1;
+    let search_label = " ⌕ Search ";
+    app.hits.buttons.push((Rect::new(x, area.y, search_label.width() as u16, 1), Action::OpenSearch));
+    spans.push(Span::styled(search_label, Style::new().fg(Color::Magenta).bold().add_modifier(Modifier::UNDERLINED)));
     spans.push(Span::raw("  "));
 
     let shown = app.visible().len();
-    let count = if !app.filter.is_empty() {
+    let count = if app.search.pinned.is_some() {
         format!("{shown} matching of {}", app.prs.len())
     } else if app.total > app.prs.len() {
         format!("{} of {} PRs", app.prs.len(), app.total)
@@ -406,14 +418,21 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         let hint = if s.input { "   Enter jump · Esc clear" } else { "   n / N next / previous · Ctrl+F edit · Esc clear" };
         spans.push(Span::styled(hint, Style::new().fg(DIM)));
         Line::from(spans)
-    } else if app.filter_input || !app.filter.is_empty() {
-        let mut spans = vec![Span::styled(" / ", Style::new().fg(ACCENT).bold()), Span::raw(app.filter.clone())];
-        if app.filter_input {
-            spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
-            spans.push(Span::styled("   Enter keep · Esc clear", Style::new().fg(DIM)));
-        } else {
-            spans.push(Span::styled("   (Esc to clear filter)", Style::new().fg(DIM)));
-        }
+    } else if let Some(p) = app.search.pinned.clone() {
+        // The pinned query: click it to edit, ✕ to clear.
+        let shown = app.visible().len();
+        let esc = if app.screen == Screen::List { " · Esc clears" } else { "" };
+        let spans = vec![
+            Span::styled(" / ", Style::new().fg(ACCENT).bold()),
+            Span::styled(truncate(&p, 48), Style::new().bold()),
+            Span::styled(format!("   {shown} of {} · click to edit{esc} ", app.prs.len()), Style::new().fg(DIM)),
+        ];
+        let w = spans.iter().map(|s| s.width()).sum::<usize>() as u16;
+        app.hits.buttons.push((Rect::new(area.x, area.y, w.min(area.width), 1), Action::EditSearch));
+        app.hits.buttons.push((Rect::new(area.x + w + 1, area.y, 3, 1), Action::ClearSearch));
+        let mut spans = spans;
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" ✕ ", Style::new().fg(Color::Black).bg(ACCENT)));
         Line::from(spans)
     } else {
         Line::from(Span::styled(format!(" {}", app.search_query()), Style::new().fg(DIM)))
@@ -442,13 +461,20 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Esc", "Close (keeps draft)", Action::ModalCancel),
         ],
         (Some(Modal::Image { .. }), _) => vec![("o", "Browser", Action::ModalPick(0)), ("y", "Copy URL", Action::ModalPick(1)), ("Esc", "Close", Action::ModalCancel)],
+        (Some(Modal::Search), _) => vec![
+            ("↵", "Open", Action::SearchEnter),
+            ("^F", "Filter list", Action::PinSearch),
+            ("^G", "GitHub", Action::SearchGitHub),
+            ("Tab", "Complete", Action::SearchComplete),
+            ("Esc", "Close", Action::ModalCancel),
+        ],
         (Some(_), _) => vec![("Enter", "Select", Action::ModalPick(usize::MAX)), ("Esc", "Close", Action::ModalCancel)],
         (None, Screen::List) => vec![
             ("↵", "Open", Action::OpenSelected),
             ("s", "Scope", Action::OpenScopes),
             ("S", "Repo", Action::OpenRepos),
             ("f", "State", Action::CycleState),
-            ("/", "Filter", Action::StartFilter),
+            ("/", "Search", Action::OpenSearch),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("o", "Browser", Action::Browser),
@@ -460,6 +486,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Esc", "Back", Action::ActionsBack),
             ("Tab", "Switch pane", Action::ToggleFocus),
             ("[ ]", "Tabs", Action::NextTab),
+            ("/", "Search", Action::OpenSearch),
             ("↵", "Fold / show", Action::TreeToggle),
             ("O", "Run in browser", Action::TreeOpenBrowser),
             ("^F", "Search log", Action::LogSearch),
@@ -474,6 +501,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Esc", "Back", Action::Back),
             ("Tab", "Switch pane", Action::ToggleFocus),
             ("[ ]", "Tabs", Action::NextTab),
+            ("/", "Search", Action::OpenSearch),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("a", "Approve", Action::Approve),
@@ -507,8 +535,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             vec![Line::styled(format!("Failed to load PRs: {e}"), Style::new().fg(Color::Red)), Line::raw(""), Line::raw("Press r to retry")]
         } else if app.loading_list {
             vec![Line::styled(format!("{} Loading pull requests…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT))]
-        } else if !app.filter.is_empty() {
-            vec![Line::raw(format!("No PRs match “{}”", app.filter)), Line::styled("Esc clears the filter", Style::new().fg(DIM))]
+        } else if let Some(p) = &app.search.pinned {
+            vec![Line::raw(format!("No PRs match “{p}”")), Line::styled("Esc clears the search · / searches again (GitHub too)", Style::new().fg(DIM))]
         } else if let Some(r) = &app.repo {
             vec![
                 Line::raw(format!("No pull requests for {} in {r}.", app.scopes[app.scope].name)),
@@ -527,16 +555,30 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let density = app.state.density;
+    // Highlight the pinned query's hits, on the rows that can be on screen only.
+    let pinned = app.search.pinned_query();
+    let page = inner.height as usize;
+    let near = app.table_state.offset().min(app.sel).saturating_sub(page)..app.table_state.offset().max(app.sel) + 2 * page;
     let rows: Vec<Row> = vis
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(row, &i)| {
             let p = &app.prs[i];
+            let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, Some(60))).unwrap_or_default();
+            let title_style = if p.is_draft { Style::new().fg(Color::Gray) } else { Style::new() };
+            let mut title = hl_spans(&p.title, &mk.title, |_| title_style, usize::MAX);
+            if body_only(&mk)
+                && let Some((text, ranges)) = &mk.snippet
+            {
+                title.push(Span::styled(" · ", Style::new().fg(DIM)));
+                title.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), usize::MAX));
+            }
             Row::new(vec![
                 Cell::from(Line::from(vec![Span::raw(" "), state_icon(&p.state, p.is_draft)])),
-                Cell::from(Span::styled(p.repository.name_with_owner.clone(), Style::new().fg(Color::Blue))),
-                Cell::from(Span::styled(format!("#{}", p.number), Style::new().fg(DIM))),
-                Cell::from(Span::styled(p.title.clone(), if p.is_draft { Style::new().fg(Color::Gray) } else { Style::new() })),
-                Cell::from(login_of(&p.author).to_string()),
+                Cell::from(Line::from(hl_spans(&p.repository.name_with_owner, &mk.repo, |_| Style::new().fg(Color::Blue), usize::MAX))),
+                Cell::from(Line::from(number_spans(p.number, &mk.number))),
+                Cell::from(Line::from(title)),
+                Cell::from(Line::from(hl_spans(login_of(&p.author), &mk.author, |_| Style::new(), usize::MAX))),
                 Cell::from(ci_icon(p.ci_state())),
                 Cell::from(review_span(p.review_decision.as_deref())),
                 Cell::from(
@@ -598,20 +640,22 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let w = inner.width.saturating_sub(2) as usize;
+    let pinned = app.search.pinned_query();
+    let page = inner.height as usize / app.state.density.sidebar_item_h();
+    let near = app.side_state.offset().min(app.sel).saturating_sub(page)..app.side_state.offset().max(app.sel) + 2 * page;
     let items: Vec<ListItem> = app
         .visible()
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(row, &i)| {
             let p = &app.prs[i];
+            let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, None)).unwrap_or_default();
             let num = format!("#{} ", p.number);
-            let l1 = Line::from(vec![
-                state_icon(&p.state, p.is_draft),
-                Span::raw(" "),
-                ci_icon(p.ci_state()),
-                Span::raw(" "),
-                Span::styled(num.clone(), Style::new().fg(DIM)),
-                Span::raw(truncate(&p.title, w.saturating_sub(4 + num.width()))),
-            ]);
+            let mut l1 = vec![state_icon(&p.state, p.is_draft), Span::raw(" "), ci_icon(p.ci_state()), Span::raw(" ")];
+            l1.extend(number_spans(p.number, &mk.number));
+            l1.push(Span::raw(" "));
+            l1.extend(hl_spans(&p.title, &mk.title, |_| Style::new(), w.saturating_sub(4 + num.width())));
+            let l1 = Line::from(l1);
             let meta = format!("    {} · {} · {}", p.repository.name_with_owner, login_of(&p.author), ago(&p.updated_at));
             let l2 = Line::styled(truncate(&meta, w), Style::new().fg(DIM));
             match app.state.density {
@@ -1716,7 +1760,6 @@ fn review_state_span(state: &str) -> Span<'static> {
 }
 
 /// One timeline entry: a header line and its rendered body.
-#[allow(clippy::too_many_arguments)]
 fn entry(rows: &mut Vec<DetailRow>, w: usize, author: &str, what: Span<'static>, ts: &str, body: &str, html: &str, img: &mut Imgs) {
     gap(rows);
     push_wrapped(
@@ -2606,7 +2649,8 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("e", "Toggle the filter to the selected PR's repository"),
         ("f / click state", "Cycle Open → Closed → Merged → All"),
         ("r  F5", "Refresh now (auto-refreshes in the background)"),
-        ("/", "Filter the loaded list by title, repo, author or #"),
+        ("/  click ⌕ Search", "Search PRs (#, title, description…), repos, commands"),
+        ("  Enter ^F ^G Tab Esc", "Open + filter · filter list · GitHub · complete · close"),
         ("o", "Open the selected PR in your browser"),
         ("y", "Copy `gh pr checkout` command to clipboard"),
         ("D / click ≡", "Display density: Comfortable → Cozy → Compact"),
@@ -2663,6 +2707,400 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     lines.push(Line::raw(""));
     lines.push(Line::styled(" press any key to close", Style::new().fg(DIM)));
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------- search ----------
+
+/// `text` cut to `max` columns, the chars at `idx` (sorted char indices) in the accent colour.
+fn hl_spans(text: &str, idx: &[u32], base: impl Fn(usize) -> Style, max: usize) -> Vec<Span<'static>> {
+    let cut = truncate(text, max);
+    let n = cut.chars().count();
+    let ellipsis = cut != text;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (i, c) in cut.chars().enumerate() {
+        let hit = !(ellipsis && i + 1 == n) && idx.binary_search(&(i as u32)).is_ok();
+        let st = if hit { base(i).fg(ACCENT).bold() } else { base(i) };
+        if cur.is_some_and(|s| s != st) {
+            spans.push(Span::styled(std::mem::take(&mut buf), cur.unwrap_or_default()));
+        }
+        cur = Some(st);
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, cur.unwrap_or_default()));
+    }
+    spans
+}
+
+fn ranges_idx(ranges: &[(usize, usize)]) -> Vec<u32> {
+    let mut v: Vec<u32> = ranges.iter().flat_map(|&(a, b)| a as u32..b as u32).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// `#123`, dim, with the typed digits highlighted.
+fn number_spans(number: u64, idx: &[u32]) -> Vec<Span<'static>> {
+    let shifted: Vec<u32> = idx.iter().map(|i| i + 1).collect();
+    hl_spans(&format!("#{number}"), &shifted, |_| Style::new().fg(DIM), usize::MAX)
+}
+
+/// Only the description matched (nothing to highlight in the row itself).
+fn body_only(m: &Marks) -> bool {
+    m.title.is_empty() && m.repo.is_empty() && m.number.is_empty() && m.author.is_empty() && m.snippet.is_some()
+}
+
+/// The palette input, each token coloured: filters accent, invalid ones red.
+fn search_input_spans(app: &App) -> Vec<Span<'static>> {
+    use crate::search::Token;
+    let q = app.search.query();
+    let raw = &app.search.text;
+    let mut spans = Vec::new();
+    if q.number_mode && !raw.trim_start().starts_with('#') {
+        spans.push(Span::styled("#", Style::new().fg(DIM)));
+    }
+    let mut at = 0;
+    for (t, r) in q.tokens.iter().zip(&q.spans) {
+        if r.start > at {
+            spans.push(Span::raw(raw[at..r.start].to_string()));
+        }
+        let style = match t {
+            Token::Invalid => Style::new().fg(Color::Red),
+            Token::Pending => Style::new().fg(ACCENT),
+            Token::Number(..) => Style::new().fg(Color::Yellow).bold(),
+            t if t.is_filter() => Style::new().fg(ACCENT).bold(),
+            _ => Style::new(),
+        };
+        spans.push(Span::styled(raw[r.clone()].to_string(), style));
+        at = r.end;
+    }
+    if at < raw.len() {
+        spans.push(Span::raw(raw[at..].to_string()));
+    }
+    spans
+}
+
+/// One PR row: marker, state (or `↗`), repo, #number, title, author · age on the right.
+fn search_pr_line(p: &PrSummary, mk: &Marks, lead: Span<'static>, repo_w: usize, w: usize, selected: bool, remote: bool) -> Line<'static> {
+    let mut spans = vec![Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT)), lead, Span::raw(" ")];
+    let nwo = &p.repository.name_with_owner;
+    let owner_len = nwo.find('/').map_or(0, |i| nwo[..i].chars().count() + 1);
+    let repo = hl_spans(nwo, &mk.repo, |i| if i < owner_len { Style::new().fg(DIM) } else { Style::new().bold() }, repo_w);
+    let repo_used: usize = repo.iter().map(|s| s.width()).sum();
+    spans.extend(repo);
+    spans.push(Span::raw(" ".repeat(repo_w.saturating_sub(repo_used) + 2)));
+    let num = number_spans(p.number, &mk.number);
+    let num_used: usize = num.iter().map(|s| s.width()).sum();
+    spans.extend(num);
+    spans.push(Span::raw(" ".repeat(7usize.saturating_sub(num_used))));
+    let mut right = format!("{} · {}", login_of(&p.author), ago(&p.updated_at));
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    let mut title_w = w.saturating_sub(used + right.width() + 2);
+    if title_w < 16 {
+        right.clear();
+        title_w = w.saturating_sub(used + 1);
+    }
+    let state = match (p.state.as_str(), p.is_draft) {
+        _ if !remote => "",
+        ("MERGED", _) => "  (merged)",
+        ("CLOSED", _) => "  (closed)",
+        (_, true) => "  (draft)",
+        _ => "",
+    };
+    let mut title = hl_spans(&p.title, &mk.title, |_| if p.is_draft { Style::new().fg(Color::Gray) } else { Style::new() }, title_w.saturating_sub(state.width()));
+    title.push(Span::styled(state, Style::new().fg(DIM)));
+    let title_used: usize = title.iter().map(|s| s.width()).sum();
+    spans.extend(title);
+    spans.push(Span::raw(" ".repeat(title_w.saturating_sub(title_used) + 1)));
+    spans.push(Span::styled(right, Style::new().fg(DIM)));
+    Line::from(spans)
+}
+
+/// Text plus a right-aligned dim note, padded to `w`.
+fn with_right(mut spans: Vec<Span<'static>>, right: String, w: usize) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    if used + right.width() + 1 <= w {
+        spans.push(Span::raw(" ".repeat(w - used - right.width())));
+        spans.push(Span::styled(right, Style::new().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+fn draw_search(f: &mut Frame, app: &mut App) {
+    let items = search_items(app);
+    let q = app.search.query();
+    let density = app.state.density;
+    let fa = f.area();
+    let w = 96.min(fa.width.saturating_sub(2));
+    let lw = w.saturating_sub(2) as usize;
+    let snippets = lw >= 60 && density != Density::Compact;
+    let spin = SPINNER[app.tick % SPINNER.len()];
+    let paused = app.search.paused_for();
+    let remote = app.current_remote(&q);
+    let scope_desc = {
+        let mut d = app.scopes[app.scope].name.clone();
+        if let Some(r) = &app.repo {
+            d = format!("{r} ({d})");
+        }
+        format!("{d} · {}", app.state_filter.label())
+    };
+    let typing = app.search.text.trim().to_string();
+
+    // Visual rows: (line, selectable index, clicking it selects).
+    let repo_w = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Pr { idx, .. } => Some(app.prs[*idx].repository.name_with_owner.width()),
+            Item::Remote { i, .. } => remote.and_then(|r| r.hits.get(*i)).map(|p| p.repository.name_with_owner.width()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(lw / 3);
+    let remote_rows = items.iter().filter(|it| matches!(it, Item::Remote { .. })).count();
+    // (line, its selectable index, or for a header the index its click highlights)
+    let mut rows: Vec<(Line<'static>, Option<usize>, Option<usize>)> = Vec::new();
+    let mut k = 0usize;
+    let mut first_section = true;
+    for it in &items {
+        let selectable = it.selectable();
+        let selected = selectable && k == app.search.sel;
+        let idx = selectable.then_some(k);
+        let mark = || Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT));
+        match it {
+            Item::Header(t) => {
+                if density == Density::Comfortable && !first_section {
+                    rows.push((Line::raw(""), None, None));
+                }
+                first_section = false;
+                let mut spans = vec![Span::styled(format!(" {t}"), Style::new().fg(ACCENT).bold())];
+                if t == "From GitHub" {
+                    match (remote, q.number()) {
+                        (Some(r), Some(n)) if r.loading => {
+                            spans.push(Span::styled(format!(" · {spin} looking up #{n} in {} repositories…", r.repos), Style::new().fg(ACCENT)));
+                        }
+                        (Some(r), _) if r.error.is_some() => {
+                            spans.push(Span::styled(format!(" · failed: {}", r.error.clone().unwrap_or_default()), Style::new().fg(Color::Red)));
+                        }
+                        (_, Some(_)) => spans.push(Span::styled(format!(" · {remote_rows} found"), Style::new().fg(DIM))),
+                        _ => spans.push(Span::styled(format!(" · {remote_rows} more"), Style::new().fg(DIM))),
+                    }
+                }
+                rows.push((Line::from(spans), None, Some(k)));
+            }
+            Item::Note(t) => rows.push((Line::styled(format!("   {t}"), Style::new().fg(DIM).italic()), None, None)),
+            Item::Pr { idx: i, m } => {
+                let p = &app.prs[*i];
+                let mk = app.marks(&q, *i, (snippets && m.body_hit.is_some()).then_some(lw.saturating_sub(8)));
+                rows.push((search_pr_line(p, &mk, state_icon(&p.state, p.is_draft), repo_w, lw, selected, false), idx, None));
+                if let Some((text, ranges)) = &mk.snippet {
+                    let mut spans = vec![Span::raw("     ")];
+                    spans.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), lw.saturating_sub(6)));
+                    rows.push((Line::from(spans), idx, None));
+                }
+            }
+            Item::Remote { i, m } => {
+                let Some(p) = remote.and_then(|r| r.hits.get(*i)) else { continue };
+                let mk = app.remote_marks(&q, *i, (snippets && m.body_hit.is_some()).then_some(lw.saturating_sub(8)));
+                rows.push((search_pr_line(p, &mk, Span::styled("↗", Style::new().fg(DIM)), repo_w, lw, selected, true), idx, None));
+                if let Some((text, ranges)) = &mk.snippet {
+                    let mut spans = vec![Span::raw("     ")];
+                    spans.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), lw.saturating_sub(6)));
+                    rows.push((Line::from(spans), idx, None));
+                }
+            }
+            Item::More(n) => {
+                let spans = vec![mark(), Span::styled(format!("  … {n} more loaded matches"), Style::new().fg(DIM).italic())];
+                rows.push((with_right(spans, "Enter / ^F filter the list ".into(), lw), idx, None));
+            }
+            Item::Repo { nwo, count } => {
+                let hl = crate::search::text_indices(&mut crate::search::matcher(), &q, nwo);
+                let owner_len = nwo.find('/').map_or(0, |i| nwo[..i].chars().count() + 1);
+                let mut spans = vec![mark(), Span::styled("◫ ", Style::new().fg(Color::Blue))];
+                spans.extend(hl_spans(nwo, &hl, |i| if i < owner_len { Style::new().fg(DIM) } else { Style::new().bold() }, lw.saturating_sub(24)));
+                let right = match count {
+                    Some(c) => format!("{c} PRs · filter "),
+                    None => "filter ".into(),
+                };
+                rows.push((with_right(spans, right, lw), idx, None));
+            }
+            Item::Scope(i) => {
+                let sc = &app.scopes[*i];
+                let hl = crate::search::text_indices(&mut crate::search::matcher(), &q, &sc.name);
+                let mut spans = vec![mark(), Span::styled(if *i == app.scope { "✓ " } else { "◉ " }, Style::new().fg(Color::Green))];
+                spans.extend(hl_spans(&sc.name, &hl, |_| Style::new().bold(), lw / 2));
+                spans.push(Span::styled(format!("  {}", truncate(&sc.qualifier, lw / 3)), Style::new().fg(DIM)));
+                rows.push((with_right(spans, "scope ".into(), lw), idx, None));
+            }
+            Item::Command { cmd, disabled } => {
+                let label = match (cmd, app.selected_detail()) {
+                    (Command::CloseOrReopen, Some(d)) if d.state == "CLOSED" => "Reopen pull request",
+                    (Command::CloseOrReopen, _) => "Close pull request",
+                    _ => cmd.label(),
+                };
+                let style = if disabled.is_some() { Style::new().fg(DIM) } else { Style::new().bold() };
+                let hl = crate::search::text_indices(&mut crate::search::matcher(), &q, cmd.label());
+                let hl = if label == cmd.label() { hl } else { Vec::new() };
+                let mut spans = vec![mark(), Span::styled("▸ ", Style::new().fg(ACCENT))];
+                spans.extend(hl_spans(label, &hl, |_| style, lw / 2));
+                if cmd.needs_pr()
+                    && let Some(p) = app.selected_pr()
+                {
+                    spans.push(Span::styled(format!("  #{}", p.number), Style::new().fg(DIM)));
+                }
+                if let Some(why) = disabled {
+                    spans.push(Span::styled(format!(" — {why}"), Style::new().fg(DIM).italic()));
+                }
+                let key = if cmd.key().is_empty() { String::new() } else { format!("{} ", cmd.key()) };
+                rows.push((with_right(spans, key, lw), idx, None));
+            }
+            Item::Recent(r) => {
+                let spans = vec![mark(), Span::styled("↺ ", Style::new().fg(DIM)), Span::raw(r.clone())];
+                rows.push((Line::from(spans), idx, None));
+            }
+            Item::SearchGitHub => {
+                let quoted = format!("“{}”", truncate(&typing, 32));
+                let incomplete = q.complete < q.tokens.len()
+                    && app.search.text.trim_end() == app.search.text
+                    && matches!(q.tokens.last(), Some(crate::search::Token::Term(..)));
+                let (text, style, right) = if let Some(why) = &app.search.blocked {
+                    (format!("↗ GitHub search off: {why}"), Style::new().fg(Color::Red), String::new())
+                } else if remote.is_some_and(|r| r.loading) {
+                    (format!("{spin} searching GitHub for {quoted} in {scope_desc}…"), Style::new().fg(ACCENT), String::new())
+                } else if let Some(e) = remote.and_then(|r| r.error.clone()) {
+                    (format!("↗ GitHub search failed: {e}"), Style::new().fg(Color::Red), "retry ^G ".into())
+                } else if let (Some(secs), true) = (paused, app.search.text.trim().chars().count() >= 3 && remote.is_none()) {
+                    (format!("⏳ GitHub search paused ({secs} s)"), Style::new().fg(Color::Yellow), "^G ".into())
+                } else if remote.is_some() && remote_rows == 0 {
+                    (format!("↗ Nothing more on GitHub for {quoted} in {scope_desc}"), Style::new().fg(DIM), "again ^G ".into())
+                } else if remote.is_some() {
+                    (format!("↗ Searched GitHub for {quoted} in {scope_desc}"), Style::new().fg(DIM), "again ^G ".into())
+                } else if incomplete && app.cfg.search.live && app.search.text.trim().chars().count() >= 3 {
+                    (format!("↗ Search GitHub for {quoted} — it matches whole words; pause, finish the word or ^G"), Style::new().fg(DIM), String::new())
+                } else {
+                    (format!("↗ Search GitHub for {quoted} in {scope_desc}"), Style::new(), "^G ".into())
+                };
+                let spans = vec![mark(), Span::styled(truncate(&text, lw.saturating_sub(right.width() + 3)), style)];
+                rows.push((with_right(spans, right, lw), idx, None));
+            }
+        }
+        if selectable {
+            k += 1;
+        }
+    }
+
+    // Box: anchored near the top so it grows downwards as results come in.
+    let rules = density.rules();
+    let chrome = 2 + 1 + 2 + if rules { 2 } else { 0 };
+    let max_h = (fa.height * 4 / 5).max(chrome + 3);
+    let h = (rows.len() as u16 + chrome).clamp(chrome + 3, max_h).min(fa.height);
+    let top = fa.y + (fa.height.saturating_sub(h) / 6).min(fa.height / 8).max(fa.height.saturating_sub(h).min(1));
+    let area = Rect::new(fa.x + (fa.width - w) / 2, top, w, h);
+    f.render_widget(Clear, area);
+    let block = modal_block("Search");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hits.modal = Some(area);
+    let rule_h = if rules { 1 } else { 0 };
+    let [input, sep1, list, sep2, keys, prefixes] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(rule_h),
+        Constraint::Min(1),
+        Constraint::Length(rule_h),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // Input line with the count (or the number-mode hint) on the right.
+    let mut spans = vec![Span::styled(" › ", Style::new().fg(ACCENT))];
+    let typed = search_input_spans(app);
+    let right = if q.number_mode {
+        "type a PR number · Enter opens an exact match ".to_string()
+    } else if q.is_empty() {
+        String::new()
+    } else {
+        let mut r = format!("{} of {}", app.palette_results().len(), app.prs.len());
+        if let Some((done, all)) = app.bodies_progress() {
+            r.push_str(&format!(" · {spin} {done}/{all}"));
+        } else if !app.cfg.search.bodies {
+            r.push_str(" · descriptions off");
+        }
+        r + " "
+    };
+    let typed_w: usize = typed.iter().map(|s| s.width()).sum();
+    let room = (input.width as usize).saturating_sub(4 + right.width());
+    if q.is_empty() && app.search.text.is_empty() {
+        spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+        spans.push(Span::styled("PRs, #numbers, repos, scopes, commands…", Style::new().fg(DIM)));
+    } else if typed_w > room {
+        // Long input: show its tail.
+        let text = app.search.text.clone();
+        let tail: String = text.chars().rev().scan(0, |acc, c| {
+            *acc += c.width().unwrap_or(0);
+            (*acc < (input.width as usize).saturating_sub(5)).then_some(c)
+        }).collect::<Vec<_>>().into_iter().rev().collect();
+        spans.push(Span::raw(format!("…{tail}")));
+        spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+    } else {
+        spans.extend(typed);
+        spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+    }
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    if used + right.width() <= input.width as usize {
+        spans.push(Span::raw(" ".repeat(input.width as usize - used - right.width())));
+        spans.push(Span::styled(right, Style::new().fg(DIM)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), input);
+    if rules {
+        f.render_widget(Paragraph::new("─".repeat(sep1.width as usize)).style(Style::new().fg(DIM)), sep1);
+        f.render_widget(Paragraph::new("─".repeat(sep2.width as usize)).style(Style::new().fg(DIM)), sep2);
+    }
+
+    // Scroll so the highlighted row (both lines of it) is in view, keeping its section header when possible.
+    let hgt = list.height as usize;
+    let sel_first = rows.iter().position(|(_, i, _)| *i == Some(app.search.sel)).unwrap_or(0);
+    let sel_last = rows.iter().rposition(|(_, i, _)| *i == Some(app.search.sel)).unwrap_or(0);
+    let offset = if sel_last >= hgt { sel_last + 1 - hgt } else { 0 };
+    let offset = offset.min(sel_first.saturating_sub(1).max(sel_first.min(offset)));
+    let mut lines = Vec::new();
+    for (row, (line, idx, target)) in rows.into_iter().enumerate().skip(offset).take(hgt) {
+        let y = list.y + (row - offset) as u16;
+        let r = Rect::new(list.x, y, list.width, 1);
+        match idx {
+            Some(i) => {
+                app.hits.modal_items.push((r, i));
+                lines.push(if i == app.search.sel { line.style(Style::new().bg(Color::Indexed(238))) } else { line });
+            }
+            None => {
+                // A section header: clicking it highlights its first row.
+                if let Some(t) = target.filter(|t| *t < k) {
+                    app.hits.buttons.push((r, Action::SearchSelect(t)));
+                }
+                lines.push(line);
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    let hint = " ↑↓ move · Enter open · ^F filter list · Tab complete · ^G GitHub · Esc close";
+    f.render_widget(Paragraph::new(Line::styled(truncate(hint, keys.width as usize), Style::new().fg(DIM))), keys);
+
+    // Clickable filter hints.
+    let mut x = prefixes.x + 1;
+    let mut spans = vec![Span::raw(" ")];
+    for (label, token) in [("repo:", "repo:"), ("author:", "author:"), ("label:", "label:"), ("head:", "head:"), ("#123", "#"), ("is:draft", "is:draft"), ("ci:failing", "ci:failing"), ("review:approved", "review:approved")] {
+        let lw = label.width() as u16;
+        if x + lw > prefixes.right() {
+            break;
+        }
+        app.hits.buttons.push((Rect::new(x, prefixes.y, lw, 1), Action::SearchInsert(token.to_string())));
+        spans.push(Span::styled(label, Style::new().fg(DIM).add_modifier(Modifier::UNDERLINED)));
+        spans.push(Span::raw("  "));
+        x += lw + 2;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), prefixes);
 }
 
 #[cfg(test)]
