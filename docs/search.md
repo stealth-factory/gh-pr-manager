@@ -329,3 +329,51 @@ removes comments/fences/tags/URLs and cuts at a char boundary; `snippet` window 
 words-only, and `None` for number-only; lenient scoring keeps remote rows; stale `Msg::Remote` generations dropped; token bucket
 refill and pause; `graphql_partial` keeps data with `NOT_FOUND` errors and fails on others; `recent_searches` dedupe/truncate;
 `visible()` cache invalidation on `prs_rev`; a 300-PR fixture asserts `rank` < 5 ms in debug.
+
+## Implementation notes
+
+Deviations from the design above, as built (2026-10-19), adapted to the Actions tab (tabs `1`–`7`; it owns `O H E W z Z t` and
+`Ctrl+F` while active) and inline images (`I`, `Modal::Image`), which came after the design:
+
+* **Keys.** `/` opens the palette from the list, both detail panes and the Actions tab, and over Help, the Actions menu and the
+  image viewer. It stays text in the composer, the scope/repo pickers and the Actions log-search input (`on_log_search_key` runs
+  before the key map); Confirm ignores it. The palette's `Ctrl-f` (pin) can't meet the Actions tab's `Ctrl+F` (log search):
+  `on_key` hands every key to `on_modal_key` while a modal is open, and the Actions binding only applies with none open.
+  `Ctrl-Backspace`/`Alt-Backspace` delete a word like `Ctrl-w`. `/` and the header chip open an empty input; clicking the
+  pinned chip in the status line opens it pre-filled (`Action::EditSearch`). The empty input lists recent searches, but Enter
+  on it still just closes unless an arrow/wheel moved the highlight.
+* **Number tokens.** Number mode needs the input to be a single number (`#14`, `14`, `14 `). A number elsewhere in a query
+  (`fix 439`) scores exact/prefix on the number and otherwise falls back to fuzzy text, which is what makes `#439` beat a
+  title containing 439.
+* **Fuzzy floor.** Real titles showed nucleo matching letters scattered across long titles ("atlas" in "summaries **at**
+  three **l**engths **a**nd… with pull-quote**s**" = 98, "skin" = 64). A field hit for a fuzzy term of ≥ 3 chars needs
+  `20·len + 4` (contiguous words score ≈ 28/char, abbreviations like `ghprm` → gh-pr-manager 125, `frmatls` → form-atlas 149
+  pass). The same floor applies to repos, scopes and commands. Highlights mark every literal occurrence of a term (nucleo only
+  reports its best one, often past the truncation), falling back to the fuzzy positions for abbreviations.
+* **Palette size.** At most 10 loaded PRs are listed, then a selectable `… N more loaded matches` row (Enter = `Ctrl-f`), so
+  GitHub rows and the other sections stay reachable. The non-PR threshold is 60% of the best PR score divided by the title
+  weight (10). The palette is 96 wide, anchored near the top so it grows downwards; Compact drops the rules and snippet lines,
+  Comfortable adds a blank line between sections. Section headers are clickable (move the highlight), and so are the filter
+  hints on the bottom line (they insert the token).
+* **Remote timing.** Debounces ride the 200 ms tick, so text searches fire 400–600 ms after the last key and number lookups
+  150–350 ms. Once idle, the whole input counts as complete (so a paused `shoulder` searches without a trailing space); while
+  still typing a partial word the `↗` row shows the whole-words hint. A 403/429 pauses for 60 s (`graphql()` doesn't surface
+  `retry-after`). Responses that arrive stale still fill `remote_cache`/`number_cache`; only their display is dropped. The
+  list's auto-refresh pauses while the palette is open, like it does for the composer. `[search] live = false` also stops
+  number lookups until Enter / `Ctrl-g`.
+* **Number lookups.** When the lookup lands and the highlight (untouched) isn't on an exact hit, it moves to the first exact
+  one. Enter before it lands opens the single exact hit, highlights the first of several, or toasts when there's none. With no
+  candidate repo at all the palette says to pick one (`S`) rather than offering a junk text search.
+* **GitHub rows.** One opened from the palette is spliced into `prs` and kept across a list reload while it's selected in the
+  detail view (otherwise the 60 s refresh would yank it out from under the reader).
+* **Commands.** Added `Show / hide images` (`I`); `State: …` uses a new `Action::SetState`, `Copy PR URL` a new
+  `Action::CopyUrl` (the menu uses it too). Disabled reasons come from the Actions menu's own `menu_entries()`.
+* **API shape.** `remote_query` also takes the loaded repo names (to resolve `repo:atlas`). `search_page` gained a `first`
+  argument (`SEARCH_QUERY` takes `$first`); the row fields are a `pr_fields!()` macro so `SEARCH_QUERY` stays a `concat!`
+  const. `Token` has a `Pending` variant (`repo:` with no value, ignored); `Invalid` tokens (`is:foo`) are ignored rather than
+  failing every row. Clicks go through `ModalPick` like the other pickers, so there is no `Action::PickSearch`.
+* **Bodies.** `strip_body` keeps a lone `-`/`_` inside a word (`snake_case`, `wp-stateless`).
+* **Performance.** `nucleo-matcher` builds with `opt-level = 3` in the dev profile too, so the 300-PR rank test holds its 5 ms
+  budget in debug (measured 0.9–2.4 ms debug, 0.02–0.37 ms release). A full 160×50 frame per keystroke (rank + palette rows
+  + highlights + the table underneath, 300 PRs with descriptions, 1000 repos) takes 2.7–3.1 ms in release, about 1 ms of it
+  the table; the first keystroke after the list changes also rebuilds the docs (≈ 7 ms).

@@ -14,11 +14,13 @@ pub struct State {
     pub repos_cache: Option<ReposCache>,
     /// Inline images shown (the `I` key).
     pub images_enabled: bool,
+    /// Searches picked or pinned in the `/` palette, newest first.
+    pub recent_searches: Vec<String>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { density: Density::default(), recent_repos: Vec::new(), repos_cache: None, images_enabled: true }
+        Self { density: Density::default(), recent_repos: Vec::new(), repos_cache: None, images_enabled: true, recent_searches: Vec::new() }
     }
 }
 
@@ -119,5 +121,35 @@ impl State {
         self.recent_repos.retain(|r| !r.eq_ignore_ascii_case(repo));
         self.recent_repos.insert(0, repo.to_string());
         self.recent_repos.truncate(10);
+    }
+
+    pub fn push_recent_search(&mut self, query: &str) {
+        let q = query.trim();
+        if q.is_empty() {
+            return;
+        }
+        self.recent_searches.retain(|r| !r.eq_ignore_ascii_case(q));
+        self.recent_searches.insert(0, q.to_string());
+        self.recent_searches.truncate(10);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_searches_dedupe_and_truncate() {
+        let mut s = State::default();
+        for i in 0..12 {
+            s.push_recent_search(&format!("q{i}"));
+        }
+        assert_eq!(s.recent_searches.len(), 10);
+        assert_eq!(s.recent_searches[0], "q11");
+        s.push_recent_search("  Q5 ");
+        assert_eq!(s.recent_searches[0], "Q5");
+        assert_eq!(s.recent_searches.iter().filter(|r| r.eq_ignore_ascii_case("q5")).count(), 1);
+        s.push_recent_search("   ");
+        assert_eq!(s.recent_searches[0], "Q5");
     }
 }

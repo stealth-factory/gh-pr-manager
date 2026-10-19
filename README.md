@@ -20,7 +20,7 @@ Auth: `GH_TOKEN` / `GITHUB_TOKEN`, otherwise the GitHub CLI's token (`gh auth lo
 
 ## Using it
 
-- **List screen** — every PR in the current scope. Click the `▾ scope` chip (or press `s`) to pick a scope from a centred modal; type to filter it. Click `◐ Open` (or `f`) to cycle Open → Closed → Merged → All. `/` filters the loaded list.
+- **List screen** — every PR in the current scope. Click the `▾ scope` chip (or press `s`) to pick a scope from a centred modal; type to filter it. Click `◐ Open` (or `f`) to cycle Open → Closed → Merged → All. `/` (or the `⌕ Search` chip) opens one search palette for everything: fuzzy over PR titles, descriptions, repos, authors, branches and labels, PR numbers (`#123`, looked up on GitHub too), plus repositories, scopes and commands. `Enter` opens the PR and keeps the query as the list filter, `Ctrl+F` only filters; `Esc` on the list clears it.
 - **Detail screen** — `Enter` or double-click a row. Left third is the PR list, right two-thirds the details. Click a pane or press `Tab` to switch focus; the wheel scrolls whatever is under the pointer. `J`/`K` jump between PRs while reading.
 - **Actions** — the button bar at the top of the detail pane, the footer chips, or keys: `c` comment, `m` merge menu (only the methods the repo allows), `a` approve, `R` request changes, `x` close/reopen, `Space` all actions, `o` open in browser, `y` copy `gh pr checkout …`. Merges are sent with `expectedHeadOid`, so they fail safely if new commits land after you looked.
 - **Composer** — `Enter` is a newline, `Ctrl+S` / `Alt+Enter` sends, `Esc` closes and keeps the draft. Typing `@` pops up suggestions (configured bots, comment authors, participants, repo members); pick with `↑↓`+`Tab`/`Enter` or click.

@@ -20,6 +20,9 @@ html2text = "0.17.3"
 # Decoders for inline images; only the formats PR bodies use. No SVG (bot
 # badges stay text labels) and no AVIF/EXR/TIFF, which `image`'s defaults pull.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# Fuzzy matching for the `/` search palette. Default features off: `unicode-segmentation`
+# makes match indices grapheme indices; without it they are `char` indices into the haystack.
+nucleo-matcher = { version = "0.3.1", default-features = false, features = ["unicode-casefold", "unicode-normalization"] }
 ratatui = "0.30"
 # Inline images. Default features off: they include `chafa-dyn`, which links
 # libchafa.so dynamically and would break the static release binaries.
@@ -40,6 +43,11 @@ rustix = { version = "1", features = ["event", "termios"] }
 # opt-level "z" because thirteen of its binaries run at once; that reason
 # does not apply here). LTO and one codegen unit for a smaller, faster
 # binary; symbols stripped because nobody debugs a release artefact.
+# The matcher runs on every keystroke of the search palette; keep it fast in debug builds
+# (and tests) too.
+[profile.dev.package.nucleo-matcher]
+opt-level = 3
+
 [profile.release]
 lto = true
 codegen-units = 1
