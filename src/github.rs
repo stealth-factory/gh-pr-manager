@@ -553,7 +553,7 @@ pub struct Login {
     pub login: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Count {
     #[serde(rename = "totalCount")]
     pub total_count: usize,
@@ -603,11 +603,40 @@ pub struct PrSummary {
     pub repository: RepoRef,
     pub review_decision: Option<String>,
     pub comments: Count,
-    pub commits: Nodes<CommitNode<RollupOnly>>,
+    pub commits: LastCommit,
     #[serde(default)]
     pub head_ref_name: String,
     #[serde(default)]
     pub labels: Nodes<LabelName>,
+    // Change signals (docs/change-signals.md); all optional so older shapes still parse.
+    #[serde(default)]
+    pub reviews: Count,
+    #[serde(default)]
+    pub review_threads: Count,
+    #[serde(default)]
+    pub review_requests: Count,
+    #[serde(default)]
+    pub head_ref_oid: String,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN` (computed lazily by GitHub).
+    #[serde(default)]
+    pub mergeable: Option<String>,
+    #[serde(default)]
+    pub last_edited_at: Option<String>,
+    /// GitHub's own notification read state for the viewer.
+    #[serde(default)]
+    pub is_read_by_viewer: Option<bool>,
+    /// Set while the viewer's review is requested.
+    #[serde(default)]
+    pub viewer_latest_review_request: Option<Value>,
+}
+
+/// `commits(last:1)`: the head commit's CI rollup plus the PR's commit count.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastCommit {
+    #[serde(default)]
+    pub total_count: usize,
+    pub nodes: Vec<Option<CommitNode<RollupOnly>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -626,7 +655,7 @@ pub struct PrBody {
 
 impl PrSummary {
     pub fn ci_state(&self) -> Option<&str> {
-        self.commits.iter().last()?.commit.status_check_rollup.as_ref().map(|r| r.state.as_str())
+        self.commits.nodes.iter().flatten().last()?.commit.status_check_rollup.as_ref().map(|r| r.state.as_str())
     }
 }
 
@@ -886,9 +915,12 @@ macro_rules! pr_fields {
       repository { nameWithOwner }
       reviewDecision
       comments { totalCount }
-      commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+      commits(last:1) { totalCount nodes { commit { statusCheckRollup { state } } } }
       headRefName
-      labels(first:10) { nodes { name } }"
+      labels(first:10) { nodes { name } }
+      reviews { totalCount } reviewThreads { totalCount } reviewRequests { totalCount }
+      headRefOid mergeable lastEditedAt isReadByViewer
+      viewerLatestReviewRequest { asCodeOwner }"
     };
 }
 

@@ -819,12 +819,14 @@ pub enum Command {
     StateAll,
     OnlyRepo,
     Images,
+    UnreadOnly,
+    MarkAllRead,
     Help,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 18] = [
+    pub const ALL: [Command; 20] = [
         Command::Comment,
         Command::Merge,
         Command::Approve,
@@ -841,6 +843,8 @@ impl Command {
         Command::StateAll,
         Command::OnlyRepo,
         Command::Images,
+        Command::UnreadOnly,
+        Command::MarkAllRead,
         Command::Help,
         Command::Quit,
     ];
@@ -863,6 +867,8 @@ impl Command {
             Command::StateAll => "State: All",
             Command::OnlyRepo => "Only this repository",
             Command::Images => "Show / hide images",
+            Command::UnreadOnly => "Unread only (show / hide read PRs)",
+            Command::MarkAllRead => "Mark all read",
             Command::Help => "Help",
             Command::Quit => "Quit",
         }
@@ -884,6 +890,8 @@ impl Command {
             Command::StateOpen | Command::StateClosed | Command::StateMerged | Command::StateAll => "f",
             Command::OnlyRepo => "e",
             Command::Images => "I",
+            Command::UnreadOnly => "u",
+            Command::MarkAllRead => "U",
             Command::Help => "?",
             Command::Quit => "q",
         }
@@ -958,7 +966,7 @@ impl TokenBucket {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::github::{Count, LabelName, Login, Nodes, RepoRef};
+    use crate::github::{Count, LabelName, LastCommit, Login, Nodes, RepoRef};
     use std::time::{Duration, Instant};
 
     pub fn pr(number: u64, repo: &str, title: &str, updated: &str) -> PrSummary {
@@ -974,9 +982,17 @@ pub(crate) mod tests {
             repository: RepoRef { name_with_owner: repo.into() },
             review_decision: None,
             comments: Count { total_count: 0 },
-            commits: Nodes::default(),
+            commits: LastCommit::default(),
             head_ref_name: "feat/x".into(),
             labels: Nodes { nodes: vec![Some(LabelName { name: "deps".into() })] },
+            reviews: Count::default(),
+            review_threads: Count::default(),
+            review_requests: Count::default(),
+            head_ref_oid: String::new(),
+            mergeable: None,
+            last_edited_at: None,
+            is_read_by_viewer: None,
+            viewer_latest_review_request: None,
         }
     }
 

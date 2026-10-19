@@ -1,5 +1,6 @@
 mod actions_log;
 mod app;
+mod changes;
 mod config;
 mod editor;
 mod github;
