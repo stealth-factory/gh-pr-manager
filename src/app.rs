@@ -28,6 +28,8 @@ const LOG_CAP: usize = 4 << 20;
 /// Seconds between Actions polls while runs are in progress (and when the REST budget is low).
 pub const POLL_SECS: u64 = 10;
 const POLL_SECS_LOW: u64 = 30;
+/// Seconds before asking again for a finished job's log that wasn't there yet.
+const LOG_RETRY_SECS: u64 = 5;
 
 /// A rendered detail row plus its clickable link ranges (start col, end col, url).
 pub type DetailRow = (ratatui::text::Line<'static>, Vec<(u16, u16, String)>);
@@ -40,16 +42,16 @@ pub enum Msg {
     /// One page of search results; `first` replaces the list, later pages append.
     Prs { generation: u64, first: bool, res: Result<SearchPage> },
     Detail { id: String, res: Result<(PrDetail, Option<RateLimit>)> },
-    Files { id: String, res: Result<Vec<FileDiff>> },
+    Files { id: String, sha: String, res: Result<Vec<FileDiff>> },
     /// Workflow runs for a PR's head (`history` adds earlier pushes); the flag is set when
     /// the list is empty because the repo has no workflows at all.
     Runs { id: String, nwo: String, sha: String, history: bool, res: Result<(Vec<WorkflowRunInfo>, bool)> },
-    Jobs { run_id: u64, res: Result<Vec<Job>> },
+    Jobs { run_id: u64, nwo: String, res: Result<Vec<Job>> },
     /// A parsed job log; `true` when the job hasn't produced one yet.
     Log { job_id: u64, res: Result<(ParsedLog, bool)> },
     Annotations { job_id: u64, res: Result<Vec<Annotation>> },
-    /// A page of the viewer's repos for the repo picker.
-    Repos { first: bool, res: Result<RepoPage> },
+    /// A page of the viewer's repos for the repo picker; `done` when no more pages follow.
+    Repos { first: bool, done: bool, res: Result<RepoPage> },
     /// A mutation finished; `Ok` carries the success message.
     Done { id: String, res: Result<String> },
     /// An inline image was downloaded and decoded, or encoded for another size.
@@ -364,8 +366,9 @@ pub struct App {
     repos_fresh: Vec<RepoInfo>,
     pub repos_total: usize,
     pub repos_loading: bool,
-    /// Repos in the last unfiltered list, with PR counts.
+    /// Repos in the last unfiltered list, with PR counts, and the scope and state they count.
     pub scope_repos: Vec<(String, usize)>,
+    scope_repos_key: (usize, StateFilter),
     pub state: State,
     /// PR to keep selected across a reload triggered by a filter change.
     pending_select: Option<String>,
@@ -392,7 +395,8 @@ pub struct App {
     /// Selected file in the Changes tab and the file list's scroll offset.
     pub file_sel: usize,
     pub file_list_scroll: usize,
-    pub files: HashMap<String, (Vec<FileDiff>, Instant)>,
+    /// Changed files per PR id, with the head commit they were fetched for.
+    pub files: HashMap<String, (Vec<FileDiff>, Instant, String)>,
     pub files_loading: HashSet<String>,
     pub files_errors: HashMap<String, String>,
     /// Actions tab: runs per PR id, jobs per run id, logs and annotations per job id.
@@ -407,6 +411,8 @@ pub struct App {
     pub logs: HashMap<u64, (ParsedLog, Instant)>,
     pub logs_loading: HashSet<u64>,
     pub log_errors: HashMap<u64, String>,
+    /// Completed jobs whose log blob didn't exist yet, and when that was seen; retried shortly.
+    pub logs_pending: HashMap<u64, Instant>,
     /// Jobs whose log was asked for (Enter / click); fetched once the job completes.
     pub log_wanted: HashSet<u64>,
     pub annotations: HashMap<u64, Vec<Annotation>>,
@@ -456,6 +462,8 @@ impl App {
         scopes.extend(cfg.scopes.iter().map(|s| Scope { name: s.name.clone(), qualifier: s.query.clone() }));
         let scope = cfg.default_scope.as_ref().and_then(|d| scopes.iter().position(|s| &s.name == d)).unwrap_or(0);
         let repo = cfg.default_repo.clone().filter(|r| looks_like_repo(r));
+        // A repo-only scope without a repo would search all of GitHub.
+        let scope = if repo.is_none() && scopes[scope].qualifier.is_empty() { 0 } else { scope };
         let state = crate::state::load();
         let repos = state.repos_cache.as_ref().map(|c| c.repos.clone()).unwrap_or_default();
         let toast = images.note.map(|n| (n, ToastKind::Info, Instant::now()));
@@ -474,6 +482,7 @@ impl App {
             repos_total: 0,
             repos_loading: false,
             scope_repos: Vec::new(),
+            scope_repos_key: (scope, StateFilter::Open),
             state,
             pending_select: None,
             prs: Vec::new(),
@@ -509,6 +518,7 @@ impl App {
             logs: HashMap::new(),
             logs_loading: HashSet::new(),
             log_errors: HashMap::new(),
+            logs_pending: HashMap::new(),
             log_wanted: HashSet::new(),
             annotations: HashMap::new(),
             annotations_loading: HashSet::new(),
@@ -558,6 +568,10 @@ impl App {
     }
 
     fn load_list(&mut self) {
+        // Counts describe the unfiltered list they came from; another scope or state voids them.
+        if self.scope_repos_key != (self.scope, self.state_filter) {
+            self.scope_repos.clear();
+        }
         self.list_gen += 1;
         self.loading_list = true;
         self.last_refresh = Instant::now();
@@ -595,13 +609,14 @@ impl App {
                 let next = res.as_ref().ok().and_then(|p| p.next.clone());
                 let low = res.as_ref().ok().and_then(|p| p.rate.as_ref()).is_some_and(|r| r.remaining < 200);
                 loaded += res.as_ref().map_or(0, |p| p.repos.len());
-                if tx.send(Msg::Repos { first, res }).is_err() {
+                let next = next.filter(|_| loaded < MAX_REPOS && !low);
+                if tx.send(Msg::Repos { first, done: next.is_none(), res }).is_err() {
                     break;
                 }
                 first = false;
                 match next {
-                    Some(n) if loaded < MAX_REPOS && !low => after = Some(n),
-                    _ => break,
+                    Some(n) => after = Some(n),
+                    None => break,
                 }
             }
         });
@@ -637,15 +652,15 @@ impl App {
             return;
         }
         let Some(d) = self.selected_detail() else { return };
-        let (id, nwo, number) = (d.id.clone(), d.repository.name_with_owner.clone(), d.number);
-        let stale = force || self.files.get(&id).is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(60));
+        let (id, nwo, number, sha) = (d.id.clone(), d.repository.name_with_owner.clone(), d.number, d.head_ref_oid.clone());
+        let stale = force || self.files.get(&id).is_none_or(|(_, at, s)| *s != sha || at.elapsed() > Duration::from_secs(60));
         if !stale || !self.files_loading.insert(id.clone()) {
             return;
         }
         let (client, tx) = (self.client.clone(), self.tx.clone());
         tokio::spawn(async move {
             let res = client.pr_files(&nwo, number).await;
-            let _ = tx.send(Msg::Files { id, res });
+            let _ = tx.send(Msg::Files { id, sha, res });
         });
     }
 
@@ -685,9 +700,11 @@ impl App {
         });
     }
 
-    /// Load a run's jobs (with steps) if missing, or again when forced.
+    /// Load a run's jobs (with steps) if missing or from an earlier attempt, or again when forced.
     fn ensure_jobs(&mut self, run_id: u64, force: bool) {
-        if !force && self.jobs.contains_key(&run_id) {
+        let attempt = self.current_runs().and_then(|e| e.runs.iter().find(|r| r.id == run_id)).map(|r| r.run_attempt);
+        let cached = self.jobs.get(&run_id).is_some_and(|(jobs, _)| !rerun(jobs, attempt));
+        if !force && cached {
             return;
         }
         let Some(nwo) = self.selected_detail().map(|d| d.repository.name_with_owner.clone()) else { return };
@@ -697,7 +714,7 @@ impl App {
         let (client, tx) = (self.client.clone(), self.tx.clone());
         tokio::spawn(async move {
             let res = client.run_jobs(&nwo, run_id).await;
-            let _ = tx.send(Msg::Jobs { run_id, res });
+            let _ = tx.send(Msg::Jobs { run_id, nwo, res });
         });
     }
 
@@ -706,7 +723,7 @@ impl App {
         if !self.find_job(job_id).is_some_and(|j| j.status == "completed") {
             return;
         }
-        if !force && (self.logs.contains_key(&job_id) || self.log_errors.contains_key(&job_id)) {
+        if !force && (self.logs.contains_key(&job_id) || self.log_errors.contains_key(&job_id) || self.logs_pending.contains_key(&job_id)) {
             return;
         }
         let Some(nwo) = self.selected_detail().map(|d| d.repository.name_with_owner.clone()) else { return };
@@ -714,6 +731,7 @@ impl App {
             return;
         }
         self.log_errors.remove(&job_id);
+        self.logs_pending.remove(&job_id);
         let (client, tx) = (self.client.clone(), self.tx.clone());
         tokio::spawn(async move {
             let res = client.job_log(&nwo, job_id, LOG_CAP).await.map(|l| {
@@ -821,7 +839,7 @@ impl App {
     }
 
     fn file_count(&self) -> usize {
-        self.selected_pr().and_then(|p| self.files.get(&p.id)).map_or(0, |(f, _)| f.len())
+        self.selected_pr().and_then(|p| self.files.get(&p.id)).map_or(0, |(f, ..)| f.len())
     }
 
     /// Show file `idx` in the Changes tab.
@@ -986,6 +1004,13 @@ impl App {
         self.ensure_tree_data();
     }
 
+    /// Stop typing into the log search; the query and its hits stay.
+    fn end_log_search_input(&mut self) {
+        if let Some(s) = &mut self.log_view.search {
+            s.input = false;
+        }
+    }
+
     fn move_tree(&mut self, delta: isize) {
         self.select_node((self.actions_sel as isize + delta).max(0) as usize);
     }
@@ -1121,6 +1146,13 @@ impl App {
             self.load_detail(&id);
         }
         self.poll_actions();
+        if self.screen == Screen::Detail
+            && self.tab == Tab::Actions
+            && let Some(id) = self.selected_job().map(|j| j.id)
+            && self.logs_pending.get(&id).is_some_and(|at| at.elapsed() > Duration::from_secs(LOG_RETRY_SECS))
+        {
+            self.ensure_log(id, true);
+        }
         self.images.evict();
     }
 
@@ -1145,6 +1177,7 @@ impl App {
                 if let Some(d) = &self.cfg.default_scope
                     && self.scopes[self.scope].name != *d
                     && let Some(i) = self.scopes.iter().position(|s| &s.name == d)
+                    && (self.repo.is_some() || !self.scopes[i].qualifier.is_empty())
                 {
                     self.scope = i;
                     self.load_list();
@@ -1175,6 +1208,7 @@ impl App {
                         self.loading_list = has_next && self.prs.len() < MAX_PRS;
                         if self.repo.is_none() {
                             self.scope_repos = count_repos(&self.prs);
+                            self.scope_repos_key = (self.scope, self.state_filter);
                         }
                         self.rate = page.rate.or(self.rate.take());
                         self.list_error = None;
@@ -1182,6 +1216,10 @@ impl App {
                         self.sel = prev
                             .and_then(|id| vis.iter().position(|&i| self.prs[i].id == id))
                             .unwrap_or(self.sel.min(vis.len().saturating_sub(1)));
+                        // A filter change can swap the open PR for one never loaded.
+                        if self.screen == Screen::Detail && self.selected_pr().is_some_and(|p| !self.details.contains_key(&p.id)) {
+                            self.ensure_detail();
+                        }
                     }
                     Err(e) => self.list_error = Some(format!("{e:#}")),
                 }
@@ -1208,7 +1246,7 @@ impl App {
                     }
                 }
             }
-            Msg::Repos { first, res } => match res {
+            Msg::Repos { first, done, res } => match res {
                 Ok(page) => {
                     self.rate = page.rate.clone().or(self.rate.take());
                     if first {
@@ -1217,10 +1255,10 @@ impl App {
                     self.repos_total = page.total;
                     self.repos_fresh.extend(page.repos);
                     // Show what we have once the fresh list overtakes the cache.
-                    if self.repos_fresh.len() >= self.repos.len() || page.next.is_none() {
+                    if self.repos_fresh.len() >= self.repos.len() || done {
                         self.repos = self.repos_fresh.clone();
                     }
-                    if page.next.is_none() || self.repos_fresh.len() >= MAX_REPOS {
+                    if done {
                         self.repos_loading = false;
                         self.repos = std::mem::take(&mut self.repos_fresh);
                         if let Some(v) = &self.viewer {
@@ -1234,12 +1272,12 @@ impl App {
                     self.toast(format!("Couldn't load your repositories: {e:#}"), ToastKind::Error);
                 }
             },
-            Msg::Files { id, res } => {
+            Msg::Files { id, sha, res } => {
                 self.files_loading.remove(&id);
                 match res {
                     Ok(files) => {
                         self.files_errors.remove(&id);
-                        self.files.insert(id, (files, Instant::now()));
+                        self.files.insert(id, (files, Instant::now(), sha));
                     }
                     Err(e) => {
                         self.files_errors.insert(id, format!("{e:#}"));
@@ -1266,10 +1304,14 @@ impl App {
                         let current = self.selected_pr().is_some_and(|p| p.id == id);
                         let first = self.runs.get(&id).is_none_or(|e| e.sha != sha);
                         let key = if current && !first { self.selected_key() } else { None };
-                        // Runs that finished since their jobs were fetched need them again.
+                        // Runs that finished or were re-run since their jobs were fetched need them again.
                         let refetch: Vec<u64> = runs
                             .iter()
-                            .filter(|r| r.status() == "completed" && self.jobs.get(&r.id).is_some_and(|(j, _)| j.iter().any(|j| j.status != "completed")))
+                            .filter(|r| {
+                                self.jobs.get(&r.id).is_some_and(|(j, _)| {
+                                    (r.status() == "completed" && j.iter().any(|j| j.status != "completed")) || rerun(j, Some(r.run_attempt))
+                                })
+                            })
                             .map(|r| r.id)
                             .collect();
                         // Open the failing or running runs of the head commit on first sight.
@@ -1302,7 +1344,7 @@ impl App {
                     }
                 }
             }
-            Msg::Jobs { run_id, res } => {
+            Msg::Jobs { run_id, nwo, res } => {
                 self.jobs_loading.remove(&run_id);
                 match res {
                     Ok(jobs) => {
@@ -1311,6 +1353,10 @@ impl App {
                         let finished: Vec<u64> = jobs.iter().filter(|j| j.status == "completed" && self.log_wanted.contains(&j.id)).map(|j| j.id).collect();
                         self.jobs.insert(run_id, (jobs, Instant::now()));
                         self.reselect(key);
+                        // A late reply for another repo's run: its logs load when it's shown again.
+                        if self.selected_detail().is_none_or(|d| d.repository.name_with_owner != nwo) {
+                            return;
+                        }
                         for job in finished {
                             self.ensure_log(job, false);
                         }
@@ -1324,7 +1370,8 @@ impl App {
                 self.logs_loading.remove(&job_id);
                 match res {
                     Ok((_, true)) => {
-                        self.log_errors.insert(job_id, "The log isn't available yet".into());
+                        // A job can report completed before its log blob exists; on_tick retries.
+                        self.logs_pending.insert(job_id, Instant::now());
                     }
                     Ok((mut log, false)) => {
                         if let Some(job) = self.find_job(job_id) {
@@ -1429,8 +1476,12 @@ impl App {
             }
             return;
         }
-        if self.log_view.search.as_ref().is_some_and(|s| s.input) {
-            return self.on_log_search_key(k);
+        if let Some(s) = self.log_view.search.as_mut().filter(|s| s.input) {
+            if self.screen == Screen::Detail && self.tab == Tab::Actions {
+                return self.on_log_search_key(k);
+            }
+            // The prompt went away with the tab (a click); stop typing into it.
+            s.input = false;
         }
 
         let page = (self.hits.detail_height.max(4) - 2) as isize;
@@ -1829,6 +1880,7 @@ impl App {
             Action::Back => {
                 self.screen = Screen::List;
                 self.focus = Focus::Sidebar;
+                self.end_log_search_input();
             }
             Action::Refresh => {
                 self.refresh();
@@ -1946,6 +1998,7 @@ impl App {
                 if t != self.tab {
                     self.tab = t;
                     self.detail_scroll = 0;
+                    self.end_log_search_input();
                 }
                 self.focus = Focus::Detail;
                 self.ensure_files(false);
@@ -2507,6 +2560,12 @@ fn looks_like_repo(s: &str) -> bool {
     let mut parts = s.split('/');
     let ok = |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)));
     ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+/// Whether cached jobs belong to an earlier attempt than the run's `attempt` (a re-run keeps
+/// the run id but brings new jobs).
+fn rerun(jobs: &[Job], attempt: Option<u64>) -> bool {
+    attempt.is_some_and(|a| jobs.first().is_some_and(|j| j.run_attempt != a))
 }
 
 fn count_repos(prs: &[PrSummary]) -> Vec<(String, usize)> {

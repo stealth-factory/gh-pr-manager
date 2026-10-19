@@ -14,7 +14,7 @@ A terminal UI for keeping up with your GitHub pull requests: browse them by scop
 npx gh-pr-manager@latest
 ```
 
-Nothing to install and no `PATH` to manage: it fetches the prebuilt binary for this machine into npm's cache and starts it. Pin a version with `npx gh-pr-manager@0.2.0`. Published for Linux x86_64 and arm64 (glibc 2.35 or newer), macOS Apple Silicon and Intel, and Windows x64. [Other ways to get it →](#other-ways-to-get-it)
+Nothing to install and no `PATH` to manage: it fetches the prebuilt binary for this machine into npm's cache and starts it. Pin a version with `npx gh-pr-manager@0.1.0`. Published for Linux x86_64 and arm64 (glibc 2.35 or newer), macOS Apple Silicon and Intel, and Windows x64. [Other ways to get it →](#other-ways-to-get-it)
 
 Auth: `GH_TOKEN` / `GITHUB_TOKEN`, otherwise the GitHub CLI's token (`gh auth login`). Listing your orgs needs the `read:org` scope.
 
@@ -73,9 +73,10 @@ sudo apt install ./gh-pr-manager_X.Y.Z_amd64.deb
 
 ### Download a release
 
-Every release has a `.tar.gz` per platform, each with a `.sha256` beside it:
+Every release has a `.tar.gz` per platform, each with a `.sha256` beside it. The subshell lets a failed step stop the rest without closing your terminal:
 
 ```sh
+( set -e
 R=https://github.com/stealth-factory/gh-pr-manager/releases
 V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' $R/latest | sed 's|.*/||')
 case "$(uname -s) $(uname -m)" in
@@ -83,13 +84,14 @@ case "$(uname -s) $(uname -m)" in
   "Darwin x86_64")  A=x86_64-apple-darwin ;;
   "Linux x86_64")   A=x86_64-unknown-linux-gnu ;;
   "Linux aarch64")  A=aarch64-unknown-linux-gnu ;;
-  *) echo "no build for $(uname -sm); build from source below" >&2 ;;
+  *) echo "no build for $(uname -sm); build from source below" >&2; exit 1 ;;
 esac
 T=gh-pr-manager-$V-$A
 curl -fsSLO $R/download/$V/$T.tar.gz
 curl -fsSLO $R/download/$V/$T.tar.gz.sha256
 shasum -a 256 -c $T.tar.gz.sha256    # sha256sum -c on Linux; either is fine
 tar -xzf $T.tar.gz && ./$T/gh-pr-manager
+)
 ```
 
 On Windows, take `gh-pr-manager-vX.Y.Z-x86_64-pc-windows-msvc.tar.gz` from the release page and extract it with `tar -xzf`. On macOS, download with `curl` rather than a browser: the binaries are not notarised, and a browser's quarantine mark makes Gatekeeper refuse them (`xattr -dr com.apple.quarantine <dir>` clears it).

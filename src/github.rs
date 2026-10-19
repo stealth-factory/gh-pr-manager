@@ -231,10 +231,11 @@ impl Client {
         Ok(out)
     }
 
-    /// A finished job's log, keeping the last `cap` bytes. The API redirects to a blob that
-    /// only exists once the job completes; until then this returns `pending`.
+    /// A finished job's log, keeping the last `cap` bytes (trimmed as it streams, so a huge
+    /// log never sits in memory whole). The API redirects to a blob that only exists once the
+    /// job completes; until then this returns `pending`.
     pub async fn job_log(&self, nwo: &str, job_id: u64, cap: usize) -> Result<JobLog> {
-        let resp = self.rest_send(&format!("https://api.github.com/repos/{nwo}/actions/jobs/{job_id}/logs")).await?;
+        let mut resp = self.rest_send(&format!("https://api.github.com/repos/{nwo}/actions/jobs/{job_id}/logs")).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND && resp.url().host_str() != Some("api.github.com") {
             return Ok(JobLog { text: String::new(), dropped_lines: 0, pending: true });
@@ -243,15 +244,27 @@ impl Client {
             let body: Value = resp.json().await.unwrap_or_default();
             bail!("HTTP {status}: {}", body.get("message").and_then(Value::as_str).unwrap_or("request failed"));
         }
-        let bytes = resp.bytes().await?;
-        let (kept, dropped_lines) = crate::actions_log::tail(&bytes, cap);
-        Ok(JobLog { text: String::from_utf8_lossy(kept).into_owned(), dropped_lines, pending: false })
+        let mut tail = crate::actions_log::Tail::new(cap);
+        while let Some(chunk) = resp.chunk().await? {
+            tail.push(&chunk);
+        }
+        let (kept, dropped_lines) = tail.finish();
+        Ok(JobLog { text: String::from_utf8_lossy(&kept).into_owned(), dropped_lines, pending: false })
     }
 
-    /// Annotations of a job (a job id is also its check-run id).
+    /// Annotations of a job (a job id is also its check-run id). Capped at 1000.
     pub async fn job_annotations(&self, nwo: &str, job_id: u64) -> Result<Vec<Annotation>> {
-        let url = format!("https://api.github.com/repos/{nwo}/check-runs/{job_id}/annotations?per_page=100");
-        Ok(self.rest_get(&url).await?.json().await?)
+        let mut out = Vec::new();
+        for page in 1..=10 {
+            let url = format!("https://api.github.com/repos/{nwo}/check-runs/{job_id}/annotations?per_page=100&page={page}");
+            let anns: Vec<Annotation> = self.rest_get(&url).await?.json().await?;
+            let done = anns.len() < 100;
+            out.extend(anns);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// How many workflows the repo has; zero means it doesn't use Actions.
@@ -298,9 +311,11 @@ impl Client {
     /// `auth` asks for the token, which only goes to `TOKEN_HOSTS`; reqwest drops it on a
     /// redirect to another host (user-attachments redirect to S3).
     pub async fn fetch_image(&self, url: &str, auth: bool) -> Result<(Vec<u8>, String)> {
-        let host = reqwest::Url::parse(url)?.host_str().unwrap_or_default().to_ascii_lowercase();
+        let parsed = reqwest::Url::parse(url)?;
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
         let mut req = self.http.get(url).header("Accept", "image/*").timeout(std::time::Duration::from_secs(15));
-        if auth && TOKEN_HOSTS.contains(&host.as_str()) {
+        // Never over plain HTTP: the first request would carry the token in clear text.
+        if auth && parsed.scheme() == "https" && TOKEN_HOSTS.contains(&host.as_str()) {
             req = req.bearer_auth(&self.token);
         }
         let mut resp = req.send().await?;

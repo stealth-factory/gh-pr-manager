@@ -64,6 +64,8 @@ commit_parsers = [
   { message = "^style", group = "Miscellaneous" },
   { message = "^revert", group = "Reverted" },
   { body = ".*security", group = "Security" },
+  # Last, so every rule above wins: what none of them matched lands here.
+  { message = ".*", group = "Other" },
 ]
 
 filter_commits = false

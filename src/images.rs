@@ -31,6 +31,10 @@ const MAX_ENTRIES: usize = 64;
 const MAX_BYTES: usize = 64 << 20;
 /// Decoded images are shrunk to fit this square; wider than any pane at 8 px per cell.
 const MAX_DECODED: u32 = 1600;
+/// Largest source image decoded at all, in pixels (~96 MiB as RGBA). The header is checked
+/// before decoding, and the decoder gets the same ceiling as an allocation limit, so a small,
+/// highly compressed file can't expand into gigabytes.
+const MAX_SOURCE_PX: u64 = 24_000_000;
 /// Images not drawn for this long are dropped.
 const STALE: Duration = Duration::from_secs(600);
 /// Encoded sizes kept per image (the inline one, the viewer's, one left over from a resize).
@@ -53,7 +57,9 @@ pub fn canonical(src: &str) -> (ImageKey, Option<String>, bool) {
     };
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let same = |token: bool| (src.to_string(), Some(src.to_string()), token);
+    // The token never goes over plain HTTP; a rewritten key is always HTTPS.
+    let https = src.starts_with("https://");
+    let same = |token: bool| (src.to_string(), Some(src.to_string()), token && https);
     match host.to_ascii_lowercase().as_str() {
         "private-user-images.githubusercontent.com" => match path.rsplit('/').next().and_then(attachment_uuid) {
             Some(uuid) => {
@@ -366,6 +372,7 @@ pub enum SkipReason {
     TooSmall,
     Svg,
     NotImage,
+    TooLarge,
 }
 
 impl SkipReason {
@@ -374,6 +381,7 @@ impl SkipReason {
             SkipReason::TooSmall => "it's smaller than 64 px",
             SkipReason::Svg => "SVGs aren't rendered",
             SkipReason::NotImage => "the server didn't send an image",
+            SkipReason::TooLarge => "it's larger than 24 megapixels",
         }
     }
 }
@@ -710,15 +718,24 @@ impl ImageStore {
 /// Decode downloaded bytes and encode them for the cells `bounds` offers. Blocking.
 pub fn decode(bytes: &[u8], picker: &Picker, bounds: (u16, u16)) -> Result<Decoded, Fail> {
     let failed = |e: image::ImageError| Fail::Failed(e.to_string());
-    let reader = || image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| Fail::Failed(e.to_string()));
+    let reader = || {
+        let mut r = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| Fail::Failed(e.to_string()))?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(MAX_SOURCE_PX * 4);
+        r.limits(limits);
+        Ok(r)
+    };
     let r = reader()?;
     if r.format().is_none() {
         return Err(Fail::Skipped(SkipReason::NotImage));
     }
-    // The header alone says whether it's a badge-sized icon; skip decoding those.
+    // The header alone says whether it's a badge-sized icon or too big to decode; skip those.
     let (w, h) = r.into_dimensions().map_err(failed)?;
     if w < MIN_PX || h < MIN_PX {
         return Err(Fail::Skipped(SkipReason::TooSmall));
+    }
+    if u64::from(w) * u64::from(h) > MAX_SOURCE_PX {
+        return Err(Fail::Skipped(SkipReason::TooLarge));
     }
     let mut image = reader()?.decode().map_err(failed)?;
     if w > MAX_DECODED || h > MAX_DECODED {
@@ -770,6 +787,8 @@ mod tests {
         let other = "https://example.com/x.png";
         assert_eq!(canonical(other), (other.to_string(), Some(other.to_string()), false));
         assert_eq!(canonical("data:image/png;base64,AAAA").1, None);
+        let plain = "http://raw.githubusercontent.com/acme/app/abc123/shot.png";
+        assert_eq!(canonical(plain), (plain.to_string(), Some(plain.to_string()), false));
     }
 
     #[test]
@@ -847,6 +866,11 @@ mod tests {
         let picker = Picker::halfblocks();
         assert!(matches!(decode(&png(40, 40), &picker, (60, 20)), Err(Fail::Skipped(SkipReason::TooSmall))));
         assert!(matches!(decode(b"<html>login</html>", &picker, (60, 20)), Err(Fail::Skipped(SkipReason::NotImage))));
+        // A GIF header claiming 60000×60000: refused from the header, before any allocation.
+        let mut huge = b"GIF89a".to_vec();
+        huge.extend_from_slice(&[0x60, 0xea, 0x60, 0xea, 0, 0, 0]);
+        huge.extend_from_slice(&[0x2c, 0, 0, 0, 0, 0x60, 0xea, 0x60, 0xea, 0, 2, 0, 0x3b]);
+        assert!(matches!(decode(&huge, &picker, (60, 20)), Err(Fail::Skipped(SkipReason::TooLarge))));
         let d = decode(&png(200, 100), &picker, (60, 20)).ok().unwrap();
         assert_eq!(d.dims, (200, 100));
         assert_eq!(d.first.map(|(s, _)| s), Some(Size::new(20, 5)));

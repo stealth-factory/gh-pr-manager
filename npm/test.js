@@ -160,6 +160,28 @@ test('refuse-stale-latest refuses to move latest backwards', () => {
   assert.match(stale.refuseStaleLatest({ version: '0.2.0', names, view: () => 'garbage' }), /not x\.y\.z/);
 });
 
+test('refuse-stale-latest treats only E404 as unpublished and fails closed otherwise', () => {
+  const failing = (stderr) => () => {
+    const err = new Error('Command failed: npm view');
+    err.stderr = stderr;
+    throw err;
+  };
+  assert.equal(stale.viewLatest('x', () => '0.1.0\n'), '0.1.0');
+  assert.equal(stale.viewLatest('x', failing('npm error code E404\nnpm error 404 Not Found')), null);
+  assert.throws(() => stale.viewLatest('x', failing('npm error code ETIMEDOUT')), /npm view x failed: npm error code ETIMEDOUT/);
+  assert.throws(() => stale.viewLatest('x', failing('npm error code E503')), /E503/);
+  const errors = [];
+  const orig = console.error;
+  console.error = (m) => errors.push(m);
+  try {
+    const view = (name) => stale.viewLatest(name, failing('npm error code E500'));
+    assert.equal(stale.main(['node', 'refuse-stale-latest.js', '0.2.0'], view), 1);
+  } finally {
+    console.error = orig;
+  }
+  assert.match(errors.join('\n'), /E500/);
+});
+
 test('the shim execs the binary from the matching platform package and passes the exit code', {
   skip: process.platform === 'win32' || !platform.currentPlatform(),
 }, () => {

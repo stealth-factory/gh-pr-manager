@@ -195,6 +195,45 @@ pub fn tail(bytes: &[u8], cap: usize) -> (&[u8], usize) {
     (&bytes[start..], dropped)
 }
 
+/// `tail` over a stream: holds at most twice `cap` bytes while chunks arrive, so a huge log
+/// is never buffered whole. The result is at most `cap` bytes, cut at a line boundary.
+pub struct Tail {
+    buf: Vec<u8>,
+    cap: usize,
+    dropped: usize,
+    /// A line was cut before its newline arrived; discard up to that newline.
+    skipping: bool,
+}
+
+impl Tail {
+    pub fn new(cap: usize) -> Self {
+        Tail { buf: Vec::new(), cap, dropped: 0, skipping: false }
+    }
+
+    pub fn push(&mut self, mut chunk: &[u8]) {
+        if self.skipping {
+            let Some(p) = chunk.iter().position(|&b| b == b'\n') else { return };
+            self.skipping = false;
+            self.dropped += 1;
+            chunk = &chunk[p + 1..];
+        }
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > self.cap.saturating_mul(2) {
+            let (kept, dropped) = tail(&self.buf, self.cap);
+            let start = self.buf.len() - kept.len();
+            self.skipping = start == self.buf.len() && self.buf.last() != Some(&b'\n');
+            self.dropped += dropped;
+            self.buf.drain(..start);
+        }
+    }
+
+    /// The kept bytes and the number of whole lines dropped.
+    pub fn finish(self) -> (Vec<u8>, usize) {
+        let (kept, dropped) = tail(&self.buf, self.cap);
+        (kept.to_vec(), self.dropped + dropped)
+    }
+}
+
 /// Groups folded when a log is first shown: all but the first failing one and the last.
 pub fn default_folds(log: &ParsedLog) -> HashSet<usize> {
     let first_err = log.groups.iter().position(|g| g.has_error);
@@ -430,6 +469,28 @@ mod tests {
         assert_eq!(tail(b"ab\ncd\n", 100), (&b"ab\ncd\n"[..], 0));
         // A cut exactly at a line start keeps that line.
         assert_eq!(tail(b"ab\ncd\n", 3), (&b"cd\n"[..], 1));
+    }
+
+    #[test]
+    fn tail_streams_within_its_cap() {
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        for chunk in [1, 7, 64, 1000] {
+            let mut t = Tail::new(100);
+            for c in text.as_bytes().chunks(chunk) {
+                t.push(c);
+                assert!(t.buf.len() <= 200 + chunk);
+            }
+            let (kept, dropped) = t.finish();
+            assert!(kept.len() <= 100 && text.ends_with(std::str::from_utf8(&kept).unwrap()));
+            assert_eq!(dropped + kept.iter().filter(|&&b| b == b'\n').count(), 500);
+            assert!(kept.starts_with(b"line "));
+        }
+        // A line longer than the cap is dropped whole, even split across chunks.
+        let mut t = Tail::new(4);
+        for c in [&b"ab\n"[..], b"0123456789", b"0123\nxy\n"] {
+            t.push(c);
+        }
+        assert_eq!(t.finish(), (b"xy\n".to_vec(), 2));
     }
 
     #[test]

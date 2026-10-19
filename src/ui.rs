@@ -738,7 +738,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let (rows, placements) = match detail {
         None => (vec![(Line::styled(format!("{} Loading…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new())], Vec::new()),
         Some((d, at)) => {
-            let stamp = if app.tab == Tab::Changes { app.files.get(&pr.id).map(|(_, t)| *t) } else { Some(at) };
+            let stamp = if app.tab == Tab::Changes { app.files.get(&pr.id).map(|(_, t, _)| *t) } else { Some(at) };
             let key = format!("{}:{text_w}:{max_rows}:{:?}:{:?}", pr.id, app.tab, density());
             match stamp {
                 Some(stamp) => {
@@ -1240,6 +1240,8 @@ fn job_lines(app: &App, job: &Job, w: usize, rows: &mut Vec<DetailRow>) -> Optio
         state(rows, Line::styled(format!("Log appears when the job finishes (polling every {} s)", crate::app::POLL_SECS), Style::new().fg(Color::Yellow)), None);
     } else if let Some(e) = app.log_errors.get(&job.id) {
         state(rows, Line::styled(format!("Couldn't load the log: {e} — press r to retry"), Style::new().fg(Color::Red)), None);
+    } else if app.logs_pending.contains_key(&job.id) && !app.logs_loading.contains(&job.id) {
+        state(rows, Line::styled("The log isn't available yet; trying again shortly", Style::new().fg(Color::Yellow)), None);
     } else {
         state(rows, Line::styled(format!("{} Fetching log…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), None);
     }

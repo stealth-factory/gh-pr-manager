@@ -11,8 +11,10 @@
 // run queued behind a newer one would otherwise move latest backwards
 // the moment it writes.
 //
-// Unpublished is fine. A latest that is not x.y.z is not — fail
-// closed rather than guess.
+// Unpublished (npm's E404) is fine. A latest that is not x.y.z is
+// not, and nor is any other lookup failure: a timeout or a registry
+// error says nothing about what latest is — fail closed rather than
+// guess.
 
 const { execFileSync } = require('child_process');
 const platform = require('./platform');
@@ -34,14 +36,16 @@ function cmp(a, b) {
   return 0;
 }
 
-function viewLatest(name) {
+function viewLatest(name, exec = execFileSync) {
   try {
-    return execFileSync('npm', ['view', name, 'version'], {
+    return exec('npm', ['view', name, 'version'], {
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
-  } catch {
-    return null;
+  } catch (err) {
+    const stderr = String((err && err.stderr) || '');
+    if (/\bE404\b/.test(stderr)) return null;
+    throw new Error(`npm view ${name} failed: ${stderr.trim() || err.message}`);
   }
 }
 
@@ -73,11 +77,12 @@ function main(argv, view = viewLatest) {
     console.error('usage: refuse-stale-latest.js <version>');
     return 2;
   }
-  const reason = refuseStaleLatest({
-    version,
-    names: packageNames(),
-    view,
-  });
+  let reason;
+  try {
+    reason = refuseStaleLatest({ version, names: packageNames(), view });
+  } catch (err) {
+    reason = err.message;
+  }
   if (reason) {
     console.error(reason);
     return 1;
@@ -94,5 +99,6 @@ module.exports = {
   cmp,
   packageNames,
   refuseStaleLatest,
+  viewLatest,
   main,
 };

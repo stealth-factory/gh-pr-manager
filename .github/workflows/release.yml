@@ -355,10 +355,13 @@ jobs:
               # `latest` at once. npm can take minutes to serve a new
               # version, and for those minutes `latest` names something npx
               # cannot fetch yet. opscope tried publishing under `next` and
-              # promoting later; `npm dist-tag add` cannot use OIDC
-              # (npm/cli#8547), so that needs a stored token. When that
-              # issue lands, publish with `--tag next` here and move
-              # `latest` after smoke-npm.
+              # promoting later, which then needed a stored token for
+              # `npm dist-tag add` (npm/cli#8547). npm 11.21.0 can do that
+              # over OIDC, but only once "Allow npm dist-tag" is ticked on
+              # each of the six packages' trusted publishers (off by
+              # default). With that done, pin npm 11.21.0 above, publish
+              # with `--tag next` here and move `latest` in a job after
+              # smoke-npm.
               npm publish "./$dir" --access public --provenance
             fi
           }

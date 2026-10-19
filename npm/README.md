@@ -4,7 +4,7 @@ A mouse-friendly terminal UI for browsing and managing GitHub pull requests.
 
 ```sh
 npx gh-pr-manager@latest          # always the newest release
-npx gh-pr-manager@0.2.0           # or pin a version
+npx gh-pr-manager@0.1.0           # or pin a version
 npx gh-pr-manager@latest --help
 ```
 
