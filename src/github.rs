@@ -657,6 +657,43 @@ impl PrSummary {
     pub fn ci_state(&self) -> Option<&str> {
         self.commits.nodes.iter().flatten().last()?.commit.status_check_rollup.as_ref().map(|r| r.state.as_str())
     }
+
+    /// Take the signal fields of a fresher detail of the same PR, so a list row and the detail
+    /// snapshot agree (no spurious unread when one replaces the other as a baseline).
+    pub fn absorb(&mut self, d: &PrDetail, me: Option<&str>) {
+        self.title = d.title.clone();
+        self.state = d.state.clone();
+        self.is_draft = d.is_draft;
+        self.review_decision = d.review_decision.clone();
+        self.updated_at = d.updated_at.clone();
+        self.comments.total_count = d.comments.total_count;
+        self.reviews.total_count = d.reviews.total_count;
+        self.review_threads.total_count = d.review_threads.total_count;
+        self.review_requests.total_count = d.review_requests.iter().count();
+        self.commits.total_count = d.commits.total_count;
+        self.head_ref_oid = d.head_ref_oid.clone();
+        let rollup = d.rollup().map(|r| RollupState { state: r.state.clone() });
+        self.commits.nodes = vec![Some(CommitNode { commit: RollupOnly { status_check_rollup: rollup } })];
+        // `UNKNOWN` never overrides a known mergeability.
+        if d.mergeable != "UNKNOWN" || self.mergeable.is_none() {
+            self.mergeable = Some(d.mergeable.clone());
+        }
+        self.last_edited_at = d.last_edited_at.clone();
+        if d.is_read_by_viewer.is_some() {
+            self.is_read_by_viewer = d.is_read_by_viewer;
+        }
+        // The detail sees direct requests only (not via a team): it can add the flag, never clear it.
+        if me.is_some_and(|me| d.requested(me)) {
+            self.viewer_latest_review_request = Some(Value::Object(Default::default()));
+        }
+    }
+}
+
+impl PrDetail {
+    /// `login`'s review is requested directly.
+    pub fn requested(&self, login: &str) -> bool {
+        self.review_requests.iter().filter_map(|r| r.requested_reviewer.as_ref()?.login.as_deref()).any(|l| l.eq_ignore_ascii_case(login))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -696,9 +733,17 @@ pub struct PrDetail {
     pub repository: DetailRepo,
     pub status_check_rollup: Option<Rollup>,
     pub commits: CommitConnection,
-    pub reviews: Nodes<Review>,
-    pub comments: Nodes<Comment>,
-    pub review_threads: Nodes<ReviewThread>,
+    pub reviews: Counted<Review>,
+    pub comments: Counted<Comment>,
+    pub review_threads: Counted<ReviewThread>,
+    // Change signals (docs/change-signals.md).
+    #[serde(default)]
+    pub last_edited_at: Option<String>,
+    #[serde(default)]
+    pub is_read_by_viewer: Option<bool>,
+    /// The last few merge/close/review-request/force-push/ready events, for "merged by alice".
+    #[serde(default)]
+    pub timeline_items: Nodes<TimelineEvent>,
 }
 
 impl PrDetail {
@@ -706,6 +751,41 @@ impl PrDetail {
         self.status_check_rollup.as_ref()
     }
 
+    /// The latest timeline event of `typename` (`MergedEvent`, `ClosedEvent`, ...).
+    pub fn last_event(&self, typename: &str) -> Option<&TimelineEvent> {
+        self.timeline_items.iter().filter(|e| e.typename == typename).last()
+    }
+}
+
+/// A connection with its total count (the list query's counters, so detail and list agree).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Counted<T> {
+    #[serde(default)]
+    pub total_count: usize,
+    pub nodes: Vec<Option<T>>,
+}
+
+impl<T> Default for Counted<T> {
+    fn default() -> Self {
+        Self { total_count: 0, nodes: Vec::new() }
+    }
+}
+
+impl<T> Counted<T> {
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.nodes.iter().flatten()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEvent {
+    #[serde(rename = "__typename")]
+    pub typename: String,
+    pub actor: Option<Login>,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -759,6 +839,8 @@ pub struct CommitConnection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitInfo {
+    #[serde(default)]
+    pub oid: String,
     pub abbreviated_oid: String,
     pub message_headline: String,
     pub committed_date: String,
@@ -863,6 +945,8 @@ impl CheckContext {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Review {
+    #[serde(default)]
+    pub id: String,
     pub author: Option<Login>,
     pub state: String,
     pub body: String,
@@ -874,6 +958,8 @@ pub struct Review {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Comment {
+    #[serde(default)]
+    pub id: String,
     pub author: Option<Login>,
     pub body: String,
     #[serde(rename = "bodyHTML")]
@@ -1007,11 +1093,20 @@ query($id:ID!) {
     statusCheckRollup { state contexts(first:100) { nodes { __typename
       ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } }
       ... on StatusContext { context state targetUrl } } } }
-    commits(last:100) { totalCount nodes { commit { abbreviatedOid messageHeadline committedDate url
+    commits(last:100) { totalCount nodes { commit { oid abbreviatedOid messageHeadline committedDate url
       authors(first:1) { nodes { name user { login } } } statusCheckRollup { state } } } }
-    reviews(last:40) { nodes { author { login } state body bodyHTML submittedAt } }
-    comments(last:80) { nodes { author { login } body bodyHTML createdAt } }
-    reviewThreads(last:40) { nodes { isResolved path line comments(first:20) { nodes { author { login } body bodyHTML createdAt } } } }
+    reviews(last:40) { totalCount nodes { id author { login } state body bodyHTML submittedAt } }
+    comments(last:80) { totalCount nodes { id author { login } body bodyHTML createdAt } }
+    reviewThreads(last:40) { totalCount nodes { isResolved path line
+      comments(first:20) { nodes { id author { login } body bodyHTML createdAt } } } }
+    lastEditedAt isReadByViewer
+    timelineItems(last:5, itemTypes:[MERGED_EVENT, CLOSED_EVENT, REVIEW_REQUESTED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, READY_FOR_REVIEW_EVENT]) {
+      nodes { __typename
+        ... on MergedEvent { actor { login } createdAt }
+        ... on ClosedEvent { actor { login } createdAt }
+        ... on ReadyForReviewEvent { actor { login } createdAt }
+        ... on ReviewRequestedEvent { actor { login } createdAt }
+        ... on HeadRefForcePushedEvent { actor { login } createdAt } } }
   } }
 }"#;
 

@@ -18,14 +18,18 @@ use crate::app::{
     Action, App, ComposeKind, DetailRow, Focus, Hits, Item, LogView, Marks, Modal, RepoItem, Screen, Tab, ToastKind, TreeNode, repo_items,
     scope_matches, search_items,
 };
-use crate::changes::Change;
+use crate::changes::{Change, NewMarks, Snapshot};
 use crate::search::Command;
 use crate::state::Density;
-use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, WorkflowRunInfo, login_of};
+use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, TimelineEvent, WorkflowRunInfo, login_of};
 use crate::images::{self, ImagePlacement, ImageStore, Look};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
+/// `NEW` markers: the word carries the meaning, the colour sets them apart from the accent.
+const NEW: Color = Color::Yellow;
+/// The zero-width link on a `NEW` entry's header row (found by `n`/`p`, never clicked).
+const NEW_LINK: &str = "#new";
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 thread_local! {
@@ -593,7 +597,12 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         ],
     };
     // In modals the "Select" hint has no target index; drop it from the clickable set.
-    let items: Vec<_> = items.into_iter().filter(|(_, _, a)| *a != Action::ModalPick(usize::MAX)).collect();
+    let mut items: Vec<_> = items.into_iter().filter(|(_, _, a)| *a != Action::ModalPick(usize::MAX)).collect();
+    // The timeline tabs: n / p walk the NEW entries.
+    if app.modal.is_none() && app.screen == Screen::Detail && app.tab.has_new() {
+        let at = items.iter().position(|(_, _, a)| *a == Action::ToggleUnreadOnly).map_or(items.len(), |i| i + 1);
+        items.insert(at, ("n p", "New", Action::NextNew));
+    }
     button_row(f, &mut app.hits, area, &items, key);
 }
 
@@ -658,18 +667,32 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 title.push(Span::styled(" · ", Style::new().fg(DIM)));
                 title.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), usize::MAX));
             }
+            // Comfortable spends its second row on what changed, in words.
+            let mut title_cell = vec![Line::from(title)];
+            if density == Density::Comfortable
+                && let Some(c) = changes
+            {
+                let words = if c.is_empty() {
+                    if p.is_read_by_viewer == Some(false) { "unread on GitHub".to_string() } else { "unread".to_string() }
+                } else {
+                    c.iter().map(Change::words).collect::<Vec<_>>().join(" · ")
+                };
+                title_cell.push(Line::styled(words, Style::new().fg(ACCENT)));
+            }
             Row::new(vec![
                 Cell::from(Line::from(vec![unread_dot(changes.is_some()), state_icon(&p.state, p.is_draft)])),
                 Cell::from(Line::from(hl_spans(&p.repository.name_with_owner, &mk.repo, |_| Style::new().fg(Color::Blue), usize::MAX))),
                 Cell::from(Line::from(number_spans(p.number, &mk.number))),
-                Cell::from(Line::from(title)),
+                Cell::from(ratatui::text::Text::from(title_cell)),
                 Cell::from(Line::from(hl_spans(login_of(&p.author), &mk.author, |_| Style::new(), usize::MAX))),
                 Cell::from(bold_if(ci_icon(p.ci_state()), changed(|c| matches!(c, Change::Ci { .. })))),
                 Cell::from(bold_if(review_span(p.review_decision.as_deref()), changed(|c| matches!(c, Change::Verdict { .. })))),
                 Cell::from(Line::from(comment_spans(p.comments.total_count, changes)).right_aligned()),
                 Cell::from(Span::styled(ago(&p.updated_at), Style::new().fg(DIM))),
             ])
-            .bottom_margin(density.table_row_h() as u16 - 1)
+            // Comfortable rows are two lines tall (the second holds the change words), so
+            // `table_row_h` and click hit-testing stay at 2 per PR.
+            .height(density.table_row_h() as u16)
         })
         .collect();
     let widths = [
@@ -835,6 +858,9 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
+    if let Some(b) = app.details.get(&pr.id).and_then(|(d, _)| state_banner(d, app.visit.as_ref().filter(|v| v.id == pr.id)?.since.as_ref()?.snap.state.as_str(), text_w)) {
+        info.insert(0, (b, Vec::new()));
+    }
     let collapsed = app.info_collapsed();
     if collapsed {
         // Keep just the title block: title, badges and the base ← head line. Found by its
@@ -885,20 +911,23 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         None => (vec![(Line::styled(format!("{} Loading…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new())], Vec::new()),
         Some((d, at)) => {
             let stamp = if app.tab == Tab::Changes { app.files.get(&pr.id).map(|(_, t, _)| *t) } else { Some(at) };
-            let key = format!("{}:{text_w}:{max_rows}:{:?}:{:?}", pr.id, app.tab, density());
+            // The markers depend on the visit (what you'd seen when you opened it).
+            let serial = app.visit.as_ref().filter(|v| v.id == pr.id).map_or(0, |v| v.serial);
+            let key = format!("{}:{text_w}:{max_rows}:{:?}:{:?}:{serial}", pr.id, app.tab, density());
             match stamp {
                 Some(stamp) => {
                     if app.tab_cache.get(&key).is_none_or(|(s, _)| *s != stamp) {
                         let mut rows = Vec::new();
                         let mut img = Imgs::new(&app.images);
+                        let news = app.visit.as_ref().filter(|v| v.id == pr.id).and_then(|v| Some(News { marks: &v.marks, since: &v.since.as_ref()?.snap }));
                         match app.tab {
                             Tab::Description => description_lines(d, text_w, &mut rows, &mut img),
-                            Tab::Conversation => conversation_lines(d, text_w, &mut rows, &mut img),
+                            Tab::Conversation => conversation_lines(d, text_w, &mut rows, &mut img, news),
                             Tab::Changes => {}
-                            Tab::Commits => commits_lines(d, text_w, &mut rows),
+                            Tab::Commits => commits_lines(d, text_w, &mut rows, news),
                             Tab::Checks => checks_lines(d, text_w, &mut rows),
                             Tab::Actions => {}
-                            Tab::Reviews => reviews_lines(d, text_w, &mut rows, &mut img),
+                            Tab::Reviews => reviews_lines(d, text_w, &mut rows, &mut img, news),
                         }
                         app.tab_cache.insert(key.clone(), (stamp, (rows, img.out)));
                     }
@@ -920,6 +949,13 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let view = format!("{}:{:?}", pr.id, app.tab);
     if app.last_placements.0 == view {
         app.detail_scroll = images::anchor(&app.last_placements.1, &placements, app.detail_scroll);
+    }
+    // `NEW` entries, for n / p and a badge click.
+    app.hits.new_rows = rows.iter().enumerate().filter(|(_, (_, l))| l.iter().any(|(a, b, u)| a == b && u == NEW_LINK)).map(|(i, _)| i).collect();
+    if std::mem::take(&mut app.jump_new)
+        && let Some(&r) = app.hits.new_rows.first()
+    {
+        app.detail_scroll = r.saturating_sub(1);
     }
     let (max, links) = render_rows(f, content, &rows, &mut app.detail_scroll);
     render_images(f, content, &placements, app.detail_scroll, &mut app.images, app.modal.is_some());
@@ -1716,6 +1752,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         outcomes.min_by_key(|o| outcome_rank(o))
     });
     let counts: Vec<String> = Tab::ALL.into_iter().map(count).collect();
+    let badges: Vec<Option<String>> = Tab::ALL.into_iter().map(|t| app.tab_badge(t)).collect();
     let mut x = area.x;
     let mut spans = Vec::new();
     for (i, t) in Tab::ALL.into_iter().enumerate() {
@@ -1729,14 +1766,22 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
             label.push_str(&ci_icon(worst.as_deref()).content);
             label.push(' ');
         }
-        let w = label.width() as u16;
-        if x + w > area.right() {
+        // ` 2 Conversation 7 +2 `: the badge is its own click target (the first new entry).
+        let badge = badges[i].as_ref().map(|b| format!("{b} "));
+        let (w, bw) = (label.width() as u16, badge.as_ref().map_or(0, |b| b.width() as u16));
+        if x + w + bw > area.right() {
             break;
         }
         let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
         spans.push(Span::styled(label, style));
         app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::SetTab(t)));
         x += w;
+        if let Some(b) = badge {
+            let bstyle = if active { style } else { Style::new().fg(ACCENT).bold() };
+            spans.push(Span::styled(b, bstyle));
+            app.hits.buttons.push((Rect::new(x, area.y, bw, 1), Action::OpenNew(t)));
+            x += bw;
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
     let toggle = if app.info_collapsed() { " ▾ info " } else { " ▴ info " };
@@ -1861,25 +1906,100 @@ fn review_state_span(state: &str) -> Span<'static> {
     }
 }
 
-/// One timeline entry: a header line and its rendered body.
-fn entry(rows: &mut Vec<DetailRow>, w: usize, author: &str, what: Span<'static>, ts: &str, body: &str, html: &str, img: &mut Imgs) {
+/// What the open PR's visit knows: the new entries and the baseline they're new against.
+#[derive(Clone, Copy)]
+struct News<'a> {
+    marks: &'a NewMarks,
+    since: &'a Snapshot,
+}
+
+/// How a timeline entry is marked: new (with the divider's count before the first one).
+#[derive(Clone, Copy, Default)]
+struct Mark {
+    new: bool,
+    divider: Option<usize>,
+}
+
+/// Hands out the divider to the first new entry drawn.
+struct Divider(Option<usize>);
+
+impl Divider {
+    fn new(n: usize) -> Self {
+        Self((n > 0).then_some(n))
+    }
+
+    fn mark(&mut self, new: bool) -> Mark {
+        Mark { new, divider: if new { self.0.take() } else { None } }
+    }
+}
+
+/// `── 2 new since you last looked ────`; clicking it jumps to the next new entry.
+fn new_divider(rows: &mut Vec<DetailRow>, n: usize, w: usize) {
+    let label = format!("── {n} new since you last looked ");
+    let fill = w.saturating_sub(label.width());
+    rows.push((
+        Line::from(vec![Span::styled(label, Style::new().fg(NEW).bold()), Span::styled("─".repeat(fill), Style::new().fg(NEW))]),
+        vec![(0, u16::MAX, "#nextnew".into())],
+    ));
+}
+
+/// The ` · NEW` word after an entry's header.
+fn new_word() -> [Span<'static>; 2] {
+    [Span::styled(" · ", Style::new().fg(DIM)), Span::styled("NEW", Style::new().fg(NEW).bold())]
+}
+
+/// Tag the row at `at` as a `NEW` entry for `n`/`p` (a zero-width link no click can hit).
+fn tag_new(rows: &mut [DetailRow], at: usize) {
+    if let Some((_, links)) = rows.get_mut(at) {
+        links.push((0, 0, NEW_LINK.into()));
+    }
+}
+
+/// One timeline entry: a header line and its rendered body. A new one has a yellow bar and
+/// the word `NEW`.
+#[allow(clippy::too_many_arguments)]
+fn entry(rows: &mut Vec<DetailRow>, w: usize, author: &str, what: Span<'static>, ts: &str, body: &str, html: &str, img: &mut Imgs, mark: Mark) {
     gap(rows);
-    push_wrapped(
-        rows,
-        Line::from(vec![
-            Span::styled("▍", Style::new().fg(ACCENT)),
-            Span::styled(author.to_string(), Style::new().fg(Color::Blue).bold()),
-            Span::raw(" "),
-            what,
-            Span::styled(format!(" · {} ago", ago(ts)), Style::new().fg(DIM)),
-        ]),
-        w,
-        "▍ ",
-        None,
-    );
+    if let Some(n) = mark.divider {
+        new_divider(rows, n, w);
+    }
+    let bar = Style::new().fg(if mark.new { NEW } else { ACCENT });
+    let mut head = vec![
+        Span::styled("▍", bar),
+        Span::styled(author.to_string(), Style::new().fg(Color::Blue).bold()),
+        Span::raw(" "),
+        what,
+        Span::styled(format!(" · {} ago", ago(ts)), Style::new().fg(DIM)),
+    ];
+    if mark.new {
+        head.extend(new_word());
+    }
+    let at = rows.len();
+    push_wrapped(rows, Line::from(head), w, "▍ ", None);
+    if mark.new {
+        tag_new(rows, at);
+    }
     if !clean_body(body).trim().is_empty() {
         body_lines(body, html, w, "▍ ", rows, img);
     }
+}
+
+/// ` Merged 2h ago by alice ` over the PR info when it merged or closed since you last looked.
+fn state_banner(d: &PrDetail, before: &str, w: usize) -> Option<Line<'static>> {
+    if before != "OPEN" || d.state == "OPEN" {
+        return None;
+    }
+    let (what, ev, color) = match d.state.as_str() {
+        "MERGED" => ("Merged", d.last_event("MergedEvent"), Color::Magenta),
+        _ => ("Closed", d.last_event("ClosedEvent"), Color::Red),
+    };
+    let mut text = format!("── {what}");
+    if let Some(TimelineEvent { actor, created_at, .. }) = ev {
+        text.push_str(&format!(" {} ago by {}", ago(created_at), login_of(actor)));
+    }
+    text.push_str(" since you last looked ");
+    let fill = w.saturating_sub(text.width());
+    Some(Line::from(vec![Span::styled(text, Style::new().fg(color).bold()), Span::styled("─".repeat(fill), Style::new().fg(color))]))
 }
 
 fn end_marker(rows: &mut Vec<DetailRow>) {
@@ -1888,42 +2008,50 @@ fn end_marker(rows: &mut Vec<DetailRow>) {
 }
 
 /// Comments plus review verdicts, oldest first (inline review comments live in Reviews).
-fn conversation_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
+fn conversation_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs, news: Option<News>) {
     enum Item<'a> {
         Comment(&'a crate::github::Comment),
         Review(&'a crate::github::Review),
     }
-    let mut items: Vec<(&str, Item)> = d.comments.iter().map(|c| (c.created_at.as_str(), Item::Comment(c))).collect();
-    for r in d.reviews.iter() {
+    let empty = NewMarks::default();
+    let marks = news.map_or(&empty, |n| n.marks);
+    let mut items: Vec<(&str, Item, bool)> =
+        d.comments.iter().enumerate().map(|(i, c)| (c.created_at.as_str(), Item::Comment(c), marks.comments.contains(&i))).collect();
+    for (i, r) in d.reviews.iter().enumerate() {
         // Empty "COMMENTED" reviews are just containers for inline comments.
         if r.state == "COMMENTED" && clean_body(&r.body).trim().is_empty() {
             continue;
         }
-        items.push((r.submitted_at.as_deref().unwrap_or(""), Item::Review(r)));
+        items.push((r.submitted_at.as_deref().unwrap_or(""), Item::Review(r), marks.reviews.contains(&i)));
     }
     items.sort_by(|a, b| a.0.cmp(b.0));
     if items.is_empty() {
         rows.push((Line::styled("No comments yet. Press c to add one.", Style::new().fg(DIM).italic()), Vec::new()));
         return;
     }
-    for (ts, item) in items {
+    let mut divider = Divider::new(items.iter().filter(|i| i.2).count());
+    for (ts, item, new) in items {
+        let mark = divider.mark(new);
         match item {
-            Item::Comment(c) => entry(rows, w, login_of(&c.author), Span::styled("commented", Style::new().fg(Color::Gray)), ts, &c.body, &c.body_html, img),
-            Item::Review(r) => entry(rows, w, login_of(&r.author), review_state_span(&r.state), ts, &r.body, &r.body_html, img),
+            Item::Comment(c) => entry(rows, w, login_of(&c.author), Span::styled("commented", Style::new().fg(Color::Gray)), ts, &c.body, &c.body_html, img, mark),
+            Item::Review(r) => entry(rows, w, login_of(&r.author), review_state_span(&r.state), ts, &r.body, &r.body_html, img, mark),
         }
     }
     end_marker(rows);
 }
 
-fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
-    // Latest verdict per reviewer: a later COMMENTED doesn't override an approval.
-    let mut latest: Vec<(String, String)> = Vec::new();
-    for r in d.reviews.iter() {
+fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs, news: Option<News>) {
+    let empty = NewMarks::default();
+    let marks = news.map_or(&empty, |n| n.marks);
+    // Latest verdict per reviewer (and whether it's new): a later COMMENTED doesn't override an approval.
+    let mut latest: Vec<(String, String, bool)> = Vec::new();
+    for (i, r) in d.reviews.iter().enumerate() {
         let who = login_of(&r.author).to_string();
-        match latest.iter_mut().find(|(a, _)| *a == who) {
-            Some(e) if r.state != "COMMENTED" => e.1 = r.state.clone(),
+        let new = marks.reviews.contains(&i) && r.state != "COMMENTED";
+        match latest.iter_mut().find(|(a, ..)| *a == who) {
+            Some(e) if r.state != "COMMENTED" => *e = (who, r.state.clone(), new),
             Some(_) => {}
-            None => latest.push((who, r.state.clone())),
+            None => latest.push((who, r.state.clone(), new)),
         }
     }
     let pending: Vec<_> = d.review_requests.iter().filter_map(|r| r.requested_reviewer.as_ref()).map(|r| r.display()).collect();
@@ -1931,31 +2059,40 @@ fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Im
     if latest.is_empty() && pending.is_empty() {
         rows.push((Line::styled("  No reviews yet.", Style::new().fg(DIM).italic()), Vec::new()));
     }
-    for (who, state) in &latest {
-        rows.push((Line::from(vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), review_state_span(state)]), Vec::new()));
+    for (who, state, new) in &latest {
+        let mut l = vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), review_state_span(state)];
+        if *new {
+            l.push(Span::raw("  "));
+            l.push(Span::styled("NEW", Style::new().fg(NEW).bold()));
+        }
+        rows.push((Line::from(l), Vec::new()));
     }
     for who in &pending {
         rows.push((Line::from(vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), Span::styled("◔ awaiting review", Style::new().fg(Color::Yellow))]), Vec::new()));
     }
 
-    let with_body: Vec<_> = d.reviews.iter().filter(|r| !clean_body(&r.body).trim().is_empty()).collect();
+    let with_body: Vec<_> = d.reviews.iter().enumerate().filter(|(_, r)| !clean_body(&r.body).trim().is_empty()).collect();
+    let threads: Vec<_> = d.review_threads.iter().enumerate().collect();
+    // One divider, before the first new entry drawn (summaries come before threads).
+    let n_new = with_body.iter().filter(|(i, _)| marks.reviews.contains(i)).count() + marks.threads.len();
+    let mut divider = Divider::new(n_new);
     if !with_body.is_empty() {
         section(rows, &format!("Review summaries ({})", with_body.len()), w);
-        for r in with_body {
-            entry(rows, w, login_of(&r.author), review_state_span(&r.state), r.submitted_at.as_deref().unwrap_or(""), &r.body, &r.body_html, img);
+        for (i, r) in with_body {
+            let mark = divider.mark(marks.reviews.contains(&i));
+            entry(rows, w, login_of(&r.author), review_state_span(&r.state), r.submitted_at.as_deref().unwrap_or(""), &r.body, &r.body_html, img, mark);
         }
     }
 
-    let threads: Vec<_> = d.review_threads.iter().collect();
-    let open = threads.iter().filter(|t| !t.is_resolved).count();
+    let open = threads.iter().filter(|(_, t)| !t.is_resolved).count();
     section(rows, &format!("Inline threads ({} · {open} unresolved)", threads.len()), w);
     if threads.is_empty() {
         rows.push((Line::styled("No inline review comments.", Style::new().fg(DIM).italic()), Vec::new()));
     }
     // Unresolved threads first, then by file.
     let mut threads = threads;
-    threads.sort_by(|a, b| (a.is_resolved, &a.path, a.line).cmp(&(b.is_resolved, &b.path, b.line)));
-    for t in threads {
+    threads.sort_by(|(_, a), (_, b)| (a.is_resolved, &a.path, a.line).cmp(&(b.is_resolved, &b.path, b.line)));
+    for (ti, t) in threads {
         gap(rows);
         let loc = match t.line {
             Some(l) => format!("{}:{l}", t.path),
@@ -1969,14 +2106,40 @@ fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Im
             "   ",
             None,
         );
-        for c in t.comments.iter() {
-            entry(rows, w, login_of(&c.author), Span::raw(""), &c.created_at, &c.body, &c.body_html, img);
+        for (ci, c) in t.comments.iter().enumerate() {
+            let mark = divider.mark(marks.threads.contains(&(ti, ci)));
+            entry(rows, w, login_of(&c.author), Span::raw(""), &c.created_at, &c.body, &c.body_html, img, mark);
         }
     }
     end_marker(rows);
 }
 
-fn commits_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
+/// `head moved d1e3597 → 9af01c2 (force-push by alice, 5m ago)` when the head was rewritten
+/// since you last looked.
+fn force_push_banner(d: &PrDetail, since: &Snapshot, w: usize) -> Option<Line<'static>> {
+    if since.head.is_empty() || since.head == d.head_ref_oid {
+        return None;
+    }
+    let ev = d.timeline_items.iter().filter(|e| e.typename == "HeadRefForcePushedEvent" && e.created_at.as_str() > since.updated_at.as_str()).last();
+    if ev.is_none() && d.commits.total_count > since.commits {
+        return None;
+    }
+    let mut why = "force-push".to_string();
+    if let Some(e) = ev {
+        why.push_str(&format!(" by {}, {} ago", login_of(&e.actor), ago(&e.created_at)));
+    }
+    let text = format!("head moved {} → {} ({why})", short_sha(&since.head), short_sha(&d.head_ref_oid));
+    Some(Line::from(vec![Span::styled("! ", Style::new().fg(NEW).bold()), Span::styled(truncate(&text, w.saturating_sub(2)), Style::new().fg(NEW).bold())]))
+}
+
+fn commits_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, news: Option<News>) {
+    if let Some(b) = news.and_then(|n| force_push_banner(d, n.since, w)) {
+        rows.push((b, Vec::new()));
+        gap(rows);
+    }
+    let empty = NewMarks::default();
+    let marks = news.map_or(&empty, |n| n.marks);
+    let mut divider = Divider::new(marks.commits.len());
     let shown = d.commits.nodes.iter().flatten().count();
     let mut head = vec![Span::styled(format!("{} commits", d.commits.total_count), Style::new().bold())];
     if d.commits.total_count > shown {
@@ -1985,19 +2148,27 @@ fn commits_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
     head.push(Span::styled("   click a commit to open it", Style::new().fg(DIM)));
     rows.push((Line::from(head), Vec::new()));
     gap(rows);
-    for c in d.commits.nodes.iter().flatten().rev().map(|n| &n.commit) {
+    let all: Vec<_> = d.commits.nodes.iter().flatten().map(|n| &n.commit).enumerate().collect();
+    for (i, c) in all.into_iter().rev() {
         let link = Some(c.url.clone());
-        let headline = truncate(&c.message_headline, w.saturating_sub(12));
-        rows.push((
-            Line::from(vec![
-                ci_icon(c.status_check_rollup.as_ref().map(|r| r.state.as_str())),
-                Span::raw(" "),
-                Span::styled(c.abbreviated_oid.clone(), Style::new().fg(Color::Yellow)),
-                Span::raw(" "),
-                Span::styled(headline, Style::new().bold()),
-            ]),
-            full_row_link(&link),
-        ));
+        let mark = divider.mark(marks.commits.contains(&i));
+        if let Some(n) = mark.divider {
+            new_divider(rows, n, w);
+        }
+        let headline = truncate(&c.message_headline, w.saturating_sub(if mark.new { 18 } else { 12 }));
+        let mut l = vec![
+            ci_icon(c.status_check_rollup.as_ref().map(|r| r.state.as_str())),
+            Span::raw(" "),
+            Span::styled(c.abbreviated_oid.clone(), Style::new().fg(Color::Yellow)),
+            Span::raw(" "),
+            Span::styled(headline, Style::new().bold()),
+        ];
+        let mut links = full_row_link(&link);
+        if mark.new {
+            l.extend(new_word());
+            links.push((0, 0, NEW_LINK.into()));
+        }
+        rows.push((Line::from(l), links));
         let meta = format!("{} · {} ago", c.author(), ago(&c.committed_date));
         if density() == Density::Compact {
             // One line per commit: append the author and age to the headline row.
@@ -2757,7 +2928,8 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("y", "Copy `gh pr checkout` command to clipboard"),
         ("D / click ≡", "Display density: Comfortable → Cozy → Compact"),
         ("u / click N unread", "Only PRs with changes since you last opened them (• in the gutter)"),
-        ("U", "Mark every listed PR read (opening a PR marks it read)"),
+        ("U", "Mark every listed PR read (opening a PR marks it read; J/K after 1 s)"),
+        ("/ Sort unread first", "Unread PRs at the top (palette command)"),
         ("?", "This help · Ctrl+C quits"),
         ("", "List"),
         ("↑↓ j k  PgUp PgDn  g G", "Move selection"),
@@ -2769,6 +2941,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("J K", "Next / previous PR while reading details"),
         ("1-7  [ ]  click tab", "Description · Conversation · Changes · Commits · Checks · Actions · Reviews"),
         ("n p  ↑ ↓  click", "Pick a file in Changes (j k scroll its diff)"),
+        ("n p  click +n / ── new", "Next / previous NEW entry (Conversation, Commits, Reviews)"),
         ("i", "Collapse / expand the PR info header"),
         ("I / click img:", "Show / hide inline images (click one to enlarge, o opens it)"),
         ("c", "Comment (type @ for mention autocomplete)"),
@@ -2791,8 +2964,9 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("click", "Select rows, buttons, menu items, check links"),
         ("click ↻ digest", "Jump to a PR the last refresh changed (status line)"),
         ("click outside", "Dismiss a popup"),
-        ("", "Images (config.toml)"),
+        ("", "config.toml"),
         ("images = …", "auto · kitty · sixel · iterm2 · halfblocks · off  (GH_PR_MANAGER_IMAGES)"),
+        ("[notify] bell desktop", "Bell / desktop notice: review asked, verdict, CI failed (off)"),
     ];
     let area = centered(f.area(), 88, rows.len() as u16 + 4);
     f.render_widget(Clear, area);

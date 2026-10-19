@@ -821,12 +821,14 @@ pub enum Command {
     Images,
     UnreadOnly,
     MarkAllRead,
+    UnreadFirst,
+    NextNew,
     Help,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 22] = [
         Command::Comment,
         Command::Merge,
         Command::Approve,
@@ -845,6 +847,8 @@ impl Command {
         Command::Images,
         Command::UnreadOnly,
         Command::MarkAllRead,
+        Command::UnreadFirst,
+        Command::NextNew,
         Command::Help,
         Command::Quit,
     ];
@@ -869,6 +873,8 @@ impl Command {
             Command::Images => "Show / hide images",
             Command::UnreadOnly => "Unread only (show / hide read PRs)",
             Command::MarkAllRead => "Mark all read",
+            Command::UnreadFirst => "Sort unread first (on / off)",
+            Command::NextNew => "Next new entry (NEW since you last looked)",
             Command::Help => "Help",
             Command::Quit => "Quit",
         }
@@ -892,6 +898,8 @@ impl Command {
             Command::Images => "I",
             Command::UnreadOnly => "u",
             Command::MarkAllRead => "U",
+            Command::UnreadFirst => "",
+            Command::NextNew => "n",
             Command::Help => "?",
             Command::Quit => "q",
         }

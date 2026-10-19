@@ -11,7 +11,7 @@ use ratatui::widgets::{ListState, TableState};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::actions_log::{self, ParsedLog};
-use crate::changes::{self, Change, Snapshot};
+use crate::changes::{self, Change, NewMarks, Snapshot};
 use crate::config::Config;
 use crate::editor::{Editor, VisualRow};
 use crate::images::{ImageKey, ImageMsg, ImagePlacement, ImageStore};
@@ -46,6 +46,10 @@ pub const DIGEST_SECS: u64 = 10;
 const OWN_SECS: u64 = 120;
 /// PRs named in the refresh digest before "+n more".
 const DIGEST_ITEMS: usize = 3;
+/// Skimming with J/K (or the list keys in the detail view) reads a PR after it stayed open this long.
+const DWELL: Duration = Duration::from_secs(1);
+/// At most one notification per PR this often.
+const NOTIFY_EVERY: Duration = Duration::from_secs(300);
 
 /// A rendered detail row plus its clickable link ranges (start col, end col, url).
 pub type DetailRow = (ratatui::text::Line<'static>, Vec<(u16, u16, String)>);
@@ -163,6 +167,11 @@ impl Tab {
     fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
+
+    /// Timeline tabs, with `NEW` markers and `n`/`p` between them.
+    pub fn has_new(self) -> bool {
+        matches!(self, Tab::Conversation | Tab::Reviews | Tab::Commits)
+    }
 }
 
 /// Everything a key press or a click can trigger.
@@ -182,6 +191,13 @@ pub enum Action {
     ToggleUnreadOnly,
     /// Mark every listed PR read (`U`).
     MarkAllRead,
+    /// Sort unread PRs first (palette).
+    ToggleUnreadFirst,
+    /// Next / previous `NEW` entry in Conversation, Reviews or Commits (`n` / `p`).
+    NextNew,
+    PrevNew,
+    /// A tab's `+n` badge: show the tab at its first new entry.
+    OpenNew(Tab),
     /// Select (in the detail view: open) a PR by id; the refresh digest's items.
     JumpTo(String),
     /// Open the search palette (empty), or with the pinned query to edit it.
@@ -329,6 +345,24 @@ pub struct Digest {
     pub since_last: bool,
 }
 
+/// The PR open in the detail view, and what you'd seen of it before (frozen at open, so the
+/// `NEW` markers stay until you leave it).
+pub struct Visit {
+    pub id: String,
+    /// Bumped per visit; keys the rendered tabs (their markers depend on it).
+    pub serial: u64,
+    pub started: Instant,
+    pub since: Option<Seen>,
+    pub marks: NewMarks,
+    /// Checks whose outcome changed, and runs that finished, while it was open.
+    pub checks: HashSet<String>,
+    pub runs: HashSet<u64>,
+    /// Badge totals already shown, per tab (`SetTab`, `n`/`p`).
+    pub ack: HashMap<Tab, usize>,
+    /// The detail last taken as read (its fetch time).
+    read_at: Option<Instant>,
+}
+
 /// Click targets recorded during the last render.
 #[derive(Default)]
 pub struct Hits {
@@ -337,6 +371,8 @@ pub struct Hits {
     pub sidebar: Option<(Rect, usize)>,
     pub detail: Option<Rect>,
     pub detail_links: Vec<Vec<(u16, u16, String)>>,
+    /// Rows of the shown tab's `NEW` entries (their header rows), for `n`/`p`.
+    pub new_rows: Vec<usize>,
     /// X of the detail text column, for mapping clicks onto link ranges.
     pub detail_text_x: u16,
     pub detail_max_scroll: usize,
@@ -669,6 +705,19 @@ pub struct App {
     loading_query: String,
     list_query: String,
     list_complete: bool,
+    pub visit: Option<Visit>,
+    visit_serial: u64,
+    /// A PR reached by skimming (J/K), and when; it's read after `DWELL`.
+    dwell: Option<(String, Instant)>,
+    /// Bring the shown tab's first `NEW` entry into view on the next frame (a badge click).
+    pub jump_new: bool,
+    /// The last `n`/`p` target (index into `hits.new_rows`) and the scroll it set.
+    new_cursor: Option<(usize, usize)>,
+    /// When each PR last notified, and how notifications go out (worked out on first use).
+    notified: HashMap<String, Instant>,
+    emission: Option<changes::Emission>,
+    /// The last notification's text (status line and tests).
+    pub last_notification: Option<String>,
 }
 
 impl App {
@@ -776,6 +825,14 @@ impl App {
             loading_query: String::new(),
             list_query: String::new(),
             list_complete: false,
+            visit: None,
+            visit_serial: 0,
+            dwell: None,
+            jump_new: false,
+            new_cursor: None,
+            notified: HashMap::new(),
+            emission: None,
+            last_notification: None,
         }
     }
 
@@ -1105,11 +1162,16 @@ impl App {
 
     /// Indices into `prs` the list shows: `visible_base`, narrowed to unread PRs when that filter is on.
     pub fn visible(&self) -> Vec<usize> {
-        let base = self.visible_base();
-        if !self.unread_only {
-            return base;
+        let mut base = self.visible_base();
+        let unread = |i: usize| self.unread.contains_key(&self.prs[i].id) || self.unread_keep.contains(&self.prs[i].id);
+        if self.unread_only {
+            base.retain(|&i| unread(i));
         }
-        base.into_iter().filter(|&i| self.unread.contains_key(&self.prs[i].id) || self.unread_keep.contains(&self.prs[i].id)).collect()
+        if self.state.unread_first {
+            // Stable: each group keeps its order.
+            base.sort_by_key(|&i| !unread(i));
+        }
+        base
     }
 
     /// Unread PRs among `visible_base`.
@@ -1399,6 +1461,15 @@ impl App {
             return;
         }
         self.select((self.sel as isize + delta).clamp(0, n - 1) as usize);
+        self.skim();
+    }
+
+    /// Moving through PRs in the detail view (J/K, the list keys, the wheel) reads one only
+    /// after it stayed open for `DWELL`.
+    fn skim(&mut self) {
+        if self.screen == Screen::Detail {
+            self.dwell = self.selected_pr().map(|p| (p.id.clone(), Instant::now()));
+        }
     }
 
     fn scroll_detail(&mut self, delta: isize) {
@@ -1449,6 +1520,10 @@ impl App {
         }
         self.images.evict();
         self.drive_search();
+        // A skimmed-to PR is read once the dwell is over.
+        if self.dwell.as_ref().is_some_and(|(_, at)| at.elapsed() >= DWELL) {
+            self.read_open();
+        }
     }
 
     pub fn handle(&mut self, msg: Msg) {
@@ -1557,19 +1632,35 @@ impl App {
                     Ok((d, rate)) => {
                         self.rate = rate.or(self.rate.take());
                         self.detail_errors.remove(&id);
+                        let me = self.viewer.as_ref().map(|v| v.login.clone());
+                        // While the PR is open: checks that changed (the Checks badge), and what
+                        // others did since the last detail of this visit (digest, notification).
+                        let mut ch = Vec::new();
+                        if let Some(v) = self.visit.as_mut().filter(|v| v.id == id)
+                            && let Some((old, at)) = self.details.get(&id)
+                        {
+                            v.checks.extend(changes::checks_changed(old, &d));
+                            if *at >= v.started && !self.own_pending.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(OWN_SECS)) {
+                                ch = changes::diff_detail(old, &d, me.as_deref(), &self.cfg.bots);
+                            }
+                        }
                         // Keep the list row in sync with the fresher detail.
                         if let Some(p) = self.prs.iter_mut().find(|p| p.id == id) {
-                            p.title = d.title.clone();
-                            p.state = d.state.clone();
-                            p.is_draft = d.is_draft;
-                            p.review_decision = d.review_decision.clone();
+                            p.absorb(&d, me.as_deref());
                             self.prs_rev += 1;
                         }
                         if self.own(&id) {
                             self.mark_read(&id);
                         }
                         self.rebuild_unread();
-                        self.details.insert(id, (d, Instant::now()));
+                        self.details.insert(id.clone(), (d, Instant::now()));
+                        self.refresh_marks();
+                        if !ch.is_empty() {
+                            let ch = vec![(id, ch)];
+                            let prs = self.prs.clone();
+                            self.set_digest(&ch, &prs, false);
+                            self.notify(&ch, &prs);
+                        }
                         self.ensure_files(false);
                         self.ensure_runs(false);
                     }
@@ -1633,6 +1724,7 @@ impl App {
                             }
                         }
                         runs.sort_by_key(|r| (r.head_sha != sha, pushes.iter().position(|p| *p == r.head_sha)));
+                        self.runs_finished(&id, &sha, &runs);
                         let current = self.selected_pr().is_some_and(|p| p.id == id);
                         let first = self.runs.get(&id).is_none_or(|e| e.sha != sha);
                         let key = if current && !first { self.selected_key() } else { None };
@@ -1872,6 +1964,8 @@ impl App {
             KeyCode::Char('[') if self.screen == Screen::Detail => Some(Action::PrevTab),
             KeyCode::Char('n') if self.screen == Screen::Detail && self.tab == Tab::Changes => Some(Action::NextFile),
             KeyCode::Char('p') if self.screen == Screen::Detail && self.tab == Tab::Changes => Some(Action::PrevFile),
+            KeyCode::Char('n') if self.screen == Screen::Detail && self.tab.has_new() => Some(Action::NextNew),
+            KeyCode::Char('p') if self.screen == Screen::Detail && self.tab.has_new() => Some(Action::PrevNew),
             KeyCode::Down if in_detail_pane && self.tab == Tab::Changes => Some(Action::NextFile),
             KeyCode::Up if in_detail_pane && self.tab == Tab::Changes => Some(Action::PrevFile),
             KeyCode::Char('i') if self.screen == Screen::Detail => Some(Action::ToggleInfo),
@@ -2118,8 +2212,10 @@ impl App {
             let rows = (r.height as usize / per).max(1);
             if self.sel < new_off {
                 self.select(new_off);
+                self.skim();
             } else if self.sel >= new_off + rows {
                 self.select(new_off + rows - 1);
+                self.skim();
             }
         }
     }
@@ -2332,6 +2428,26 @@ impl App {
                 self.save_state();
                 self.toast(format!("Marked {} PR{} read", ids.len(), if ids.len() == 1 { "" } else { "s" }), ToastKind::Success);
             }
+            Action::ToggleUnreadFirst => {
+                let prev = self.selected_pr().map(|p| p.id.clone());
+                self.state.unread_first = !self.state.unread_first;
+                self.unread_keep.clear();
+                if self.screen == Screen::Detail
+                    && let Some(id) = &prev
+                {
+                    self.unread_keep.insert(id.clone());
+                }
+                crate::state::save(&self.state);
+                self.keep_selected(prev);
+                self.toast(if self.state.unread_first { "Unread PRs first" } else { "Sorted by last update" }, ToastKind::Info);
+            }
+            Action::NextNew => self.jump_new_entry(false),
+            Action::PrevNew => self.jump_new_entry(true),
+            Action::OpenNew(t) => {
+                self.run(Action::SetTab(t));
+                self.jump_new = t.has_new();
+                self.new_cursor = None;
+            }
             Action::JumpTo(id) => {
                 let Some(idx) = self.prs.iter().position(|p| p.id == id) else {
                     return self.toast("That PR is no longer in the list", ToastKind::Info);
@@ -2422,8 +2538,11 @@ impl App {
                 if t != self.tab {
                     self.tab = t;
                     self.detail_scroll = 0;
+                    self.new_cursor = None;
                     self.end_log_search_input();
                 }
+                // Showing a tab clears its badge; its `NEW` markers stay until you leave the PR.
+                self.ack_tab(t);
                 self.focus = Focus::Detail;
                 self.ensure_files(false);
                 self.ensure_runs(false);
@@ -2556,6 +2675,9 @@ impl App {
                 }
             }
             Action::Internal(link) => {
+                if link == "nextnew" {
+                    return self.jump_new_entry(false);
+                }
                 if let Some(key) = link.strip_prefix("image:") {
                     return self.run(Action::ViewImage(key.to_string()));
                 }
@@ -2904,15 +3026,12 @@ impl App {
     /// A list row whose open detail is newer takes the detail's fields: search results can lag
     /// a little, and a stale row would read as a change back and forth.
     fn absorb_details(&mut self, ids: &HashSet<String>) {
+        let me = self.viewer.as_ref().map(|v| v.login.as_str());
         for p in self.prs.iter_mut().filter(|p| ids.contains(&p.id)) {
             if let Some((d, _)) = self.details.get(&p.id)
                 && d.updated_at > p.updated_at
             {
-                p.title = d.title.clone();
-                p.state = d.state.clone();
-                p.is_draft = d.is_draft;
-                p.review_decision = d.review_decision.clone();
-                p.updated_at = d.updated_at.clone();
+                p.absorb(d, me);
             }
         }
     }
@@ -2930,17 +3049,26 @@ impl App {
         for p in self.prs.iter().filter(|p| ids.contains(&p.id)) {
             let own = self.own_pending.get(&p.id).is_some_and(|at| at.elapsed() < Duration::from_secs(OWN_SECS));
             let snap = Snapshot::of_summary(p, me.as_deref());
+            let gh_unread = p.is_read_by_viewer == Some(false);
             match self.state.seen.get_mut(&p.id) {
-                Some(s) if own => *s = Seen { snap: snap.rebase_on(Some(&s.snap)), at: now, unread: false },
+                // Yours, or read on github.com since (GitHub's flag went false → true): what's
+                // there now is seen.
+                Some(s) if own || (s.gh_unread && p.is_read_by_viewer == Some(true)) => {
+                    let ids = if own { std::mem::take(&mut s.ids) } else { Vec::new() };
+                    *s = Seen { snap: snap.rebase_on(Some(&s.snap)), at: now, unread: false, ids, gh_unread };
+                }
                 // Still listed: keep it from being evicted (daily is plenty for a 30-day TTL).
                 Some(s) => {
                     if now - s.at > 86400 {
                         s.at = now;
                     }
+                    if p.is_read_by_viewer.is_some() {
+                        s.gh_unread = gh_unread;
+                    }
                 }
                 None => {
-                    let unread = !own && (p.is_read_by_viewer == Some(false) || appeared.as_ref().is_some_and(|old| !old.contains(p.id.as_str())));
-                    self.state.seen.insert(p.id.clone(), Seen { snap, at: now, unread });
+                    let unread = !own && (gh_unread || appeared.as_ref().is_some_and(|old| !old.contains(p.id.as_str())));
+                    self.state.seen.insert(p.id.clone(), Seen { snap, at: now, unread, ids: Vec::new(), gh_unread });
                 }
             }
         }
@@ -2975,6 +3103,7 @@ impl App {
                 // `old` too: PRs that left the list are only there.
                 let all: Vec<PrSummary> = now.into_iter().chain(old).collect();
                 self.set_digest(&ch, &all, false);
+                self.notify(&ch, &all);
             }
             // Startup: what changed since you last looked (baselines from an earlier session;
             // ones seeded just now have no diff, so a first run stays quiet).
@@ -2982,11 +3111,17 @@ impl App {
                 let ch: Vec<(String, Vec<Change>)> =
                     now.iter().filter_map(|p| self.unread.get(&p.id).filter(|c| !c.is_empty()).map(|c| (p.id.clone(), c.clone()))).collect();
                 self.set_digest(&ch, &now, true);
+                self.notify(&ch, &now);
             }
             _ => {}
         }
         self.list_query = self.loading_query.clone();
         self.own_pending.retain(|_, at| at.elapsed() < Duration::from_secs(OWN_SECS));
+        // "Unread first" re-sorts on each reload (the open PR stays put).
+        if self.state.unread_first && !self.unread_only {
+            let open = self.selected_pr().map(|p| p.id.clone()).filter(|_| self.screen == Screen::Detail);
+            self.unread_keep.retain(|id| Some(id) == open.as_ref());
+        }
         self.save_state();
     }
 
@@ -3002,23 +3137,179 @@ impl App {
     fn mark_read(&mut self, id: &str) {
         let Some(p) = self.prs.iter().find(|p| p.id == id) else { return };
         let me = self.viewer.as_ref().map(|v| v.login.as_str());
-        let snap = Snapshot::of_summary(p, me).rebase_on(self.state.seen.get(id).map(|s| &s.snap));
-        self.state.seen.insert(id.to_string(), Seen { snap, at: changes::now_secs(), unread: false });
-        if self.unread.remove(id).is_some() && self.unread_only {
+        let prev = self.state.seen.get(id);
+        let snap = Snapshot::of_summary(p, me).rebase_on(prev.map(|s| &s.snap));
+        // The entry ids go: a read without the detail can't say which entries it covered, so
+        // the next `NEW` marks go by time again.
+        let gh_unread = prev.is_some_and(|s| s.gh_unread);
+        self.state.seen.insert(id.to_string(), Seen { snap, at: changes::now_secs(), unread: false, ids: Vec::new(), gh_unread });
+        if self.unread.remove(id).is_some() && (self.unread_only || self.state.unread_first) {
             self.unread_keep.insert(id.to_string());
         }
     }
 
-    /// The PR in the detail view is read.
+    /// The PR in the detail view is being read: start its visit (freezing what you'd seen, for
+    /// the `NEW` markers), then take it as seen, at the summary level at once and at the detail
+    /// level (its entry ids) whenever a detail lands. Skimming with J/K waits for `DWELL`.
     fn read_open(&mut self) {
         if self.screen != Screen::Detail {
+            self.visit = None;
+            self.dwell = None;
             return;
         }
         let Some(id) = self.selected_pr().map(|p| p.id.clone()) else { return };
+        if self.visit.as_ref().is_none_or(|v| v.id != id) {
+            self.visit_serial += 1;
+            self.new_cursor = None;
+            self.visit = Some(Visit {
+                id: id.clone(),
+                serial: self.visit_serial,
+                started: Instant::now(),
+                since: self.state.seen.get(&id).cloned(),
+                marks: NewMarks::default(),
+                checks: HashSet::new(),
+                runs: HashSet::new(),
+                ack: HashMap::new(),
+                read_at: None,
+            });
+            self.refresh_marks();
+        }
+        if self.dwell.as_ref().is_some_and(|(d, at)| *d == id && at.elapsed() < DWELL) {
+            return;
+        }
+        self.dwell = None;
+        let mut dirty = false;
         if self.unread.contains_key(&id) || !self.state.seen.contains_key(&id) {
             self.mark_read(&id);
+            dirty = true;
+        }
+        let at = self.details.get(&id).map(|(_, at)| *at);
+        if let Some(at) = at
+            && (dirty || self.visit.as_ref().is_some_and(|v| v.read_at != Some(at)))
+        {
+            let ids = changes::known_ids(&self.details[&id].0);
+            if let Some(s) = self.state.seen.get_mut(&id)
+                && s.ids != ids
+            {
+                s.ids = ids;
+                dirty = true;
+            }
+            if let Some(v) = self.visit.as_mut() {
+                v.read_at = Some(at);
+            }
+        }
+        if dirty {
             self.save_state();
         }
+    }
+
+    /// Recompute the open PR's `NEW` marks from its detail and the visit's frozen baseline.
+    fn refresh_marks(&mut self) {
+        let me = self.viewer.as_ref().map(|v| v.login.as_str());
+        let Some(v) = self.visit.as_mut() else { return };
+        v.marks = match (self.details.get(&v.id), &v.since) {
+            (Some((d, _)), Some(s)) => changes::new_marks(d, &s.snap, &s.ids, me, &self.cfg.bots),
+            _ => NewMarks::default(),
+        };
+    }
+
+    /// The open PR's new entries (or changes) in tab `t`, whether or not the badge was shown.
+    pub fn tab_new(&self, t: Tab) -> usize {
+        let Some(v) = self.visit.as_ref().filter(|v| self.selected_pr().is_some_and(|p| p.id == v.id)) else { return 0 };
+        let Some(d) = self.details.get(&v.id).map(|(d, _)| d) else { return 0 };
+        let m = &v.marks;
+        // Reviews both tabs show: a verdict, or words (empty COMMENTED ones hold inline comments).
+        let review = |i: &&usize| d.reviews.iter().nth(**i).is_some_and(|r| r.state != "COMMENTED" || !r.body.trim().is_empty());
+        match t {
+            Tab::Description => {
+                let edited = v.since.as_ref().is_some_and(|s| d.last_edited_at.is_some() && d.last_edited_at != s.snap.edited_at && !s.snap.updated_at.is_empty());
+                edited as usize
+            }
+            Tab::Conversation => m.comments.len() + m.reviews.iter().filter(review).count(),
+            Tab::Commits => m.commits.len(),
+            Tab::Checks => v.checks.len(),
+            Tab::Actions => v.runs.len(),
+            Tab::Reviews => m.reviews.iter().filter(review).count() + m.threads.len(),
+            Tab::Changes => 0,
+        }
+    }
+
+    /// Tab `t`'s badge (`+2`, or `✎` for an edited description) until the tab is shown.
+    pub fn tab_badge(&self, t: Tab) -> Option<String> {
+        let total = self.tab_new(t);
+        let acked = self.visit.as_ref().and_then(|v| v.ack.get(&t)).copied().unwrap_or(0);
+        match total.saturating_sub(acked) {
+            0 => None,
+            _ if t == Tab::Description => Some("✎".into()),
+            n => Some(format!("+{n}")),
+        }
+    }
+
+    fn ack_tab(&mut self, t: Tab) {
+        let total = self.tab_new(t);
+        if let Some(v) = self.visit.as_mut() {
+            v.ack.insert(t, total);
+        }
+    }
+
+    /// Workflow runs of PR `id`'s head that finished since its last runs load: the Actions
+    /// badge, and the digest.
+    fn runs_finished(&mut self, id: &str, sha: &str, runs: &[crate::github::WorkflowRunInfo]) {
+        let Some(prev) = self.runs.get(id).filter(|e| e.sha == sha) else { return };
+        let before: HashMap<u64, &str> = prev.runs.iter().map(|r| (r.id, r.status())).collect();
+        let done: Vec<&crate::github::WorkflowRunInfo> =
+            runs.iter().filter(|r| r.head_sha == sha && r.status() == "completed" && before.get(&r.id).is_some_and(|s| *s != "completed")).collect();
+        if done.is_empty() {
+            return;
+        }
+        let failed = done.iter().filter(|r| matches!(r.conclusion.as_deref(), Some("failure" | "timed_out" | "startup_failure" | "action_required"))).count();
+        if let Some(v) = self.visit.as_mut().filter(|v| v.id == id) {
+            v.runs.extend(done.iter().map(|r| r.id));
+        }
+        if !self.own(id) {
+            let prs = self.prs.clone();
+            self.set_digest(&[(id.to_string(), vec![Change::Runs { done: done.len(), failed }])], &prs, false);
+        }
+    }
+
+    /// Ring / notify for interrupt-worthy changes, per `[notify]`: at most once per PR per
+    /// five minutes, and never while a popup is open (the status line still has the digest).
+    fn notify(&mut self, ch: &[(String, Vec<Change>)], prs: &[PrSummary]) {
+        if !self.cfg.notify.enabled() || self.modal.is_some() {
+            return;
+        }
+        let fresh: Vec<(String, Vec<Change>)> = ch.iter().filter(|(id, _)| self.notified.get(id).is_none_or(|t| t.elapsed() >= NOTIFY_EVERY)).cloned().collect();
+        let me = self.viewer.as_ref().map(|v| v.login.as_str());
+        let Some((ids, text)) = changes::notification(&fresh, prs, me, &self.cfg.notify) else { return };
+        let cfg = &self.cfg.notify;
+        let em = *self.emission.get_or_insert_with(|| changes::emission(&cfg.desktop, cfg.bell, &|k| std::env::var(k).ok(), tmux_passthrough()));
+        write_raw(&em.bytes(&text));
+        let now = Instant::now();
+        for id in ids {
+            self.notified.insert(id, now);
+        }
+        self.last_notification = Some(text);
+    }
+
+    /// `n` / `p`: bring the next / previous `NEW` entry of the shown tab into view, wrapping.
+    fn jump_new_entry(&mut self, back: bool) {
+        let rows = self.hits.new_rows.clone();
+        if !self.tab.has_new() || rows.is_empty() {
+            return self.toast("Nothing new here", ToastKind::Info);
+        }
+        let target = |r: usize| r.saturating_sub(1);
+        let n = rows.len();
+        // Step from the last jump while the view hasn't moved since; else from the view's top.
+        let from = self.new_cursor.filter(|(i, set)| *i < n && self.detail_scroll == (*set).min(self.hits.detail_max_scroll)).map(|(i, _)| i);
+        let i = match (from, back) {
+            (Some(i), false) => (i + 1) % n,
+            (Some(i), true) => (i + n - 1) % n,
+            (None, false) => rows.iter().position(|&r| target(r) > self.detail_scroll).unwrap_or(0),
+            (None, true) => rows.iter().rposition(|&r| target(r) < self.detail_scroll).unwrap_or(n - 1),
+        };
+        self.detail_scroll = target(rows[i]);
+        self.new_cursor = Some((i, self.detail_scroll));
+        self.ack_tab(self.tab);
     }
 
     fn save_state(&mut self) {
@@ -3585,6 +3876,9 @@ impl App {
         if c.needs_pr() && self.selected_pr().is_none() {
             return Some("no PR selected".into());
         }
+        if c == Command::NextNew && !(self.screen == Screen::Detail && self.tab.has_new()) {
+            return Some("open a PR's Conversation, Commits or Reviews".into());
+        }
         let d = self.selected_detail()?;
         let entries = self.menu_entries(d, false);
         let reason = |f: fn(&MenuItem) -> bool| entries.iter().find(|e| f(&e.item)).and_then(|e| e.disabled.clone());
@@ -3624,6 +3918,8 @@ impl App {
             Command::Images => Action::ToggleImages,
             Command::UnreadOnly => Action::ToggleUnreadOnly,
             Command::MarkAllRead => Action::MarkAllRead,
+            Command::UnreadFirst => Action::ToggleUnreadFirst,
+            Command::NextNew => Action::NextNew,
             Command::Help => Action::Help,
             Command::Quit => Action::Quit,
         };
@@ -3776,6 +4072,30 @@ fn open_url(url: &str) -> std::io::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Write escape bytes straight to the terminal, past ratatui's buffer (OSC 52, BEL, OSC 9…).
+fn write_raw(bytes: &str) {
+    use std::io::Write;
+    if cfg!(test) || bytes.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(bytes.as_bytes());
+    let _ = out.flush();
+}
+
+/// Inside tmux, whether it passes escape sequences through to the outer terminal.
+fn tmux_passthrough() -> bool {
+    if std::env::var_os("TMUX").is_none() || cfg!(test) {
+        return false;
+    }
+    std::process::Command::new("tmux")
+        .args(["show-options", "-gv", "allow-passthrough"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| matches!(String::from_utf8_lossy(&o.stdout).trim(), "on" | "all"))
 }
 
 /// Copy via the OSC 52 terminal escape, which works over SSH too.
@@ -4277,4 +4597,220 @@ mod change_tests {
         assert_eq!(d.count, 2);
         assert!(d.items.iter().any(|(_, t)| t == "#5 new") && d.items.iter().any(|(_, t)| t == "#1 left the list"), "{:?}", d.items);
     }
+    fn comment(id: &str, who: &str, at: &str) -> Option<crate::github::Comment> {
+        Some(crate::github::Comment { id: id.into(), author: Some(crate::github::Login { login: who.into() }), body: "hi".into(), body_html: String::new(), created_at: at.into() })
+    }
+
+    /// PR #1 got two comments from others after you last looked (and one of yours): open it.
+    async fn open_with_news() -> (App, Vec<PrSummary>, PrDetail) {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[0].comments.total_count = 4;
+        list[0].updated_at = "2026-10-19T03:00:00Z".into();
+        load(&mut app, list.clone());
+        let mut d = detail(&list[0], None);
+        d.updated_at = "2026-10-19T03:00:00Z".into();
+        d.comments.total_count = 4;
+        d.comments.nodes = vec![
+            comment("c1", "bob", "2026-10-18T09:00:00Z"),
+            comment("c2", "bob", "2026-10-19T02:00:00Z"),
+            comment("c3", "wiiiimm", "2026-10-19T02:30:00Z"),
+            comment("c4", "eve", "2026-10-19T03:00:00Z"),
+        ];
+        app.select(0);
+        key(&mut app, KeyCode::Enter);
+        app.handle(Msg::Detail { id: list[0].id.clone(), res: Ok((d.clone(), None)) });
+        (app, list, d)
+    }
+
+    fn draw(app: &mut App) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_freezes_the_baseline_and_set_tab_clears_its_badge_only() {
+        let (mut app, list, _) = open_with_news().await;
+        // Read at once (summary and detail level), but the visit remembers what was new.
+        assert!(unread(&app).is_empty());
+        assert!(!app.state.seen[&list[0].id].ids.is_empty());
+        assert_eq!(app.visit.as_ref().unwrap().marks.comments, vec![1, 3]);
+        assert_eq!(app.tab_badge(Tab::Conversation).as_deref(), Some("+2"));
+        assert_eq!(app.tab_badge(Tab::Commits), None);
+        // The Checks badge counts checks that changed during the visit; showing Conversation leaves it.
+        app.visit.as_mut().unwrap().checks.insert("ci / build".into());
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.tab, Tab::Conversation);
+        assert_eq!(app.tab_badge(Tab::Conversation), None);
+        assert_eq!(app.tab_badge(Tab::Checks).as_deref(), Some("+1"));
+        // The markers stay: two NEW rows, and n / p walk them, wrapping.
+        draw(&mut app);
+        let rows = app.hits.new_rows.clone();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let mut seen = Vec::new();
+        for c in ['n', 'n', 'n', 'p'] {
+            key(&mut app, KeyCode::Char(c));
+            seen.push(app.new_cursor.unwrap().0);
+            draw(&mut app);
+        }
+        assert_eq!(seen, vec![0, 1, 0, 1]);
+        // Leaving the PR ends the visit; coming back, nothing is new any more.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.visit.is_none());
+        key(&mut app, KeyCode::Enter);
+        assert!(app.visit.as_ref().unwrap().marks.comments.is_empty());
+        assert_eq!(app.tab_badge(Tab::Conversation), None);
+        draw(&mut app);
+        assert!(app.hits.new_rows.is_empty());
+        key(&mut app, KeyCode::Char('n'));
+        assert!(app.toast.as_ref().is_some_and(|(m, ..)| m == "Nothing new here"));
+    }
+
+    #[tokio::test]
+    async fn a_badge_click_opens_the_tab_at_its_first_new_entry() {
+        let (mut app, ..) = open_with_news().await;
+        draw(&mut app);
+        let badge = app.hits.buttons.iter().find(|(_, a)| *a == Action::OpenNew(Tab::Conversation)).map(|(r, _)| *r).expect("badge");
+        app.on_click(Position::new(badge.x, badge.y));
+        assert_eq!(app.tab, Tab::Conversation);
+        draw(&mut app);
+        assert!(!app.jump_new);
+        assert_eq!(app.tab_badge(Tab::Conversation), None);
+    }
+
+    #[test]
+    fn read_on_github_clears_unread() {
+        let mut app = test_app();
+        let mut list = prs();
+        list[1].is_read_by_viewer = Some(false);
+        load(&mut app, list.clone());
+        assert_eq!(unread(&app), vec![2]);
+        // #3 gets a comment and GitHub calls it unread too.
+        list[2].comments.total_count = 1;
+        list[2].is_read_by_viewer = Some(false);
+        load(&mut app, list.clone());
+        assert_eq!(unread(&app), vec![2, 3]);
+        // You read both on github.com: false → true.
+        list[1].is_read_by_viewer = Some(true);
+        list[2].is_read_by_viewer = Some(true);
+        load(&mut app, list.clone());
+        assert!(unread(&app).is_empty());
+        assert_eq!(app.state.seen[&list[2].id].snap.comments, 1);
+        // `true` alone (no edge) doesn't hide a change.
+        list[3].is_read_by_viewer = Some(true);
+        list[3].comments.total_count = 2;
+        load(&mut app, list);
+        assert_eq!(unread(&app), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn skimming_reads_after_the_dwell() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[1].comments.total_count = 1;
+        load(&mut app, list.clone());
+        app.select(0);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        // The visit started (its baseline is frozen), but #2 isn't read yet.
+        assert_eq!(app.visit.as_ref().unwrap().id, list[1].id);
+        assert_eq!(unread(&app), vec![2]);
+        app.dwell.as_mut().unwrap().1 -= DWELL;
+        app.on_tick();
+        assert!(unread(&app).is_empty());
+    }
+
+    #[test]
+    fn unread_first_keeps_each_group_in_order() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[2].comments.total_count = 1;
+        list[3].comments.total_count = 1;
+        load(&mut app, list);
+        app.select(1);
+        app.run(Action::ToggleUnreadFirst);
+        let numbers = |app: &App| app.visible().iter().map(|&i| app.prs[i].number).collect::<Vec<_>>();
+        assert_eq!(numbers(&app), vec![3, 4, 1, 2]);
+        // The selection follows the PR.
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        app.run(Action::ToggleUnreadFirst);
+        assert_eq!(numbers(&app), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn comfortable_rows_carry_words_and_clicks_hit_the_right_pr() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[1].comments.total_count = 2;
+        list[1].commits.total_count = 3;
+        load(&mut app, list);
+        app.state.density = crate::state::Density::Comfortable;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let (r, _) = app.hits.table.unwrap();
+        let text = |y: u16| (0..140).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>();
+        // Row 1 (#2) spans r.y + 2 and r.y + 3; its second line holds the words.
+        assert!(text(r.y + 2).contains("pr 2"), "{}", text(r.y + 2));
+        assert!(text(r.y + 3).contains("2 new comments"), "{}", text(r.y + 3));
+        app.on_click(Position::new(r.x + 30, r.y + 3));
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        app.on_click(Position::new(r.x + 30, r.y + 4));
+        assert_eq!(app.selected_pr().unwrap().number, 3);
+    }
+
+    #[tokio::test]
+    async fn finished_runs_feed_the_digest_and_the_actions_badge() {
+        let (mut app, list, d) = open_with_news().await;
+        let run = |status: &str, conclusion: Option<&str>| -> crate::github::WorkflowRunInfo {
+            serde_json::from_value(json!({ "id": 9, "name": "CI", "status": status, "conclusion": conclusion, "event": "pull_request",
+                "run_number": 1, "head_sha": d.head_ref_oid, "html_url": "u", "created_at": "2026-10-19T00:00:00Z", "updated_at": "2026-10-19T00:00:00Z",
+                "run_started_at": null, "actor": null, "triggering_actor": null }))
+            .unwrap()
+        };
+        let msg = |r| Msg::Runs { id: list[0].id.clone(), nwo: "acme/app".into(), sha: d.head_ref_oid.clone(), history: false, res: Ok((vec![r], false)) };
+        app.handle(msg(run("in_progress", None)));
+        app.digest = None;
+        app.handle(msg(run("completed", Some("failure"))));
+        assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run failed");
+        assert_eq!(app.tab_badge(Tab::Actions).as_deref(), Some("+1"));
+    }
+
+    #[test]
+    fn notifications_follow_config_and_rate_limit() {
+        let mut app = test_app();
+        let ci = |state: &str| crate::github::LastCommit {
+            total_count: 1,
+            nodes: vec![Some(crate::github::CommitNode { commit: crate::github::RollupOnly { status_check_rollup: Some(crate::github::RollupState { state: state.into() }) } })],
+        };
+        let mut list = prs();
+        list[0].commits = ci("SUCCESS");
+        load(&mut app, list.clone());
+        // Off by default.
+        list[0].commits = ci("FAILURE");
+        load(&mut app, list.clone());
+        assert!(app.last_notification.is_none());
+        app.cfg.notify.bell = true;
+        list[0].commits = ci("SUCCESS");
+        load(&mut app, list.clone());
+        list[0].commits = ci("FAILURE");
+        load(&mut app, list.clone());
+        assert_eq!(app.last_notification.as_deref(), Some("#1 CI failed"));
+        // Once per PR per five minutes.
+        app.last_notification = None;
+        list[0].review_decision = Some("CHANGES_REQUESTED".into());
+        load(&mut app, list.clone());
+        assert!(app.last_notification.is_none());
+        // Never over a popup.
+        app.notified.clear();
+        app.modal = Some(Modal::Help);
+        list[0].review_decision = Some("APPROVED".into());
+        load(&mut app, list);
+        assert!(app.last_notification.is_none());
+    }
 }
+
