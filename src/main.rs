@@ -6,6 +6,7 @@ mod editor;
 mod github;
 mod images;
 mod search;
+mod stacks;
 mod state;
 mod ui;
 
