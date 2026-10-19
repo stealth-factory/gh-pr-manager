@@ -1,16 +1,24 @@
 //! GitHub GraphQL client, queries, and response types.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 const ENDPOINT: &str = "https://api.github.com/graphql";
+/// The only hosts an image request may send the token to.
+const TOKEN_HOSTS: [&str; 3] = ["github.com", "api.github.com", "raw.githubusercontent.com"];
+/// Image downloads larger than this are refused.
+const IMAGE_CAP: usize = 10 << 20;
 
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     token: String,
+    /// The REST `core` bucket, from the last REST response's `x-ratelimit-*` headers.
+    /// Separate from GraphQL's, which responses carry in their body.
+    rest_rate: Arc<Mutex<Option<RateLimit>>>,
 }
 
 /// Token from `GH_TOKEN` / `GITHUB_TOKEN`, falling back to `gh auth token`.
@@ -43,7 +51,41 @@ pub struct RateLimit {
 impl Client {
     pub fn new(token: String) -> Result<Self> {
         let http = reqwest::Client::builder().user_agent(concat!("gh-pr-manager/", env!("CARGO_PKG_VERSION"))).build()?;
-        Ok(Self { http, token })
+        Ok(Self { http, token, rest_rate: Arc::default() })
+    }
+
+    pub fn rest_rate(&self) -> Option<RateLimit> {
+        self.rest_rate.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// GET a REST URL, recording the rate limit. Non-2xx statuses are returned, not raised.
+    async fn rest_send(&self, url: &str) -> Result<reqwest::Response> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await?;
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+        if let (Some(remaining), Some(limit)) = (header("x-ratelimit-remaining"), header("x-ratelimit-limit"))
+            && let Ok(mut r) = self.rest_rate.lock()
+        {
+            *r = Some(RateLimit { remaining, limit });
+        }
+        Ok(resp)
+    }
+
+    /// GET a REST URL; an HTTP error becomes `HTTP {status}: {message}`.
+    async fn rest_get(&self, url: &str) -> Result<reqwest::Response> {
+        let resp = self.rest_send(url).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or_default();
+            bail!("HTTP {status}: {}", body.get("message").and_then(Value::as_str).unwrap_or("request failed"));
+        }
+        Ok(resp)
     }
 
     async fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
@@ -106,6 +148,29 @@ impl Client {
         Ok(SearchPage { prs, total: r.search.issue_count, next, rate })
     }
 
+    /// One page (100) of the viewer's non-archived repos, most recently pushed first.
+    pub async fn viewer_repos_page(&self, after: Option<String>) -> Result<RepoPage> {
+        #[derive(Deserialize)]
+        struct R {
+            viewer: V,
+        }
+        #[derive(Deserialize)]
+        struct V {
+            repositories: Conn,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Conn {
+            total_count: usize,
+            page_info: PageInfo,
+            nodes: Vec<Option<RepoInfo>>,
+        }
+        let (r, rate): (R, _) = self.graphql(VIEWER_REPOS_QUERY, json!({ "after": after })).await?;
+        let c = r.viewer.repositories;
+        let next = if c.page_info.has_next_page { c.page_info.end_cursor } else { None };
+        Ok(RepoPage { repos: c.nodes.into_iter().flatten().collect(), total: c.total_count, next, rate })
+    }
+
     pub async fn pr_detail(&self, id: &str) -> Result<(PrDetail, Option<RateLimit>)> {
         #[derive(Deserialize)]
         struct R {
@@ -113,6 +178,90 @@ impl Client {
         }
         let (r, rate): (R, _) = self.graphql(DETAIL_QUERY, json!({ "id": id })).await?;
         Ok((r.node.ok_or_else(|| anyhow!("pull request not found"))?, rate))
+    }
+
+    /// Changed files with patches (REST; GraphQL has no diffs). Capped at 1000 files.
+    pub async fn pr_files(&self, name_with_owner: &str, number: u64) -> Result<Vec<FileDiff>> {
+        let mut out = Vec::new();
+        for page in 1..=10 {
+            let url = format!("https://api.github.com/repos/{name_with_owner}/pulls/{number}/files?per_page=100&page={page}");
+            let files: Vec<FileDiff> = self.rest_get(&url).await?.json().await?;
+            let done = files.len() < 100;
+            out.extend(files);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Workflow runs for a head commit, or the latest on a branch (history).
+    pub async fn workflow_runs(&self, nwo: &str, q: RunsQuery<'_>) -> Result<Vec<WorkflowRunInfo>> {
+        #[derive(Deserialize)]
+        struct R {
+            workflow_runs: Vec<WorkflowRunInfo>,
+        }
+        let url = match q {
+            RunsQuery::HeadSha(sha) => format!("https://api.github.com/repos/{nwo}/actions/runs?head_sha={sha}&per_page=100"),
+            RunsQuery::Branch { name, per_page } => {
+                format!("https://api.github.com/repos/{nwo}/actions/runs?branch={}&event=pull_request&per_page={per_page}", url_encode(name))
+            }
+        };
+        let r: R = self.rest_get(&url).await?.json().await?;
+        Ok(r.workflow_runs)
+    }
+
+    /// Jobs (with steps) of a run's latest attempt.
+    pub async fn run_jobs(&self, nwo: &str, run_id: u64) -> Result<Vec<Job>> {
+        #[derive(Deserialize)]
+        struct R {
+            total_count: usize,
+            jobs: Vec<Job>,
+        }
+        let mut out = Vec::new();
+        for page in 1..=5 {
+            let url = format!("https://api.github.com/repos/{nwo}/actions/runs/{run_id}/jobs?per_page=100&page={page}");
+            let r: R = self.rest_get(&url).await?.json().await?;
+            let done = r.jobs.len() < 100 || out.len() + r.jobs.len() >= r.total_count;
+            out.extend(r.jobs);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A finished job's log, keeping the last `cap` bytes. The API redirects to a blob that
+    /// only exists once the job completes; until then this returns `pending`.
+    pub async fn job_log(&self, nwo: &str, job_id: u64, cap: usize) -> Result<JobLog> {
+        let resp = self.rest_send(&format!("https://api.github.com/repos/{nwo}/actions/jobs/{job_id}/logs")).await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND && resp.url().host_str() != Some("api.github.com") {
+            return Ok(JobLog { text: String::new(), dropped_lines: 0, pending: true });
+        }
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or_default();
+            bail!("HTTP {status}: {}", body.get("message").and_then(Value::as_str).unwrap_or("request failed"));
+        }
+        let bytes = resp.bytes().await?;
+        let (kept, dropped_lines) = crate::actions_log::tail(&bytes, cap);
+        Ok(JobLog { text: String::from_utf8_lossy(kept).into_owned(), dropped_lines, pending: false })
+    }
+
+    /// Annotations of a job (a job id is also its check-run id).
+    pub async fn job_annotations(&self, nwo: &str, job_id: u64) -> Result<Vec<Annotation>> {
+        let url = format!("https://api.github.com/repos/{nwo}/check-runs/{job_id}/annotations?per_page=100");
+        Ok(self.rest_get(&url).await?.json().await?)
+    }
+
+    /// How many workflows the repo has; zero means it doesn't use Actions.
+    pub async fn workflow_count(&self, nwo: &str) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct R {
+            total_count: usize,
+        }
+        let r: R = self.rest_get(&format!("https://api.github.com/repos/{nwo}/actions/workflows?per_page=1")).await?.json().await?;
+        Ok(r.total_count)
     }
 
     pub async fn add_comment(&self, subject_id: &str, body: &str) -> Result<()> {
@@ -143,6 +292,35 @@ impl Client {
             json!({ "id": pr_id, "e": event.api_name(), "body": if body.is_empty() { Value::Null } else { body.into() } }),
         )
         .await
+    }
+
+    /// Download an image for inline display: the bytes and the content type (lowercased).
+    /// `auth` asks for the token, which only goes to `TOKEN_HOSTS`; reqwest drops it on a
+    /// redirect to another host (user-attachments redirect to S3).
+    pub async fn fetch_image(&self, url: &str, auth: bool) -> Result<(Vec<u8>, String)> {
+        let host = reqwest::Url::parse(url)?.host_str().unwrap_or_default().to_ascii_lowercase();
+        let mut req = self.http.get(url).header("Accept", "image/*").timeout(std::time::Duration::from_secs(15));
+        if auth && TOKEN_HOSTS.contains(&host.as_str()) {
+            req = req.bearer_auth(&self.token);
+        }
+        let mut resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("HTTP {}", status.as_u16());
+        }
+        let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+        let too_big = || anyhow!("larger than {} MiB", IMAGE_CAP >> 20);
+        if resp.content_length().is_some_and(|n| n > IMAGE_CAP as u64) {
+            return Err(too_big());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > IMAGE_CAP {
+                return Err(too_big());
+            }
+        }
+        Ok((bytes, ctype))
     }
 
     async fn mutate(&self, query: &str, vars: Value) -> Result<()> {
@@ -181,6 +359,117 @@ impl ReviewEvent {
             Self::RequestChanges => "REQUEST_CHANGES",
         }
     }
+}
+
+/// Which workflow runs to list.
+#[derive(Debug, Clone, Copy)]
+pub enum RunsQuery<'a> {
+    HeadSha(&'a str),
+    Branch { name: &'a str, per_page: u8 },
+}
+
+/// Percent-encode a query value (branch names may hold `/`, `#`, `+`…).
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// A workflow run from the REST Actions API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowRunInfo {
+    pub id: u64,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub display_title: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub event: String,
+    pub run_number: u64,
+    #[serde(default)]
+    pub run_attempt: u64,
+    pub head_sha: String,
+    #[serde(default)]
+    pub path: String,
+    pub html_url: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub run_started_at: Option<String>,
+    pub actor: Option<Login>,
+    pub triggering_actor: Option<Login>,
+}
+
+impl WorkflowRunInfo {
+    pub fn name(&self) -> &str {
+        self.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&self.path)
+    }
+
+    pub fn status(&self) -> &str {
+        self.status.as_deref().unwrap_or("queued")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Job {
+    pub id: u64,
+    pub run_id: u64,
+    #[serde(default)]
+    pub run_attempt: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub html_url: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Step {
+    pub name: String,
+    pub number: u64,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Annotation {
+    pub path: String,
+    pub start_line: Option<u64>,
+    pub annotation_level: String,
+    pub title: Option<String>,
+    pub message: String,
+}
+
+pub struct JobLog {
+    pub text: String,
+    /// Whole lines cut from the front to stay under the byte cap.
+    pub dropped_lines: usize,
+    /// The job hasn't finished, so there's no log yet.
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoInfo {
+    pub name_with_owner: String,
+    pub is_private: bool,
+    pub pushed_at: Option<String>,
+}
+
+pub struct RepoPage {
+    pub repos: Vec<RepoInfo>,
+    pub total: usize,
+    pub next: Option<String>,
+    pub rate: Option<RateLimit>,
 }
 
 pub struct SearchPage {
@@ -302,6 +591,9 @@ pub struct PrDetail {
     pub deletions: u64,
     pub changed_files: u64,
     pub head_ref_oid: String,
+    /// Head branch lives in a fork (branch-based run history doesn't reach it).
+    #[serde(default)]
+    pub is_cross_repository: bool,
     pub can_be_rebased: bool,
     pub viewer_can_close: bool,
     pub viewer_can_reopen: bool,
@@ -311,7 +603,8 @@ pub struct PrDetail {
     pub review_requests: Nodes<ReviewRequest>,
     pub participants: Nodes<Login>,
     pub repository: DetailRepo,
-    pub commits: Nodes<CommitNode<DetailCommit>>,
+    pub status_check_rollup: Option<Rollup>,
+    pub commits: CommitConnection,
     pub reviews: Nodes<Review>,
     pub comments: Nodes<Comment>,
     pub review_threads: Nodes<ReviewThread>,
@@ -319,7 +612,7 @@ pub struct PrDetail {
 
 impl PrDetail {
     pub fn rollup(&self) -> Option<&Rollup> {
-        self.commits.iter().last()?.commit.status_check_rollup.as_ref()
+        self.status_check_rollup.as_ref()
     }
 
 }
@@ -367,8 +660,44 @@ impl DetailRepo {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DetailCommit {
-    pub status_check_rollup: Option<Rollup>,
+pub struct CommitConnection {
+    pub total_count: usize,
+    pub nodes: Vec<Option<CommitNode<CommitInfo>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitInfo {
+    pub abbreviated_oid: String,
+    pub message_headline: String,
+    pub committed_date: String,
+    pub url: String,
+    pub authors: Nodes<CommitAuthor>,
+    pub status_check_rollup: Option<RollupState>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitAuthor {
+    pub name: Option<String>,
+    pub user: Option<Login>,
+}
+
+impl CommitInfo {
+    pub fn author(&self) -> String {
+        let a = self.authors.iter().next();
+        a.and_then(|a| a.user.as_ref().map(|u| u.login.clone()).or_else(|| a.name.clone())).unwrap_or_else(|| "unknown".into())
+    }
+}
+
+/// A changed file from the REST `pulls/{n}/files` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileDiff {
+    pub filename: String,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub patch: Option<String>,
+    pub previous_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,6 +805,17 @@ pub fn login_of(l: &Option<Login>) -> &str {
 
 const VIEWER_QUERY: &str = "query { viewer { login organizations(first:100){ nodes { login } } } rateLimit { remaining limit } }";
 
+const VIEWER_REPOS_QUERY: &str = r#"
+query($after:String) {
+  rateLimit { remaining limit }
+  viewer { repositories(first:100, after:$after,
+      affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],
+      ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],
+      orderBy:{field:PUSHED_AT, direction:DESC}, isArchived:false) {
+    totalCount pageInfo { hasNextPage endCursor }
+    nodes { nameWithOwner isPrivate pushedAt } } }
+}"#;
+
 const SEARCH_QUERY: &str = r#"
 query($q:String!, $after:String) {
   rateLimit { remaining limit }
@@ -499,7 +839,7 @@ query($id:ID!) {
   node(id:$id) { ... on PullRequest {
     id number title body bodyHTML state isDraft mergeable mergeStateStatus reviewDecision
     createdAt updatedAt author { login } headRefName baseRefName
-    additions deletions changedFiles headRefOid canBeRebased
+    additions deletions changedFiles headRefOid isCrossRepository canBeRebased
     viewerCanClose viewerCanReopen viewerCanMergeAsAdmin
     labels(first:20) { nodes { name color } }
     assignees(first:10) { nodes { login } }
@@ -508,9 +848,11 @@ query($id:ID!) {
     participants(first:50) { nodes { login } }
     repository { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission
       mentionableUsers(first:100) { nodes { login } } }
-    commits(last:1) { nodes { commit { statusCheckRollup { state contexts(first:80) { nodes { __typename
+    statusCheckRollup { state contexts(first:100) { nodes { __typename
       ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } }
-      ... on StatusContext { context state targetUrl } } } } } } }
+      ... on StatusContext { context state targetUrl } } } }
+    commits(last:100) { totalCount nodes { commit { abbreviatedOid messageHeadline committedDate url
+      authors(first:1) { nodes { name user { login } } } statusCheckRollup { state } } } }
     reviews(last:40) { nodes { author { login } state body bodyHTML submittedAt } }
     comments(last:80) { nodes { author { login } body bodyHTML createdAt } }
     reviewThreads(last:40) { nodes { isResolved path line comments(first:20) { nodes { author { login } body bodyHTML createdAt } } } }

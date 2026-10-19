@@ -9,18 +9,30 @@ use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::actions_log::{self, ParsedLog};
 use crate::config::Config;
 use crate::editor::{Editor, VisualRow};
-use crate::github::{Client, MergeMethod, PrDetail, PrSummary, RateLimit, ReviewEvent, SearchPage, Viewer};
+use crate::images::{ImageKey, ImageMsg, ImagePlacement, ImageStore};
+use crate::github::{
+    Annotation, Client, FileDiff, Job, MergeMethod, PrDetail, PrSummary, RateLimit, RepoInfo, RepoPage, ReviewEvent, RunsQuery, SearchPage, Viewer,
+    WorkflowRunInfo,
+};
+use crate::state::State;
 
 /// Maximum PRs loaded per scope (GitHub search caps at 1000).
 const MAX_PRS: usize = 300;
+/// Maximum repos listed in the repo picker.
+const MAX_REPOS: usize = 1000;
+/// Bytes kept from the end of a job log.
+const LOG_CAP: usize = 4 << 20;
+/// Seconds between Actions polls while runs are in progress (and when the REST budget is low).
+pub const POLL_SECS: u64 = 10;
+const POLL_SECS_LOW: u64 = 30;
 
 /// A rendered detail row plus its clickable link ranges (start col, end col, url).
 pub type DetailRow = (ratatui::text::Line<'static>, Vec<(u16, u16, String)>);
-
-/// Rows per PR in the detail-view sidebar.
-pub const SIDEBAR_ITEM_H: usize = 2;
+/// A built block of rows and the inline images placed in it.
+pub type Built = (Vec<DetailRow>, Vec<ImagePlacement>);
 
 pub enum Msg {
     Input(Event),
@@ -28,8 +40,20 @@ pub enum Msg {
     /// One page of search results; `first` replaces the list, later pages append.
     Prs { generation: u64, first: bool, res: Result<SearchPage> },
     Detail { id: String, res: Result<(PrDetail, Option<RateLimit>)> },
+    Files { id: String, res: Result<Vec<FileDiff>> },
+    /// Workflow runs for a PR's head (`history` adds earlier pushes); the flag is set when
+    /// the list is empty because the repo has no workflows at all.
+    Runs { id: String, nwo: String, sha: String, history: bool, res: Result<(Vec<WorkflowRunInfo>, bool)> },
+    Jobs { run_id: u64, res: Result<Vec<Job>> },
+    /// A parsed job log; `true` when the job hasn't produced one yet.
+    Log { job_id: u64, res: Result<(ParsedLog, bool)> },
+    Annotations { job_id: u64, res: Result<Vec<Annotation>> },
+    /// A page of the viewer's repos for the repo picker.
+    Repos { first: bool, res: Result<RepoPage> },
     /// A mutation finished; `Ok` carries the success message.
     Done { id: String, res: Result<String> },
+    /// An inline image was downloaded and decoded, or encoded for another size.
+    Image(ImageMsg),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +111,38 @@ pub enum Focus {
     Detail,
 }
 
+/// Tabs under the PR info + description in the detail pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tab {
+    Description,
+    Conversation,
+    Changes,
+    Commits,
+    Checks,
+    Actions,
+    Reviews,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 7] = [Tab::Description, Tab::Conversation, Tab::Changes, Tab::Commits, Tab::Checks, Tab::Actions, Tab::Reviews];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Description => "Description",
+            Tab::Conversation => "Conversation",
+            Tab::Changes => "Changes",
+            Tab::Commits => "Commits",
+            Tab::Checks => "Checks",
+            Tab::Actions => "Actions",
+            Tab::Reviews => "Reviews",
+        }
+    }
+
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+}
+
 /// Everything a key press or a click can trigger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -94,6 +150,10 @@ pub enum Action {
     Back,
     Refresh,
     OpenScopes,
+    CycleDensity,
+    OpenRepos,
+    SetRepo(Option<String>),
+    ToggleRepoOfSelected,
     CycleState,
     StartFilter,
     ClearFilter,
@@ -110,7 +170,33 @@ pub enum Action {
     Browser,
     CopyCheckout,
     Help,
+    ToggleImages,
+    /// Open the image viewer (clicking an inline image).
+    ViewImage(ImageKey),
     OpenUrl(String),
+    SetTab(Tab),
+    NextTab,
+    PrevTab,
+    NextFile,
+    PrevFile,
+    ToggleInfo,
+    // Actions tab
+    TreeNext,
+    TreePrev,
+    TreeToggle,
+    TreeOpenBrowser,
+    ToggleHistory,
+    ActionsBack,
+    LogNextError,
+    LogNextWarning,
+    LogFold,
+    LogFoldAll,
+    LogTimestamps,
+    LogSearch,
+    LogNextHit,
+    LogPrevHit,
+    /// A `#…` link handled inside the app: `fold:<group>`, `line:<line>`, `job:<id>`, `image:<key>`.
+    Internal(String),
     // Modal-level actions
     ModalPick(usize),
     ModalCancel,
@@ -149,6 +235,7 @@ pub enum MenuItem {
     Browser,
     CopyCheckout,
     CopyUrl,
+    ToggleRepo,
 }
 
 #[derive(Debug, Clone)]
@@ -170,10 +257,13 @@ pub enum PendingOp {
 
 pub enum Modal {
     Scopes { filter: String, sel: usize },
+    Repos { filter: String, sel: usize },
     Composer(Box<Composer>),
     Menu { pr_id: String, entries: Vec<MenuEntry>, sel: usize },
     Confirm { pr_id: String, title: String, message: String, op: PendingOp },
     Help,
+    /// One image fitted to the screen.
+    Image { key: ImageKey, alt: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,11 +285,68 @@ pub struct Hits {
     pub detail_text_x: u16,
     pub detail_max_scroll: usize,
     pub detail_height: usize,
+    /// Changes tab file list: rows area and scroll offset.
+    pub file_list: Option<(Rect, usize)>,
+    /// Actions tab tree: rows area and scroll offset, plus every row's tree node (blank
+    /// spacer and push-header rows have none).
+    pub actions_tree: Option<(Rect, usize)>,
+    pub actions_tree_rows: Vec<Option<usize>>,
+    /// Absolute row of `detail_links[0]` (the Actions pane only records the rows on screen).
+    pub detail_links_from: usize,
+    /// First job-log line on screen, for `z` and `E` when nothing was jumped to yet.
+    pub log_top_line: Option<usize>,
+    /// The PR info + description region above the tabs.
+    pub info: Option<Rect>,
+    pub info_links: Vec<Vec<(u16, u16, String)>>,
+    pub info_max_scroll: usize,
     pub modal: Option<Rect>,
     pub modal_items: Vec<(Rect, usize)>,
     pub editor: Option<Rect>,
     pub editor_rows: Vec<VisualRow>,
     pub popup_items: Vec<(Rect, usize)>,
+}
+
+/// Workflow runs loaded for a PR, for the head commit they were fetched for.
+pub struct RunsEntry {
+    pub sha: String,
+    pub history: bool,
+    /// Head-commit runs first, then earlier pushes (newest first), each push's runs together.
+    pub runs: Vec<WorkflowRunInfo>,
+    pub at: Instant,
+}
+
+/// A row of the Actions tree, in display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeNode {
+    /// Heading for the runs of an earlier push (history mode); never selected.
+    Push(String),
+    /// Index into `RunsEntry::runs`.
+    Run(usize),
+    /// Run id and index into its jobs.
+    Job(u64, usize),
+}
+
+/// How the shown job log is folded, searched and stamped.
+pub struct LogView {
+    pub job: Option<u64>,
+    /// When the shown log was fetched, to notice a refetch.
+    pub at: Option<Instant>,
+    pub folds: HashSet<usize>,
+    pub timestamps: bool,
+    pub search: Option<LogSearch>,
+    /// Line indices on screen given `folds`.
+    pub visible: Vec<usize>,
+    /// Line the last jump landed on (E/W, search, a step or annotation click).
+    pub cursor: Option<usize>,
+    /// Line to bring into view on the next frame.
+    pub scroll_to: Option<usize>,
+}
+
+pub struct LogSearch {
+    pub query: String,
+    /// Still typing the query.
+    pub input: bool,
+    pub hits: Vec<usize>,
 }
 
 pub struct App {
@@ -210,6 +357,18 @@ pub struct App {
     pub scopes: Vec<Scope>,
     pub scope: usize,
     pub state_filter: StateFilter,
+    /// Optional `owner/name` filter layered on top of the scope.
+    pub repo: Option<String>,
+    /// The viewer's repos (most recently pushed first), cached across runs.
+    pub repos: Vec<RepoInfo>,
+    repos_fresh: Vec<RepoInfo>,
+    pub repos_total: usize,
+    pub repos_loading: bool,
+    /// Repos in the last unfiltered list, with PR counts.
+    pub scope_repos: Vec<(String, usize)>,
+    pub state: State,
+    /// PR to keep selected across a reload triggered by a filter change.
+    pending_select: Option<String>,
     pub prs: Vec<PrSummary>,
     pub total: usize,
     pub list_error: Option<String>,
@@ -223,9 +382,53 @@ pub struct App {
     pub details: HashMap<String, (PrDetail, Instant)>,
     pub detail_loading: HashSet<String>,
     pub detail_errors: HashMap<String, String>,
+    /// Scroll of the active tab's content.
     pub detail_scroll: usize,
+    pub info_scroll: usize,
+    info_collapsed: bool,
+    /// The Changes tab wants the room, so its info section starts collapsed separately.
+    changes_info_expanded: bool,
+    pub tab: Tab,
+    /// Selected file in the Changes tab and the file list's scroll offset.
+    pub file_sel: usize,
+    pub file_list_scroll: usize,
+    pub files: HashMap<String, (Vec<FileDiff>, Instant)>,
+    pub files_loading: HashSet<String>,
+    pub files_errors: HashMap<String, String>,
+    /// Actions tab: runs per PR id, jobs per run id, logs and annotations per job id.
+    pub runs: HashMap<String, RunsEntry>,
+    pub runs_loading: HashSet<String>,
+    pub runs_errors: HashMap<String, String>,
+    /// Repos (owner/name) without any workflows.
+    pub no_workflows: HashSet<String>,
+    pub jobs: HashMap<u64, (Vec<Job>, Instant)>,
+    pub jobs_loading: HashSet<u64>,
+    pub jobs_errors: HashMap<u64, String>,
+    pub logs: HashMap<u64, (ParsedLog, Instant)>,
+    pub logs_loading: HashSet<u64>,
+    pub log_errors: HashMap<u64, String>,
+    /// Jobs whose log was asked for (Enter / click); fetched once the job completes.
+    pub log_wanted: HashSet<u64>,
+    pub annotations: HashMap<u64, Vec<Annotation>>,
+    annotations_loading: HashSet<u64>,
+    /// Tree cursor (an index into `tree()`) and the tree's scroll offset.
+    pub actions_sel: usize,
+    pub actions_tree_scroll: usize,
+    /// Scroll the tree to the cursor on the next frame (false after wheel scrolling).
+    pub actions_tree_follow: bool,
+    /// Runs whose jobs are unfolded in the tree.
+    pub actions_expanded: HashSet<u64>,
+    /// PR ids also showing runs from earlier pushes.
+    pub actions_history: HashSet<String>,
+    pub log_view: LogView,
+    actions_poll_at: Instant,
+    /// Rendered tab rows keyed by "id:width:image rows:tab:density", stamped with the data's fetch time.
+    pub tab_cache: HashMap<String, (Instant, Built)>,
     /// Rendered rows for (pr id, width, fetched at); rebuilding them per frame is costly.
     pub detail_cache: Option<(String, usize, Instant, Vec<DetailRow>)>,
+    pub images: ImageStore,
+    /// The images of the tab drawn last ("pr id:tab"), to keep the scroll steady as they load.
+    pub last_placements: (String, Vec<ImagePlacement>),
     pub busy: HashSet<String>,
     drafts: HashMap<String, Editor>,
     pub screen: Screen,
@@ -241,15 +444,22 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Client, tx: UnboundedSender<Msg>, cfg: Config) -> Self {
+    pub fn new(client: Client, tx: UnboundedSender<Msg>, cfg: Config, images: crate::images::Detection) -> Self {
         let mut scopes = vec![
             Scope { name: "My PRs".into(), qualifier: "author:@me".into() },
             Scope { name: "Review requested".into(), qualifier: "review-requested:@me".into() },
             Scope { name: "Involves me".into(), qualifier: "involves:@me".into() },
             Scope { name: "Assigned to me".into(), qualifier: "assignee:@me".into() },
+            // Only offered while a repo filter is set (an unscoped search is useless).
+            Scope { name: "Everyone (all PRs in the repo)".into(), qualifier: String::new() },
         ];
         scopes.extend(cfg.scopes.iter().map(|s| Scope { name: s.name.clone(), qualifier: s.query.clone() }));
         let scope = cfg.default_scope.as_ref().and_then(|d| scopes.iter().position(|s| &s.name == d)).unwrap_or(0);
+        let repo = cfg.default_repo.clone().filter(|r| looks_like_repo(r));
+        let state = crate::state::load();
+        let repos = state.repos_cache.as_ref().map(|c| c.repos.clone()).unwrap_or_default();
+        let toast = images.note.map(|n| (n, ToastKind::Info, Instant::now()));
+        let images = ImageStore::new(images.picker, state.images_enabled, images.off_reason);
         Self {
             client,
             tx,
@@ -258,6 +468,14 @@ impl App {
             scopes,
             scope,
             state_filter: StateFilter::Open,
+            repo,
+            repos,
+            repos_fresh: Vec::new(),
+            repos_total: 0,
+            repos_loading: false,
+            scope_repos: Vec::new(),
+            state,
+            pending_select: None,
             prs: Vec::new(),
             total: 0,
             list_error: None,
@@ -272,13 +490,45 @@ impl App {
             detail_loading: HashSet::new(),
             detail_errors: HashMap::new(),
             detail_scroll: 0,
+            info_scroll: 0,
+            info_collapsed: false,
+            changes_info_expanded: false,
+            tab: Tab::Description,
+            file_sel: 0,
+            file_list_scroll: 0,
+            files: HashMap::new(),
+            files_loading: HashSet::new(),
+            files_errors: HashMap::new(),
+            runs: HashMap::new(),
+            runs_loading: HashSet::new(),
+            runs_errors: HashMap::new(),
+            no_workflows: HashSet::new(),
+            jobs: HashMap::new(),
+            jobs_loading: HashSet::new(),
+            jobs_errors: HashMap::new(),
+            logs: HashMap::new(),
+            logs_loading: HashSet::new(),
+            log_errors: HashMap::new(),
+            log_wanted: HashSet::new(),
+            annotations: HashMap::new(),
+            annotations_loading: HashSet::new(),
+            actions_sel: 0,
+            actions_tree_scroll: 0,
+            actions_tree_follow: true,
+            actions_expanded: HashSet::new(),
+            actions_history: HashSet::new(),
+            log_view: LogView { job: None, at: None, folds: HashSet::new(), timestamps: true, search: None, visible: Vec::new(), cursor: None, scroll_to: None },
+            actions_poll_at: Instant::now(),
+            tab_cache: HashMap::new(),
             detail_cache: None,
+            images,
+            last_placements: (String::new(), Vec::new()),
             busy: HashSet::new(),
             drafts: HashMap::new(),
             screen: Screen::List,
             focus: Focus::Sidebar,
             modal: None,
-            toast: None,
+            toast,
             rate: None,
             tick: 0,
             last_refresh: Instant::now(),
@@ -300,7 +550,8 @@ impl App {
 
     pub fn search_query(&self) -> String {
         let scope = &self.scopes[self.scope];
-        format!("is:pr archived:false {} {} sort:updated-desc", self.state_filter.qualifier(), scope.qualifier)
+        let repo = self.repo.as_ref().map(|r| format!("repo:{r}")).unwrap_or_default();
+        format!("is:pr archived:false {} {} {repo} sort:updated-desc", self.state_filter.qualifier(), scope.qualifier)
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -330,6 +581,32 @@ impl App {
         });
     }
 
+    /// Fetch the viewer's repos in the background (pages of 100, up to MAX_REPOS).
+    fn load_repos(&mut self) {
+        if self.repos_loading {
+            return;
+        }
+        self.repos_loading = true;
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let (mut after, mut loaded, mut first) = (None, 0, true);
+            loop {
+                let res = client.viewer_repos_page(after).await;
+                let next = res.as_ref().ok().and_then(|p| p.next.clone());
+                let low = res.as_ref().ok().and_then(|p| p.rate.as_ref()).is_some_and(|r| r.remaining < 200);
+                loaded += res.as_ref().map_or(0, |p| p.repos.len());
+                if tx.send(Msg::Repos { first, res }).is_err() {
+                    break;
+                }
+                first = false;
+                match next {
+                    Some(n) if loaded < MAX_REPOS && !low => after = Some(n),
+                    _ => break,
+                }
+            }
+        });
+    }
+
     fn load_detail(&mut self, id: &str) {
         if !self.detail_loading.insert(id.to_string()) {
             return;
@@ -350,6 +627,214 @@ impl App {
                 self.load_detail(&id);
             }
         }
+        self.ensure_files(false);
+        self.ensure_runs(false);
+    }
+
+    /// Load the selected PR's diff when the Changes tab is showing.
+    fn ensure_files(&mut self, force: bool) {
+        if self.screen != Screen::Detail || self.tab != Tab::Changes {
+            return;
+        }
+        let Some(d) = self.selected_detail() else { return };
+        let (id, nwo, number) = (d.id.clone(), d.repository.name_with_owner.clone(), d.number);
+        let stale = force || self.files.get(&id).is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(60));
+        if !stale || !self.files_loading.insert(id.clone()) {
+            return;
+        }
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = client.pr_files(&nwo, number).await;
+            let _ = tx.send(Msg::Files { id, res });
+        });
+    }
+
+    /// Load the selected PR's workflow runs when the Actions tab is showing.
+    fn ensure_runs(&mut self, force: bool) {
+        if self.screen != Screen::Detail || self.tab != Tab::Actions {
+            return;
+        }
+        let Some(d) = self.selected_detail() else { return };
+        let history = self.actions_history.contains(&d.id) && !d.is_cross_repository;
+        let (id, nwo, sha, branch) = (d.id.clone(), d.repository.name_with_owner.clone(), d.head_ref_oid.clone(), d.head_ref_name.clone());
+        let stale = force || self.runs.get(&id).is_none_or(|e| e.sha != sha || e.history != history || e.at.elapsed() > Duration::from_secs(60));
+        if !stale || !self.runs_loading.insert(id.clone()) {
+            return;
+        }
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let mut res = client.workflow_runs(&nwo, RunsQuery::HeadSha(&sha)).await;
+            if history && let Ok(runs) = &mut res {
+                match client.workflow_runs(&nwo, RunsQuery::Branch { name: &branch, per_page: 30 }).await {
+                    Ok(more) => {
+                        let seen: HashSet<u64> = runs.iter().map(|r| r.id).collect();
+                        runs.extend(more.into_iter().filter(|r| !seen.contains(&r.id)));
+                    }
+                    Err(e) => res = Err(e),
+                }
+            }
+            // An empty list: either no runs for this commit or no workflows at all.
+            let res = match res {
+                Ok(runs) if runs.is_empty() => {
+                    let none = client.workflow_count(&nwo).await.is_ok_and(|n| n == 0);
+                    Ok((runs, none))
+                }
+                other => other.map(|runs| (runs, false)),
+            };
+            let _ = tx.send(Msg::Runs { id, nwo, sha, history, res });
+        });
+    }
+
+    /// Load a run's jobs (with steps) if missing, or again when forced.
+    fn ensure_jobs(&mut self, run_id: u64, force: bool) {
+        if !force && self.jobs.contains_key(&run_id) {
+            return;
+        }
+        let Some(nwo) = self.selected_detail().map(|d| d.repository.name_with_owner.clone()) else { return };
+        if !self.jobs_loading.insert(run_id) {
+            return;
+        }
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = client.run_jobs(&nwo, run_id).await;
+            let _ = tx.send(Msg::Jobs { run_id, res });
+        });
+    }
+
+    /// Load a finished job's log; a running job has none yet (polling fetches it later).
+    fn ensure_log(&mut self, job_id: u64, force: bool) {
+        if !self.find_job(job_id).is_some_and(|j| j.status == "completed") {
+            return;
+        }
+        if !force && (self.logs.contains_key(&job_id) || self.log_errors.contains_key(&job_id)) {
+            return;
+        }
+        let Some(nwo) = self.selected_detail().map(|d| d.repository.name_with_owner.clone()) else { return };
+        if !self.logs_loading.insert(job_id) {
+            return;
+        }
+        self.log_errors.remove(&job_id);
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = client.job_log(&nwo, job_id, LOG_CAP).await.map(|l| {
+                let mut log = actions_log::parse(&l.text);
+                log.dropped_lines += l.dropped_lines;
+                (log, l.pending)
+            });
+            let _ = tx.send(Msg::Log { job_id, res });
+        });
+    }
+
+    fn ensure_annotations(&mut self, job_id: u64) {
+        if self.annotations.contains_key(&job_id) || !self.find_job(job_id).is_some_and(|j| j.status == "completed") {
+            return;
+        }
+        let Some(nwo) = self.selected_detail().map(|d| d.repository.name_with_owner.clone()) else { return };
+        if !self.annotations_loading.insert(job_id) {
+            return;
+        }
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = client.job_annotations(&nwo, job_id).await;
+            let _ = tx.send(Msg::Annotations { job_id, res });
+        });
+    }
+
+    /// Fetch what the node under the tree cursor shows: a run's jobs, a job's annotations and log.
+    fn ensure_tree_data(&mut self) {
+        match self.selected_node() {
+            Some(TreeNode::Run(i)) => {
+                if let Some(id) = self.current_runs().map(|e| e.runs[i].id) {
+                    self.ensure_jobs(id, false);
+                }
+            }
+            Some(TreeNode::Job(run_id, j)) => {
+                if let Some(job_id) = self.jobs.get(&run_id).and_then(|(jobs, _)| jobs.get(j)).map(|j| j.id) {
+                    self.ensure_annotations(job_id);
+                    if self.log_wanted.contains(&job_id) {
+                        self.ensure_log(job_id, false);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Poll while the Actions tab shows runs that haven't finished, backing off when the REST
+    /// budget runs low and stopping when it's nearly gone.
+    fn poll_actions(&mut self) {
+        if self.screen != Screen::Detail || self.tab != Tab::Actions {
+            return;
+        }
+        let Some(e) = self.current_runs() else { return };
+        let live: Vec<u64> = e.runs.iter().filter(|r| r.status() != "completed").map(|r| r.id).collect();
+        if live.is_empty() {
+            return;
+        }
+        let every = match self.client.rest_rate() {
+            Some(r) if r.remaining < 100 => return,
+            Some(r) if r.remaining < 500 => POLL_SECS_LOW,
+            _ => POLL_SECS,
+        };
+        if self.actions_poll_at.elapsed() < Duration::from_secs(every) {
+            return;
+        }
+        self.actions_poll_at = Instant::now();
+        self.ensure_runs(true);
+        let shown = self.selected_run_id();
+        for id in live {
+            if Some(id) == shown || self.actions_expanded.contains(&id) {
+                self.ensure_jobs(id, true);
+            }
+        }
+    }
+
+    fn scroll_info(&mut self, delta: isize) {
+        let max = self.hits.info_max_scroll as isize;
+        self.info_scroll = (self.info_scroll as isize + delta).clamp(0, max.max(0)) as usize;
+    }
+
+    /// Changes when the layout changes enough to warrant a full repaint (clears any
+    /// stray glyphs a terminal may have left behind).
+    /// Showing or hiding images counts too: Sixel pixels can outlive the cells they were drawn in.
+    pub fn layout_key(&self) -> (bool, Option<Tab>, bool, usize, usize, Option<String>, crate::state::Density, bool) {
+        let detail = self.screen == Screen::Detail;
+        let pr = if detail { self.selected_pr().map(|p| p.id.clone()) } else { None };
+        (detail, detail.then_some(self.tab), self.modal.is_some(), self.file_sel, self.actions_sel, pr, self.state.density, self.images.enabled)
+    }
+
+    /// Terminal rows per PR in whichever list is on screen.
+    fn rows_per_item(&self) -> usize {
+        match self.screen {
+            Screen::List => self.state.density.table_row_h(),
+            Screen::Detail => self.state.density.sidebar_item_h(),
+        }
+    }
+
+    /// The two-column tabs want the room, so they share a separate, initially collapsed state.
+    fn wide_tab(&self) -> bool {
+        matches!(self.tab, Tab::Changes | Tab::Actions)
+    }
+
+    pub fn info_collapsed(&self) -> bool {
+        if self.wide_tab() { !self.changes_info_expanded } else { self.info_collapsed }
+    }
+
+    fn file_count(&self) -> usize {
+        self.selected_pr().and_then(|p| self.files.get(&p.id)).map_or(0, |(f, _)| f.len())
+    }
+
+    /// Show file `idx` in the Changes tab.
+    fn select_file(&mut self, idx: usize) {
+        let n = self.file_count();
+        if n == 0 {
+            return;
+        }
+        let idx = idx.min(n - 1);
+        if idx != self.file_sel {
+            self.file_sel = idx;
+            self.detail_scroll = 0;
+        }
     }
 
     fn refresh(&mut self) {
@@ -358,6 +843,11 @@ impl App {
             && let Some(id) = self.selected_pr().map(|p| p.id.clone())
         {
             self.load_detail(&id);
+            self.ensure_files(true);
+            self.ensure_runs(true);
+            if let Some(run) = self.selected_run_id() {
+                self.ensure_jobs(run, true);
+            }
         }
     }
 
@@ -387,6 +877,184 @@ impl App {
         self.selected_pr().and_then(|p| self.details.get(&p.id)).map(|(d, _)| d)
     }
 
+    /// The selected PR's runs, if they were fetched for its current head commit.
+    pub fn current_runs(&self) -> Option<&RunsEntry> {
+        let d = self.selected_detail()?;
+        self.runs.get(&d.id).filter(|e| e.sha == d.head_ref_oid)
+    }
+
+    /// The Actions tree, flattened in display order.
+    pub fn tree(&self) -> Vec<TreeNode> {
+        let Some(e) = self.current_runs() else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut push = e.sha.as_str();
+        for (i, r) in e.runs.iter().enumerate() {
+            if r.head_sha != push {
+                push = &r.head_sha;
+                out.push(TreeNode::Push(r.head_sha.clone()));
+            }
+            out.push(TreeNode::Run(i));
+            if self.actions_expanded.contains(&r.id)
+                && let Some((jobs, _)) = self.jobs.get(&r.id)
+            {
+                out.extend((0..jobs.len()).map(|j| TreeNode::Job(r.id, j)));
+            }
+        }
+        out
+    }
+
+    pub fn selected_node(&self) -> Option<TreeNode> {
+        self.tree().get(self.actions_sel).cloned()
+    }
+
+    /// The run under the tree cursor, or the run of the job under it.
+    fn selected_run_id(&self) -> Option<u64> {
+        match self.selected_node()? {
+            TreeNode::Run(i) => self.current_runs().map(|e| e.runs[i].id),
+            TreeNode::Job(run_id, _) => Some(run_id),
+            TreeNode::Push(_) => None,
+        }
+    }
+
+    pub fn selected_job(&self) -> Option<&Job> {
+        match self.selected_node()? {
+            TreeNode::Job(run_id, j) => self.jobs.get(&run_id)?.0.get(j),
+            _ => None,
+        }
+    }
+
+    fn find_job(&self, job_id: u64) -> Option<&Job> {
+        self.jobs.values().flat_map(|(jobs, _)| jobs).find(|j| j.id == job_id)
+    }
+
+    /// Identity of the tree cursor (run id, job id), stable across reloads.
+    fn selected_key(&self) -> Option<(u64, Option<u64>)> {
+        match self.selected_node()? {
+            TreeNode::Job(run_id, _) => Some((run_id, self.selected_job().map(|j| j.id))),
+            _ => self.selected_run_id().map(|r| (r, None)),
+        }
+    }
+
+    /// Put the tree cursor back on `key` (or its run) after the tree changed.
+    fn reselect(&mut self, key: Option<(u64, Option<u64>)>) {
+        let tree = self.tree();
+        let runs = self.current_runs().map(|e| e.runs.iter().map(|r| r.id).collect::<Vec<_>>()).unwrap_or_default();
+        let is = |n: &TreeNode, run: u64, job: Option<u64>| match (n, job) {
+            (TreeNode::Run(i), None) => runs.get(*i) == Some(&run),
+            (TreeNode::Job(r, j), Some(job)) => *r == run && self.jobs.get(r).and_then(|(js, _)| js.get(*j)).is_some_and(|x| x.id == job),
+            _ => false,
+        };
+        if let Some((run, job)) = key
+            && let Some(i) = tree.iter().position(|n| is(n, run, job)).or_else(|| tree.iter().position(|n| is(n, run, None)))
+        {
+            if i != self.actions_sel {
+                self.actions_sel = i;
+                self.actions_tree_follow = true;
+            }
+        }
+        self.actions_sel = self.actions_sel.min(tree.len().saturating_sub(1));
+        // Push headings aren't selectable.
+        if matches!(tree.get(self.actions_sel), Some(TreeNode::Push(_))) {
+            self.actions_sel = (self.actions_sel + 1).min(tree.len().saturating_sub(1));
+        }
+        self.ensure_tree_data();
+    }
+
+    /// Move the tree cursor to node `idx`, skipping push headings in the direction of travel.
+    fn select_node(&mut self, idx: usize) {
+        let tree = self.tree();
+        if tree.is_empty() {
+            return;
+        }
+        let mut idx = idx.min(tree.len() - 1);
+        let down = idx >= self.actions_sel;
+        while matches!(tree[idx], TreeNode::Push(_)) {
+            match (down, idx) {
+                (true, i) if i + 1 < tree.len() => idx += 1,
+                (false, i) if i > 0 => idx -= 1,
+                _ => return,
+            }
+        }
+        if idx != self.actions_sel {
+            self.actions_sel = idx;
+            self.detail_scroll = 0;
+            if self.selected_job().is_some_and(|j| self.log_wanted.contains(&j.id)) {
+                self.detail_scroll = usize::MAX;
+            }
+        }
+        self.actions_tree_follow = true;
+        self.ensure_tree_data();
+    }
+
+    fn move_tree(&mut self, delta: isize) {
+        self.select_node((self.actions_sel as isize + delta).max(0) as usize);
+    }
+
+    /// Point the log view at `job_id`'s log, resetting folds for a different or refetched log.
+    pub fn sync_log_view(&mut self, job_id: u64) {
+        let Some((log, at)) = self.logs.get(&job_id) else { return };
+        let v = &mut self.log_view;
+        if v.job == Some(job_id) && v.at == Some(*at) {
+            return;
+        }
+        if v.job != Some(job_id) {
+            v.search = None;
+            v.cursor = None;
+        }
+        v.job = Some(job_id);
+        v.at = Some(*at);
+        v.folds = actions_log::default_folds(log);
+        v.visible = actions_log::visible_lines(log, &v.folds);
+        if let Some(s) = &mut v.search {
+            s.hits = actions_log::search(log, &s.query);
+        }
+    }
+
+    /// The selected job's log, once it's shown, and synced into `log_view`.
+    fn shown_log(&mut self) -> Option<u64> {
+        let id = self.selected_job().map(|j| j.id).filter(|id| self.logs.contains_key(id))?;
+        self.sync_log_view(id);
+        Some(id)
+    }
+
+    /// Recompute the visible lines after a fold change.
+    fn refold(&mut self) {
+        if let Some((log, _)) = self.log_view.job.and_then(|j| self.logs.get(&j)) {
+            self.log_view.visible = actions_log::visible_lines(log, &self.log_view.folds);
+        }
+    }
+
+    /// Unfold whatever hides `line`, mark it and bring it into view.
+    fn jump_to_line(&mut self, line: usize) {
+        let Some(job) = self.shown_log() else { return };
+        if let Some(g) = self.logs[&job].0.lines.get(line).and_then(|l| l.group)
+            && self.logs[&job].0.groups[g].start != line
+            && self.log_view.folds.remove(&g)
+        {
+            self.refold();
+        }
+        self.log_view.cursor = Some(line);
+        self.log_view.scroll_to = Some(line);
+    }
+
+    /// Jump to the next line in `targets` after the cursor (or the top of the view), wrapping.
+    fn jump_next(&mut self, targets: &[usize], back: bool) -> bool {
+        if targets.is_empty() {
+            return false;
+        }
+        let from = self.log_view.cursor.or(self.hits.log_top_line);
+        let next = match (from, back) {
+            (Some(c), false) => targets.iter().find(|&&t| t > c).or(targets.first()),
+            (Some(c), true) => targets.iter().rev().find(|&&t| t < c).or(targets.last()),
+            (None, false) => targets.first(),
+            (None, true) => targets.last(),
+        };
+        if let Some(&line) = next {
+            self.jump_to_line(line);
+        }
+        true
+    }
+
     fn select(&mut self, idx: usize) {
         let n = self.visible().len();
         if n == 0 {
@@ -397,6 +1065,12 @@ impl App {
         if idx != self.sel {
             self.sel = idx;
             self.detail_scroll = 0;
+            self.info_scroll = 0;
+            self.file_sel = 0;
+            self.file_list_scroll = 0;
+            self.actions_sel = 0;
+            self.actions_tree_scroll = 0;
+            self.actions_tree_follow = true;
         }
         if self.screen == Screen::Detail {
             self.ensure_detail();
@@ -435,6 +1109,19 @@ impl App {
         if every > 0 && !composing && !self.loading_list && self.last_refresh.elapsed() > Duration::from_secs(every) {
             self.refresh();
         }
+        // The open PR refreshes on its own, faster cadence.
+        let detail_every = self.cfg.detail_refresh_secs;
+        if detail_every > 0
+            && !composing
+            && self.screen == Screen::Detail
+            && let Some(id) = self.selected_pr().map(|p| p.id.clone())
+            && !self.detail_loading.contains(&id)
+            && self.details.get(&id).is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(detail_every))
+        {
+            self.load_detail(&id);
+        }
+        self.poll_actions();
+        self.images.evict();
     }
 
     pub fn handle(&mut self, msg: Msg) {
@@ -442,9 +1129,15 @@ impl App {
             Msg::Input(ev) => self.on_event(ev),
             Msg::Viewer(Ok((v, rate))) => {
                 self.rate = rate.or(self.rate.take());
-                let mut extra = vec![Scope { name: format!("{} (my repos)", v.login), qualifier: format!("user:{}", v.login) }];
+                // Search ORs repeated user:/org: qualifiers, so this is every PR you can see in
+                // your own repos and all your orgs' repos.
+                let everywhere = std::iter::once(format!("user:{}", v.login)).chain(v.orgs.iter().map(|o| format!("org:{o}"))).collect::<Vec<_>>().join(" ");
+                let mut extra = vec![
+                    Scope { name: "All PRs (my repos + orgs)".into(), qualifier: everywhere },
+                    Scope { name: format!("{} (my repos)", v.login), qualifier: format!("user:{}", v.login) },
+                ];
                 extra.extend(v.orgs.iter().map(|o| Scope { name: format!("org: {o}"), qualifier: format!("org:{o}") }));
-                let builtin = 4;
+                let builtin = 5;
                 let current = self.scopes[self.scope].clone();
                 self.scopes.splice(builtin..builtin, extra);
                 self.scope = self.scopes.iter().position(|s| *s == current).unwrap_or(0);
@@ -456,6 +1149,10 @@ impl App {
                     self.scope = i;
                     self.load_list();
                 }
+                if self.state.repos_cache.as_ref().is_some_and(|c| c.login != v.login) {
+                    self.repos.clear();
+                }
+                self.load_repos();
                 self.viewer = Some(v);
             }
             Msg::Viewer(Err(e)) => self.toast(format!("Failed to load account: {e:#}"), ToastKind::Error),
@@ -467,7 +1164,7 @@ impl App {
                 match res {
                     Ok(page) => {
                         let has_next = page.next.is_some();
-                        let prev = self.selected_pr().map(|p| p.id.clone());
+                        let prev = if first { self.pending_select.take() } else { None }.or_else(|| self.selected_pr().map(|p| p.id.clone()));
                         if first {
                             self.prs = page.prs;
                         } else {
@@ -476,6 +1173,9 @@ impl App {
                         }
                         self.total = page.total;
                         self.loading_list = has_next && self.prs.len() < MAX_PRS;
+                        if self.repo.is_none() {
+                            self.scope_repos = count_repos(&self.prs);
+                        }
                         self.rate = page.rate.or(self.rate.take());
                         self.list_error = None;
                         let vis = self.visible();
@@ -500,11 +1200,151 @@ impl App {
                             p.review_decision = d.review_decision.clone();
                         }
                         self.details.insert(id, (d, Instant::now()));
+                        self.ensure_files(false);
+                        self.ensure_runs(false);
                     }
                     Err(e) => {
                         self.detail_errors.insert(id, format!("{e:#}"));
                     }
                 }
+            }
+            Msg::Repos { first, res } => match res {
+                Ok(page) => {
+                    self.rate = page.rate.clone().or(self.rate.take());
+                    if first {
+                        self.repos_fresh.clear();
+                    }
+                    self.repos_total = page.total;
+                    self.repos_fresh.extend(page.repos);
+                    // Show what we have once the fresh list overtakes the cache.
+                    if self.repos_fresh.len() >= self.repos.len() || page.next.is_none() {
+                        self.repos = self.repos_fresh.clone();
+                    }
+                    if page.next.is_none() || self.repos_fresh.len() >= MAX_REPOS {
+                        self.repos_loading = false;
+                        self.repos = std::mem::take(&mut self.repos_fresh);
+                        if let Some(v) = &self.viewer {
+                            self.state.repos_cache = Some(crate::state::ReposCache { login: v.login.clone(), repos: self.repos.clone() });
+                            crate::state::save(&self.state);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.repos_loading = false;
+                    self.toast(format!("Couldn't load your repositories: {e:#}"), ToastKind::Error);
+                }
+            },
+            Msg::Files { id, res } => {
+                self.files_loading.remove(&id);
+                match res {
+                    Ok(files) => {
+                        self.files_errors.remove(&id);
+                        self.files.insert(id, (files, Instant::now()));
+                    }
+                    Err(e) => {
+                        self.files_errors.insert(id, format!("{e:#}"));
+                    }
+                }
+            }
+            Msg::Runs { id, nwo, sha, history, res } => {
+                self.runs_loading.remove(&id);
+                match res {
+                    Ok((mut runs, no_workflows)) => {
+                        self.runs_errors.remove(&id);
+                        if no_workflows {
+                            self.no_workflows.insert(nwo);
+                        } else {
+                            self.no_workflows.remove(&nwo);
+                        }
+                        let mut pushes: Vec<String> = Vec::new();
+                        for r in &runs {
+                            if !pushes.contains(&r.head_sha) {
+                                pushes.push(r.head_sha.clone());
+                            }
+                        }
+                        runs.sort_by_key(|r| (r.head_sha != sha, pushes.iter().position(|p| *p == r.head_sha)));
+                        let current = self.selected_pr().is_some_and(|p| p.id == id);
+                        let first = self.runs.get(&id).is_none_or(|e| e.sha != sha);
+                        let key = if current && !first { self.selected_key() } else { None };
+                        // Runs that finished since their jobs were fetched need them again.
+                        let refetch: Vec<u64> = runs
+                            .iter()
+                            .filter(|r| r.status() == "completed" && self.jobs.get(&r.id).is_some_and(|(j, _)| j.iter().any(|j| j.status != "completed")))
+                            .map(|r| r.id)
+                            .collect();
+                        // Open the failing or running runs of the head commit on first sight.
+                        let open: Vec<u64> = if first {
+                            let live = |r: &&WorkflowRunInfo| crate::ui::outcome_rank(&crate::ui::rest_outcome(r.status(), r.conclusion.as_deref())) < 2;
+                            runs.iter().filter(|r| r.head_sha == sha).filter(live).take(3).map(|r| r.id).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        self.runs.insert(id, RunsEntry { sha, history, runs, at: Instant::now() });
+                        if !current {
+                            return;
+                        }
+                        self.actions_poll_at = Instant::now();
+                        for run in &open {
+                            self.actions_expanded.insert(*run);
+                            self.ensure_jobs(*run, false);
+                        }
+                        for run in refetch {
+                            self.ensure_jobs(run, true);
+                        }
+                        match open.first() {
+                            Some(&run) => self.reselect(Some((run, None))),
+                            None => self.reselect(key),
+                        }
+                        self.ensure_runs(false);
+                    }
+                    Err(e) => {
+                        self.runs_errors.insert(id, format!("{e:#}"));
+                    }
+                }
+            }
+            Msg::Jobs { run_id, res } => {
+                self.jobs_loading.remove(&run_id);
+                match res {
+                    Ok(jobs) => {
+                        self.jobs_errors.remove(&run_id);
+                        let key = self.selected_key();
+                        let finished: Vec<u64> = jobs.iter().filter(|j| j.status == "completed" && self.log_wanted.contains(&j.id)).map(|j| j.id).collect();
+                        self.jobs.insert(run_id, (jobs, Instant::now()));
+                        self.reselect(key);
+                        for job in finished {
+                            self.ensure_log(job, false);
+                        }
+                    }
+                    Err(e) => {
+                        self.jobs_errors.insert(run_id, format!("{e:#}"));
+                    }
+                }
+            }
+            Msg::Log { job_id, res } => {
+                self.logs_loading.remove(&job_id);
+                match res {
+                    Ok((_, true)) => {
+                        self.log_errors.insert(job_id, "The log isn't available yet".into());
+                    }
+                    Ok((mut log, false)) => {
+                        if let Some(job) = self.find_job(job_id) {
+                            actions_log::assign_steps(&mut log, &job.steps);
+                        }
+                        self.logs.insert(job_id, (log, Instant::now()));
+                        if self.selected_job().is_some_and(|j| j.id == job_id) {
+                            // Tail first.
+                            self.detail_scroll = usize::MAX;
+                        }
+                    }
+                    Err(e) => {
+                        self.log_errors.insert(job_id, format!("{e:#}"));
+                    }
+                }
+            }
+            Msg::Annotations { job_id, res } => {
+                self.annotations_loading.remove(&job_id);
+                // Annotations are a bonus; a failure just shows none.
+                self.annotations.insert(job_id, res.unwrap_or_default());
             }
             Msg::Done { id, res } => {
                 self.busy.remove(&id);
@@ -528,6 +1368,13 @@ impl App {
                     }
                 }
             }
+            Msg::Image(m) => {
+                // Rows change when an image arrives; rebuilding re-lays out the tabs.
+                if self.images.apply(m) {
+                    self.tab_cache.clear();
+                }
+                self.images.pump(&self.client, &self.tx);
+            }
         }
     }
 
@@ -538,7 +1385,7 @@ impl App {
             Event::Paste(s) => {
                 if let Some(Modal::Composer(c)) = &mut self.modal {
                     c.editor.insert_str(&s);
-                } else if let Some(Modal::Scopes { filter, sel }) = &mut self.modal {
+                } else if let Some(Modal::Scopes { filter, sel } | Modal::Repos { filter, sel }) = &mut self.modal {
                     filter.push_str(s.trim());
                     *sel = 0;
                 } else if self.filter_input {
@@ -582,15 +1429,41 @@ impl App {
             }
             return;
         }
+        if self.log_view.search.as_ref().is_some_and(|s| s.input) {
+            return self.on_log_search_key(k);
+        }
 
         let page = (self.hits.detail_height.max(4) - 2) as isize;
         let in_detail_pane = self.screen == Screen::Detail && self.focus == Focus::Detail;
+        let actions = self.screen == Screen::Detail && self.tab == Tab::Actions;
+        let searching = self.log_view.search.is_some();
         let action = match k.code {
+            // Actions tab first: it reuses keys that mean something else elsewhere.
+            KeyCode::Char('f') if ctrl && actions => Some(Action::LogSearch),
+            KeyCode::Char('n') if actions && searching => Some(Action::LogNextHit),
+            KeyCode::Char('N') if actions && searching => Some(Action::LogPrevHit),
+            KeyCode::Char('n') if actions => Some(Action::TreeNext),
+            KeyCode::Char('p') if actions => Some(Action::TreePrev),
+            KeyCode::Down if in_detail_pane && actions => Some(Action::TreeNext),
+            KeyCode::Up if in_detail_pane && actions => Some(Action::TreePrev),
+            KeyCode::Enter if in_detail_pane && actions => Some(Action::TreeToggle),
+            KeyCode::Esc if actions && (in_detail_pane || searching) => Some(Action::ActionsBack),
+            KeyCode::Char('O') if actions => Some(Action::TreeOpenBrowser),
+            KeyCode::Char('H') if actions => Some(Action::ToggleHistory),
+            KeyCode::Char('E') if actions => Some(Action::LogNextError),
+            KeyCode::Char('W') if actions => Some(Action::LogNextWarning),
+            KeyCode::Char('z') if actions => Some(Action::LogFold),
+            KeyCode::Char('Z') if actions => Some(Action::LogFoldAll),
+            KeyCode::Char('t') if actions => Some(Action::LogTimestamps),
             KeyCode::Char('q') => Some(if self.screen == Screen::Detail { Action::Back } else { Action::Quit }),
             KeyCode::Esc => Some(if self.screen == Screen::Detail { Action::Back } else { Action::ClearFilter }),
             KeyCode::Char('?') => Some(Action::Help),
             KeyCode::Char('r') | KeyCode::F(5) => Some(Action::Refresh),
             KeyCode::Char('s') => Some(Action::OpenScopes),
+            KeyCode::Char('S') => Some(Action::OpenRepos),
+            KeyCode::Char('D') => Some(Action::CycleDensity),
+            KeyCode::Char('I') => Some(Action::ToggleImages),
+            KeyCode::Char('e') => Some(Action::ToggleRepoOfSelected),
             KeyCode::Char('f') => Some(Action::CycleState),
             KeyCode::Char('/') => Some(Action::StartFilter),
             KeyCode::Char('o') => Some(Action::Browser),
@@ -601,6 +1474,14 @@ impl App {
             KeyCode::Char('R') => Some(Action::RequestChanges),
             KeyCode::Char('x') => Some(Action::CloseOrReopen),
             KeyCode::Char('y') => Some(Action::CopyCheckout),
+            KeyCode::Char(c @ '1'..='7') if self.screen == Screen::Detail => Some(Action::SetTab(Tab::ALL[c as usize - '1' as usize])),
+            KeyCode::Char(']') if self.screen == Screen::Detail => Some(Action::NextTab),
+            KeyCode::Char('[') if self.screen == Screen::Detail => Some(Action::PrevTab),
+            KeyCode::Char('n') if self.screen == Screen::Detail && self.tab == Tab::Changes => Some(Action::NextFile),
+            KeyCode::Char('p') if self.screen == Screen::Detail && self.tab == Tab::Changes => Some(Action::PrevFile),
+            KeyCode::Down if in_detail_pane && self.tab == Tab::Changes => Some(Action::NextFile),
+            KeyCode::Up if in_detail_pane && self.tab == Tab::Changes => Some(Action::PrevFile),
+            KeyCode::Char('i') if self.screen == Screen::Detail => Some(Action::ToggleInfo),
             KeyCode::Tab | KeyCode::BackTab if self.screen == Screen::Detail => Some(Action::ToggleFocus),
             KeyCode::Char('h') | KeyCode::Left if self.screen == Screen::Detail => Some(Action::FocusSidebar),
             KeyCode::Char('l') | KeyCode::Right if self.screen == Screen::Detail => Some(Action::FocusDetail),
@@ -632,13 +1513,56 @@ impl App {
         }
     }
 
+    /// Typing a log search query (after Ctrl+F).
+    fn on_log_search_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(s) = self.log_view.search.as_mut() else { return };
+        match k.code {
+            KeyCode::Esc => self.log_view.search = None,
+            KeyCode::Enter => {
+                s.input = false;
+                if s.query.is_empty() {
+                    self.log_view.search = None;
+                } else if !self.run_search_jump(false) {
+                    self.toast(format!("No matches for “{}”", self.log_view.search.as_ref().map_or("", |s| s.query.as_str())), ToastKind::Info);
+                }
+                return;
+            }
+            KeyCode::Backspace => {
+                s.query.pop();
+            }
+            KeyCode::Char(c) if !ctrl => s.query.push(c),
+            _ => return,
+        }
+        // Count matches as the query changes; Enter jumps.
+        if let (Some(s), Some((log, _))) = (self.log_view.search.as_mut(), self.log_view.job.and_then(|j| self.logs.get(&j))) {
+            s.hits = actions_log::search(log, &s.query);
+        }
+    }
+
+    /// Jump to the next (or previous) search hit; false when there are none.
+    fn run_search_jump(&mut self, back: bool) -> bool {
+        let hits = self.log_view.search.as_ref().map(|s| s.hits.clone()).unwrap_or_default();
+        self.jump_next(&hits, back)
+    }
+
     fn on_modal_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match self.modal.as_mut() {
             Some(Modal::Help) => self.modal = None,
-            Some(Modal::Scopes { filter, sel }) => {
-                let n = scope_matches(&self.scopes, filter).len();
+            Some(Modal::Image { .. }) => match k.code {
+                KeyCode::Char('o') | KeyCode::Enter => self.modal_pick(0),
+                KeyCode::Char('y') => self.modal_pick(1),
+                _ => self.modal = None,
+            },
+            Some(Modal::Scopes { .. } | Modal::Repos { .. }) => {
+                let n = match &self.modal {
+                    Some(Modal::Scopes { filter, .. }) => scope_matches(&self.scopes, filter, self.repo.is_some()).len(),
+                    Some(Modal::Repos { filter, .. }) => repo_items(self, filter).iter().filter(|i| i.value().is_some()).count(),
+                    _ => 0,
+                };
+                let Some(Modal::Scopes { filter, sel } | Modal::Repos { filter, sel }) = self.modal.as_mut() else { return };
                 match k.code {
                     KeyCode::Esc => self.modal = None,
                     KeyCode::Enter => {
@@ -739,21 +1663,43 @@ impl App {
     }
 
     fn on_wheel(&mut self, pos: Position, delta: isize) {
+        // Lists can be longer than what's drawn, so count every selectable row.
+        let list_len = match &self.modal {
+            Some(Modal::Scopes { filter, .. }) => scope_matches(&self.scopes, filter, self.repo.is_some()).len(),
+            Some(Modal::Repos { filter, .. }) => repo_items(self, filter).iter().filter(|i| i.value().is_some()).count(),
+            Some(Modal::Menu { entries, .. }) => entries.len(),
+            _ => 0,
+        };
         if let Some(modal) = self.modal.as_mut() {
             match modal {
                 Modal::Composer(c) => {
                     let max = self.hits.editor_rows.len().saturating_sub(1) as isize;
                     c.editor.scroll = (c.editor.scroll as isize + delta).clamp(0, max) as usize;
                 }
-                Modal::Scopes { sel, .. } | Modal::Menu { sel, .. } => {
-                    let n = self.hits.modal_items.len().max(1);
+                Modal::Scopes { sel, .. } | Modal::Repos { sel, .. } | Modal::Menu { sel, .. } => {
+                    let n = list_len.max(1);
                     *sel = (*sel as isize + delta.signum()).clamp(0, n as isize - 1) as usize;
                 }
+                Modal::Image { .. } => self.modal = None,
                 _ => {}
             }
             return;
         }
-        if self.hits.detail.is_some_and(|r| r.contains(pos)) {
+        if let Some((r, offset)) = self.hits.file_list
+            && r.contains(pos)
+        {
+            let n = self.file_count();
+            self.file_list_scroll = (offset as isize + delta).clamp(0, n.saturating_sub(r.height as usize) as isize) as usize;
+        } else if let Some((r, offset)) = self.hits.actions_tree
+            && r.contains(pos)
+        {
+            let n = self.hits.actions_tree_rows.len();
+            self.actions_tree_scroll = (offset as isize + delta).clamp(0, n.saturating_sub(r.height as usize) as isize) as usize;
+            self.actions_tree_follow = false;
+        } else if self.hits.info.is_some_and(|r| r.contains(pos)) {
+            self.focus = Focus::Detail;
+            self.scroll_info(delta);
+        } else if self.hits.detail.is_some_and(|r| r.contains(pos)) {
             self.focus = Focus::Detail;
             self.scroll_detail(delta);
         } else if let Some((r, offset)) = self.hits.sidebar.or(self.hits.table)
@@ -761,7 +1707,7 @@ impl App {
         {
             // Wheel scrolls the viewport; selection follows if it would leave it.
             let n = self.visible().len();
-            let per = if self.screen == Screen::List { 1 } else { SIDEBAR_ITEM_H };
+            let per = self.rows_per_item();
             let page = r.height as usize / per;
             let new_off = (offset as isize + delta / per as isize).clamp(0, n.saturating_sub(page) as isize) as usize;
             if self.screen == Screen::List {
@@ -770,7 +1716,7 @@ impl App {
                 *self.side_state.offset_mut() = new_off;
                 self.focus = Focus::Sidebar;
             }
-            let rows = (r.height as usize / if self.screen == Screen::List { 1 } else { SIDEBAR_ITEM_H }).max(1);
+            let rows = (r.height as usize / per).max(1);
             if self.sel < new_off {
                 self.select(new_off);
             } else if self.sel >= new_off + rows {
@@ -812,7 +1758,7 @@ impl App {
         if let Some((r, offset)) = self.hits.table
             && r.contains(pos)
         {
-            let idx = offset + (pos.y - r.y) as usize;
+            let idx = offset + (pos.y - r.y) as usize / self.state.density.table_row_h();
             if idx < self.visible().len() {
                 let double = self.last_click.is_some_and(|(t, i)| i == idx && t.elapsed() < Duration::from_millis(450));
                 self.select(idx);
@@ -827,14 +1773,46 @@ impl App {
             && r.contains(pos)
         {
             self.focus = Focus::Sidebar;
-            self.select(offset + (pos.y - r.y) as usize / SIDEBAR_ITEM_H);
+            self.select(offset + (pos.y - r.y) as usize / self.state.density.sidebar_item_h());
+            return;
+        }
+        if let Some((r, offset)) = self.hits.file_list
+            && r.contains(pos)
+        {
+            self.focus = Focus::Detail;
+            self.select_file(offset + (pos.y - r.y) as usize);
+            return;
+        }
+        if let Some((r, offset)) = self.hits.actions_tree
+            && r.contains(pos)
+        {
+            self.focus = Focus::Detail;
+            // Clicking a run folds/unfolds it; clicking a job shows its log.
+            if let Some(Some(node)) = self.hits.actions_tree_rows.get(offset + (pos.y - r.y) as usize).copied() {
+                self.select_node(node);
+                if self.actions_sel == node {
+                    self.run(Action::TreeToggle);
+                }
+            }
+            return;
+        }
+        if let Some(r) = self.hits.info
+            && r.contains(pos)
+        {
+            self.focus = Focus::Detail;
+            let row = self.info_scroll + (pos.y - r.y) as usize;
+            let x = pos.x.saturating_sub(self.hits.detail_text_x);
+            let link = self.hits.info_links.get(row).and_then(|links| links.iter().find(|(a, b, _)| x >= *a && x < *b));
+            if let Some((_, _, url)) = link.cloned() {
+                self.run(Action::OpenUrl(url));
+            }
             return;
         }
         if let Some(r) = self.hits.detail
             && r.contains(pos)
         {
             self.focus = Focus::Detail;
-            let row = self.detail_scroll + (pos.y - r.y) as usize;
+            let row = (self.detail_scroll + (pos.y - r.y) as usize).saturating_sub(self.hits.detail_links_from);
             let x = pos.x.saturating_sub(self.hits.detail_text_x);
             let link = self.hits.detail_links.get(row).and_then(|links| links.iter().find(|(a, b, _)| x >= *a && x < *b));
             if let Some((_, _, url)) = link.cloned() {
@@ -854,9 +1832,62 @@ impl App {
             }
             Action::Refresh => {
                 self.refresh();
+                if self.screen == Screen::Detail
+                    && self.tab == Tab::Actions
+                    && let Some(job) = self.selected_job().map(|j| j.id).filter(|j| self.log_wanted.contains(j))
+                {
+                    self.ensure_log(job, true);
+                }
                 self.toast("Refreshing…", ToastKind::Info);
             }
-            Action::OpenScopes => self.modal = Some(Modal::Scopes { filter: String::new(), sel: self.scope }),
+            Action::OpenScopes => {
+                let sel = scope_matches(&self.scopes, "", self.repo.is_some()).iter().position(|&i| i == self.scope).unwrap_or(0);
+                self.modal = Some(Modal::Scopes { filter: String::new(), sel });
+            }
+            Action::CycleDensity => {
+                self.state.density = self.state.density.next();
+                crate::state::save(&self.state);
+                self.toast(format!("Density: {}", self.state.density.label()), ToastKind::Info);
+            }
+            Action::OpenRepos => {
+                // Pre-select the active repo, else "This PR's repo", else "All repositories".
+                let items = repo_items(self, "");
+                let values: Vec<Option<String>> = items.iter().filter_map(RepoItem::value).collect();
+                let sel = match &self.repo {
+                    Some(r) => values.iter().position(|v| v.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(r))),
+                    None => items.iter().any(|i| matches!(i, RepoItem::ThisPr(..))).then_some(1),
+                }
+                .unwrap_or(0);
+                self.modal = Some(Modal::Repos { filter: String::new(), sel });
+                if self.repos.is_empty() && self.viewer.is_some() {
+                    self.load_repos();
+                }
+            }
+            Action::SetRepo(repo) => {
+                self.modal = None;
+                if let Some(r) = &repo {
+                    self.state.push_recent(r);
+                    crate::state::save(&self.state);
+                }
+                if repo == self.repo {
+                    return;
+                }
+                self.repo = repo;
+                if self.repo.is_none() && self.scopes[self.scope].qualifier.is_empty() {
+                    self.scope = 0;
+                    self.toast(format!("Scope reset to {}", self.scopes[0].name), ToastKind::Info);
+                }
+                self.pending_select = self.selected_pr().map(|p| p.id.clone());
+                self.prs.clear();
+                self.total = 0;
+                self.sel = 0;
+                self.load_list();
+            }
+            Action::ToggleRepoOfSelected => {
+                let Some(nwo) = self.selected_pr().map(|p| p.repository.name_with_owner.clone()) else { return };
+                let same = self.repo.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&nwo));
+                self.run(Action::SetRepo(if same { None } else { Some(nwo) }));
+            }
             Action::CycleState => {
                 self.state_filter = self.state_filter.next();
                 self.sel = 0;
@@ -911,10 +1942,167 @@ impl App {
                     self.run(Action::OpenUrl(url));
                 }
             }
+            Action::SetTab(t) => {
+                if t != self.tab {
+                    self.tab = t;
+                    self.detail_scroll = 0;
+                }
+                self.focus = Focus::Detail;
+                self.ensure_files(false);
+                self.ensure_runs(false);
+            }
+            Action::NextTab => self.run(Action::SetTab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()])),
+            Action::PrevTab => self.run(Action::SetTab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])),
+            Action::NextFile => self.select_file(self.file_sel + 1),
+            Action::PrevFile => self.select_file(self.file_sel.saturating_sub(1)),
+            Action::ToggleInfo => {
+                if self.wide_tab() {
+                    self.changes_info_expanded = !self.changes_info_expanded;
+                } else {
+                    self.info_collapsed = !self.info_collapsed;
+                }
+                self.info_scroll = 0;
+            }
+            Action::ToggleImages => {
+                if !self.images.available() {
+                    return self.toast(format!("Images are off: {}", self.images.off_reason), ToastKind::Info);
+                }
+                self.images.enabled = !self.images.enabled;
+                self.state.images_enabled = self.images.enabled;
+                crate::state::save(&self.state);
+                self.tab_cache.clear();
+                let msg = if self.images.enabled { format!("Images on ({})", self.images.protocol_label()) } else { "Images off".to_string() };
+                self.toast(msg, ToastKind::Info);
+            }
+            Action::ViewImage(key) => {
+                let alt = self.last_placements.1.iter().find(|p| p.key == key).map(|p| p.alt.clone());
+                self.modal = Some(Modal::Image { key, alt: alt.filter(|a| !a.is_empty()).unwrap_or_else(|| "Image".into()) });
+            }
+            Action::OpenUrl(url) if url.starts_with('#') => self.run(Action::Internal(url[1..].to_string())),
             Action::OpenUrl(url) => match open_url(&url) {
                 Ok(()) => self.toast(format!("Opened {url}"), ToastKind::Info),
                 Err(e) => self.toast(format!("Couldn't open browser: {e}"), ToastKind::Error),
             },
+            Action::TreeNext => self.move_tree(1),
+            Action::TreePrev => self.move_tree(-1),
+            Action::TreeToggle => match self.selected_node() {
+                Some(TreeNode::Run(i)) => {
+                    let Some(id) = self.current_runs().map(|e| e.runs[i].id) else { return };
+                    if !self.actions_expanded.remove(&id) {
+                        self.actions_expanded.insert(id);
+                        self.ensure_jobs(id, false);
+                    }
+                }
+                Some(TreeNode::Job(..)) => {
+                    let Some(id) = self.selected_job().map(|j| j.id) else { return };
+                    self.log_wanted.insert(id);
+                    self.ensure_log(id, false);
+                    self.detail_scroll = usize::MAX;
+                }
+                _ => {}
+            },
+            Action::TreeOpenBrowser => {
+                let url = match self.selected_node() {
+                    Some(TreeNode::Run(i)) => self.current_runs().map(|e| e.runs[i].html_url.clone()),
+                    Some(TreeNode::Job(..)) => self.selected_job().and_then(|j| j.html_url.clone()),
+                    _ => None,
+                };
+                match url {
+                    Some(u) => self.run(Action::OpenUrl(u)),
+                    None => self.toast("Select a run or job first", ToastKind::Info),
+                }
+            }
+            Action::ToggleHistory => {
+                let Some(d) = self.selected_detail() else { return };
+                if d.is_cross_repository {
+                    return self.toast("Run history isn't available for PRs from forks yet", ToastKind::Info);
+                }
+                let id = d.id.clone();
+                let on = !self.actions_history.remove(&id);
+                if on {
+                    self.actions_history.insert(id);
+                }
+                self.ensure_runs(true);
+                self.toast(if on { "Showing runs from earlier pushes too" } else { "Showing runs for the head commit only" }, ToastKind::Info);
+            }
+            Action::ActionsBack => {
+                if self.log_view.search.take().is_some() {
+                    return;
+                }
+                match self.selected_node() {
+                    // Close the job back to its run.
+                    Some(TreeNode::Job(run_id, _)) => self.reselect(Some((run_id, None))),
+                    _ => self.run(Action::Back),
+                }
+            }
+            Action::LogNextError | Action::LogNextWarning => {
+                let Some(job) = self.shown_log() else { return self.toast("Open a job's log first (Enter on a job)", ToastKind::Info) };
+                let (what, targets) = match action {
+                    Action::LogNextError => ("errors", self.logs[&job].0.errors.clone()),
+                    _ => ("warnings", self.logs[&job].0.warnings.clone()),
+                };
+                if !self.jump_next(&targets, false) {
+                    self.toast(format!("No {what} in this log"), ToastKind::Info);
+                }
+            }
+            Action::LogFold => {
+                let Some(job) = self.shown_log() else { return };
+                let log = &self.logs[&job].0;
+                let line = self.log_view.cursor.filter(|c| self.log_view.visible.binary_search(c).is_ok()).or(self.hits.log_top_line);
+                let Some(g) = line.and_then(|l| log.lines.get(l)).and_then(|l| l.group) else {
+                    return self.toast("Not inside a group", ToastKind::Info);
+                };
+                let start = log.groups[g].start;
+                self.run(Action::Internal(format!("fold:{g}")));
+                self.log_view.cursor = Some(start);
+                self.log_view.scroll_to = Some(start);
+            }
+            Action::LogFoldAll => {
+                let Some(job) = self.shown_log() else { return };
+                let n = self.logs[&job].0.groups.len();
+                self.log_view.folds = if self.log_view.folds.len() < n { (0..n).collect() } else { HashSet::new() };
+                self.refold();
+            }
+            Action::LogTimestamps => {
+                self.log_view.timestamps = !self.log_view.timestamps;
+            }
+            Action::LogSearch => {
+                if self.shown_log().is_none() {
+                    return self.toast("Open a job's log first (Enter on a job)", ToastKind::Info);
+                }
+                let s = self.log_view.search.get_or_insert_with(|| LogSearch { query: String::new(), input: true, hits: Vec::new() });
+                s.input = true;
+            }
+            Action::LogNextHit | Action::LogPrevHit => {
+                if self.shown_log().is_some() && !self.run_search_jump(action == Action::LogPrevHit) {
+                    self.toast("No matches", ToastKind::Info);
+                }
+            }
+            Action::Internal(link) => {
+                if let Some(key) = link.strip_prefix("image:") {
+                    return self.run(Action::ViewImage(key.to_string()));
+                }
+                let (kind, arg) = link.split_once(':').unwrap_or((&link, ""));
+                match (kind, arg.parse::<u64>()) {
+                    ("fold", Ok(g)) => {
+                        if self.shown_log().is_some() {
+                            let g = g as usize;
+                            if !self.log_view.folds.remove(&g) {
+                                self.log_view.folds.insert(g);
+                            }
+                            self.refold();
+                        }
+                    }
+                    ("line", Ok(line)) => self.jump_to_line(line as usize),
+                    ("job", Ok(job)) => {
+                        let Some(run) = self.find_job(job).map(|j| j.run_id) else { return };
+                        self.actions_expanded.insert(run);
+                        self.reselect(Some((run, Some(job))));
+                        self.run(Action::TreeToggle);
+                    }
+                    _ => {}
+                }
+            }
             Action::CopyCheckout => {
                 if let Some(p) = self.selected_pr() {
                     let cmd = format!("gh pr checkout {} -R {}", p.number, p.repository.name_with_owner);
@@ -1034,6 +2222,12 @@ impl App {
             entries.push(MenuEntry { item: MenuItem::Browser, label: "Open in browser".into(), key: 'b', disabled: None });
             entries.push(MenuEntry { item: MenuItem::CopyCheckout, label: "Copy `gh pr checkout` command".into(), key: 'y', disabled: None });
             entries.push(MenuEntry { item: MenuItem::CopyUrl, label: "Copy PR URL".into(), key: 'u', disabled: None });
+            let label = if self.repo.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&d.repository.name_with_owner)) {
+                "Show all repositories".to_string()
+            } else {
+                format!("Only PRs in {}", d.repository.name_with_owner)
+            };
+            entries.push(MenuEntry { item: MenuItem::ToggleRepo, label, key: 'e', disabled: None });
         }
         if entries.is_empty() {
             return;
@@ -1063,8 +2257,26 @@ impl App {
 
     fn modal_pick(&mut self, i: usize) {
         match self.modal.take() {
+            // The image viewer's footer: 0 opens the image in the browser, 1 copies its URL.
+            Some(Modal::Image { key, alt }) => {
+                match i {
+                    0 => self.run(Action::OpenUrl(key.clone())),
+                    _ => {
+                        copy_to_clipboard(&key);
+                        self.toast(format!("Copied: {key}"), ToastKind::Success);
+                    }
+                }
+                self.modal = Some(Modal::Image { key, alt });
+            }
+            Some(Modal::Repos { filter, sel }) => {
+                let values: Vec<Option<String>> = repo_items(self, &filter).iter().filter_map(RepoItem::value).collect();
+                match values.get(i) {
+                    Some(v) => self.run(Action::SetRepo(v.clone())),
+                    None => self.modal = Some(Modal::Repos { filter, sel }),
+                }
+            }
             Some(Modal::Scopes { filter, sel }) => {
-                let matches = scope_matches(&self.scopes, &filter);
+                let matches = scope_matches(&self.scopes, &filter, self.repo.is_some());
                 match matches.get(i) {
                     Some(&idx) => {
                         if idx != self.scope || self.prs.is_empty() {
@@ -1098,6 +2310,7 @@ impl App {
                     MenuItem::Reopen => self.confirm(PendingOp::Reopen),
                     MenuItem::Browser => self.run(Action::Browser),
                     MenuItem::CopyCheckout => self.run(Action::CopyCheckout),
+                    MenuItem::ToggleRepo => self.run(Action::ToggleRepoOfSelected),
                     MenuItem::CopyUrl => {
                         if let Some(url) = self.selected_pr().map(|p| p.url.clone()) {
                             copy_to_clipboard(&url);
@@ -1212,11 +2425,12 @@ fn review_block(d: &PrDetail, viewer: Option<&Viewer>) -> Option<String> {
     }
 }
 
-pub fn scope_matches(scopes: &[Scope], filter: &str) -> Vec<usize> {
+pub fn scope_matches(scopes: &[Scope], filter: &str, repo_set: bool) -> Vec<usize> {
     let f = filter.to_lowercase();
     scopes
         .iter()
         .enumerate()
+        .filter(|(_, s)| repo_set || !s.qualifier.is_empty())
         .filter(|(_, s)| f.is_empty() || s.name.to_lowercase().contains(&f) || s.qualifier.to_lowercase().contains(&f))
         .map(|(i, _)| i)
         .collect()
@@ -1266,4 +2480,122 @@ mod tests {
         assert_eq!(super::base64(b"ab"), "YWI=");
         assert_eq!(super::base64(b"abc"), "YWJj");
     }
+}
+
+/// A row in the repo picker. Headers and notes are display-only.
+pub enum RepoItem {
+    All { count: usize },
+    ThisPr(String, Option<usize>),
+    Header(String),
+    Repo { nwo: String, count: Option<usize>, private: bool, pushed: Option<String> },
+    UseTyped(String),
+    Note(String),
+}
+
+impl RepoItem {
+    /// What picking this row sets the filter to; `None` for non-selectable rows.
+    pub fn value(&self) -> Option<Option<String>> {
+        match self {
+            RepoItem::All { .. } => Some(None),
+            RepoItem::ThisPr(r, _) | RepoItem::UseTyped(r) | RepoItem::Repo { nwo: r, .. } => Some(Some(r.clone())),
+            RepoItem::Header(_) | RepoItem::Note(_) => None,
+        }
+    }
+}
+
+fn looks_like_repo(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let ok = |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)));
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+fn count_repos(prs: &[PrSummary]) -> Vec<(String, usize)> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for p in prs {
+        match counts.iter_mut().find(|(r, _)| *r == p.repository.name_with_owner) {
+            Some(e) => e.1 += 1,
+            None => counts.push((p.repository.name_with_owner.clone(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts
+}
+
+/// Picker rows: sectioned when `filter` is empty, otherwise one ranked flat list.
+pub fn repo_items(app: &App, filter: &str) -> Vec<RepoItem> {
+    let count_of = |nwo: &str| app.scope_repos.iter().find(|(r, _)| r.eq_ignore_ascii_case(nwo)).map(|(_, c)| *c);
+    let info_of = |nwo: &str| app.repos.iter().find(|r| r.name_with_owner.eq_ignore_ascii_case(nwo));
+    let repo_row = |nwo: &str| {
+        let info = info_of(nwo);
+        RepoItem::Repo {
+            nwo: info.map_or(nwo.to_string(), |i| i.name_with_owner.clone()),
+            count: count_of(nwo),
+            private: info.is_some_and(|i| i.is_private),
+            pushed: info.and_then(|i| i.pushed_at.clone()),
+        }
+    };
+    let active = |nwo: &str| app.repo.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(nwo));
+    let this_pr = app.selected_pr().map(|p| p.repository.name_with_owner.clone()).filter(|r| !active(r));
+
+    // Candidates in tier order, deduplicated.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut tiers: Vec<(&str, Vec<String>)> = vec![
+        ("In this view", app.scope_repos.iter().map(|(r, _)| r.clone()).collect()),
+        ("Recent", app.state.recent_repos.clone()),
+        ("Your repositories", app.repos.iter().map(|r| r.name_with_owner.clone()).collect()),
+    ];
+    for (_, list) in tiers.iter_mut() {
+        list.retain(|r| seen.insert(r.to_lowercase()));
+    }
+
+    let mut items = vec![RepoItem::All { count: app.scope_repos.iter().map(|(_, c)| c).sum() }];
+    let f = filter.trim().to_lowercase();
+    if f.is_empty() {
+        if let Some(r) = this_pr {
+            let c = count_of(&r);
+            items.push(RepoItem::ThisPr(r, c));
+        }
+        for (title, list) in tiers {
+            if list.is_empty() {
+                continue;
+            }
+            items.push(RepoItem::Header(title.to_string()));
+            items.extend(list.iter().map(|r| repo_row(r)));
+        }
+    } else {
+        // Rank: name starts with > name contains > owner contains; ties keep tier order.
+        let mut ranked: Vec<(u8, String)> = Vec::new();
+        for (_, list) in &tiers {
+            for nwo in list {
+                let l = nwo.to_lowercase();
+                let (owner, name) = l.split_once('/').unwrap_or(("", &l));
+                let rank = if name.starts_with(&f) || l.starts_with(&f) {
+                    0
+                } else if name.contains(&f) || l.contains(&f) {
+                    1
+                } else if owner.contains(&f) {
+                    2
+                } else {
+                    continue;
+                };
+                ranked.push((rank, nwo.clone()));
+            }
+        }
+        ranked.sort_by_key(|(r, _)| *r);
+        let exact = ranked.iter().any(|(_, n)| n.eq_ignore_ascii_case(filter.trim()));
+        items.extend(ranked.iter().map(|(_, r)| repo_row(r)));
+        if !exact && looks_like_repo(filter.trim()) {
+            items.push(RepoItem::UseTyped(filter.trim().to_string()));
+        }
+        if ranked.is_empty() {
+            items.push(RepoItem::Note(format!("No repositories match “{}”", filter.trim())));
+        }
+        // While searching, Enter should pick the best match, so "All" moves to the end.
+        let all = items.remove(0);
+        items.push(all);
+    }
+    if app.repos_loading {
+        items.push(RepoItem::Note(format!("loading your repositories… ({} of {})", app.repos.len().max(app.repos_fresh.len()), app.repos_total)));
+    }
+    items
 }

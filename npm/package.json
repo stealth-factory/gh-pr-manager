@@ -1,0 +1,48 @@
+{
+  "name": "gh-pr-manager",
+  "version": "0.0.0-dev",
+  "description": "A mouse-friendly terminal UI for browsing and managing GitHub pull requests.",
+  "bin": {
+    "gh-pr-manager": "bin/gh-pr-manager"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js",
+    "test": "node --test test.js"
+  },
+  "optionalDependencies": {
+    "gh-pr-manager-linux-x64": "0.0.0-dev",
+    "gh-pr-manager-linux-arm64": "0.0.0-dev",
+    "gh-pr-manager-darwin-arm64": "0.0.0-dev",
+    "gh-pr-manager-darwin-x64": "0.0.0-dev",
+    "gh-pr-manager-win32-x64": "0.0.0-dev"
+  },
+  "files": [
+    "bin",
+    "platform.js",
+    "postinstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stealth-factory/gh-pr-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stealth-factory/gh-pr-manager/issues"
+  },
+  "homepage": "https://github.com/stealth-factory/gh-pr-manager#readme",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "github",
+    "pull-requests",
+    "tui",
+    "terminal",
+    "cli"
+  ]
+}
