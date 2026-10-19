@@ -20,6 +20,7 @@ use crate::github::{
     Viewer, WorkflowRunInfo,
 };
 use crate::search::{self, Command, Doc, Match, Query, TokenBucket};
+use crate::stacks::{self, Link, Member, RowView, Stack};
 use crate::state::{ReposCache, Seen, State};
 
 /// Maximum PRs loaded per scope (GitHub search caps at 1000).
@@ -80,6 +81,12 @@ pub enum Msg {
     Remote { generation: u64, key: RemoteKey, res: Result<(Vec<PrSummary>, Option<RateLimit>)> },
     /// An inline image was downloaded and decoded, or encoded for another size.
     Image(ImageMsg),
+    /// The needs-rebase compare query for the stack keyed `key`.
+    Links { key: String, res: Result<(Vec<Link>, Option<RateLimit>)> },
+    /// A stack's cumulative files (`Whole stack`), by `stack_files` key.
+    StackFiles { key: String, res: Result<Vec<FileDiff>> },
+    /// A stack member that wasn't loaded, fetched to open it (`id` is the one asked for).
+    Splice { id: String, res: Result<(Vec<PrSummary>, Option<RateLimit>)> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,10 +154,11 @@ pub enum Tab {
     Checks,
     Actions,
     Reviews,
+    Stack,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [Tab::Description, Tab::Conversation, Tab::Changes, Tab::Commits, Tab::Checks, Tab::Actions, Tab::Reviews];
+    pub const ALL: [Tab; 8] = [Tab::Description, Tab::Conversation, Tab::Changes, Tab::Commits, Tab::Checks, Tab::Actions, Tab::Reviews, Tab::Stack];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -161,6 +169,21 @@ impl Tab {
             Tab::Checks => "Checks",
             Tab::Actions => "Actions",
             Tab::Reviews => "Reviews",
+            Tab::Stack => "Stack",
+        }
+    }
+
+    /// For a tab bar too narrow for every full name.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Tab::Description => "Desc",
+            Tab::Conversation => "Conv",
+            Tab::Changes => "Diff",
+            Tab::Commits => "Log",
+            Tab::Checks => "Checks",
+            Tab::Actions => "Runs",
+            Tab::Reviews => "Revs",
+            Tab::Stack => "Stack",
         }
     }
 
@@ -253,8 +276,25 @@ pub enum Action {
     LogSearch,
     LogNextHit,
     LogPrevHit,
-    /// A `#…` link handled inside the app: `fold:<group>`, `line:<line>`, `job:<id>`, `image:<key>`.
+    /// A `#…` link handled inside the app: `fold:<group>`, `line:<line>`, `job:<id>`, `image:<key>`,
+    /// `pr:<id>` (open a PR), `stackfile:<i>` (show a Stack tab file's patch).
     Internal(String),
+    // Stacks (docs/stacks.md)
+    /// `<` / `>`: the PR below (toward the trunk) / above in the stack.
+    StackPrev,
+    StackNext,
+    /// Stack tab: move the cursor (members, or files once one is opened), open, back.
+    StackMove(isize),
+    StackSelect(usize),
+    StackOpen,
+    StackBack,
+    StackOpenBrowser,
+    StackUpdateBranch,
+    StackLink,
+    StackMergeUpTo,
+    /// The bottom PR's page, which holds GitHub's stack map.
+    StackOnGitHub,
+    ToggleGroupStacks,
     // Modal-level actions
     ModalPick(usize),
     ModalCancel,
@@ -294,6 +334,11 @@ pub enum MenuItem {
     CopyCheckout,
     CopyUrl,
     ToggleRepo,
+    StackUpdate,
+    StackLink,
+    StackMerge,
+    /// A method for "merge the stack up to here" (the menu `M` opens).
+    MergeStack(MergeMethod),
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +356,12 @@ pub enum PendingOp {
     Close,
     Reopen,
     Approve,
+    /// Bring the branch up to date with its base (rebase, else merge), from this head commit.
+    UpdateBranch { oid: String },
+    /// Link these PRs (bottom first) into a GitHub stack.
+    LinkStack { nwo: String, numbers: Vec<u64> },
+    /// merge-async PR `up_to` (and its open downstack), polled to the end.
+    MergeStack { nwo: String, up_to: u64, method: MergeMethod, sha: String, label: String },
 }
 
 pub enum Modal {
@@ -383,6 +434,9 @@ pub struct Hits {
     /// spacer and push-header rows have none).
     pub actions_tree: Option<(Rect, usize)>,
     pub actions_tree_rows: Vec<Option<usize>>,
+    /// Stack tab's left column: rows area and scroll, and each row's entry (`stack_entries`).
+    pub stack_list: Option<(Rect, usize)>,
+    pub stack_list_rows: Vec<Option<usize>>,
     /// Absolute row of `detail_links[0]` (the Actions pane only records the rows on screen).
     pub detail_links_from: usize,
     /// First job-log line on screen, for `z` and `E` when nothing was jumped to yet.
@@ -731,6 +785,27 @@ pub struct App {
     emission: Option<changes::Emission>,
     /// The last notification's text (status line and tests).
     pub last_notification: Option<String>,
+    // Stacks (docs/stacks.md)
+    /// Native stacks and implicit chains among the loaded PRs, and PR id → (stack, member).
+    pub stacks: Vec<Stack>,
+    pub membership: HashMap<String, (usize, usize)>,
+    /// Default branch per repo (lowercased `owner/name`), learnt from details.
+    default_branches: HashMap<String, String>,
+    /// Needs-rebase compare results per stack key.
+    pub links: HashMap<String, (Vec<Link>, Instant)>,
+    links_loading: HashSet<String>,
+    /// `Whole stack` files per key (trunk…top head).
+    pub stack_files: HashMap<String, (Vec<FileDiff>, Instant)>,
+    stack_files_loading: HashSet<String>,
+    pub stack_files_errors: HashMap<String, String>,
+    /// Stack tab cursor (an index into `stack_entries`; `None` follows the open PR), whether a
+    /// file's patch is open, the file cursor, and the left column's scroll.
+    pub stack_sel: Option<usize>,
+    pub stack_open: bool,
+    pub stack_file_sel: usize,
+    pub stack_list_scroll: usize,
+    /// Members being fetched to be opened.
+    splicing: HashSet<String>,
 }
 
 impl App {
@@ -847,6 +922,19 @@ impl App {
             notified: HashMap::new(),
             emission: None,
             last_notification: None,
+            stacks: Vec::new(),
+            membership: HashMap::new(),
+            default_branches: HashMap::new(),
+            links: HashMap::new(),
+            links_loading: HashSet::new(),
+            stack_files: HashMap::new(),
+            stack_files_loading: HashSet::new(),
+            stack_files_errors: HashMap::new(),
+            stack_sel: None,
+            stack_open: false,
+            stack_file_sel: 0,
+            stack_list_scroll: 0,
+            splicing: HashSet::new(),
         }
     }
 
@@ -955,6 +1043,7 @@ impl App {
         }
         self.ensure_files(false);
         self.ensure_runs(false);
+        self.ensure_stack_data();
     }
 
     /// Load the selected PR's diff when the Changes tab is showing.
@@ -1142,7 +1231,7 @@ impl App {
 
     /// The two-column tabs want the room, so they share a separate, initially collapsed state.
     fn wide_tab(&self) -> bool {
-        matches!(self.tab, Tab::Changes | Tab::Actions)
+        matches!(self.tab, Tab::Changes | Tab::Actions | Tab::Stack)
     }
 
     pub fn info_collapsed(&self) -> bool {
@@ -1184,6 +1273,12 @@ impl App {
 
     /// Indices into `prs` the list shows: `visible_base`, narrowed to unread PRs when that filter is on.
     pub fn visible(&self) -> Vec<usize> {
+        self.visible_rows().into_iter().map(|r| r.idx).collect()
+    }
+
+    /// The list's rows: `visible_base`, narrowed to unread PRs when that filter is on, unread
+    /// first when asked, then each stack's PRs together (bottom first) with their tree glyphs.
+    pub fn visible_rows(&self) -> Vec<RowView> {
         let mut base = self.visible_base();
         let unread = |i: usize| self.unread.contains_key(&self.prs[i].id) || self.unread_keep.contains(&self.prs[i].id);
         if self.unread_only {
@@ -1193,7 +1288,10 @@ impl App {
             // Stable: each group keeps its order.
             base.sort_by_key(|&i| !unread(i));
         }
-        base
+        if self.state.group_stacks && !self.stacks.is_empty() {
+            return stacks::grouped(&base, &self.prs, &self.stacks, &self.membership);
+        }
+        base.into_iter().map(|idx| RowView { idx, glyph: None }).collect()
     }
 
     /// Unread PRs among `visible_base`.
@@ -1471,6 +1569,7 @@ impl App {
             self.actions_sel = 0;
             self.actions_tree_scroll = 0;
             self.actions_tree_follow = true;
+            self.reset_stack_view();
         }
         if self.screen == Screen::Detail {
             self.ensure_detail();
@@ -1624,6 +1723,7 @@ impl App {
                         }
                         self.absorb_details(&page_ids);
                         self.prs_rev += 1;
+                        self.rebuild_stacks();
                         self.total = page.total;
                         self.loading_list = has_next && self.prs.len() < MAX_PRS;
                         self.observe(&page_ids);
@@ -1682,10 +1782,17 @@ impl App {
                             self.mark_read(&id);
                         }
                         self.rebuild_unread();
+                        if let Some(b) = &d.repository.default_branch_ref {
+                            self.default_branches.insert(d.repository.name_with_owner.to_lowercase(), b.name.clone());
+                        }
+                        let stacked = d.stack.is_some() || self.membership.contains_key(&id);
                         self.details.insert(id.clone(), (d, Instant::now()));
+                        if stacked {
+                            self.rebuild_stacks_keep();
+                        }
                         self.refresh_marks();
                         if !ch.is_empty() {
-                            let ch = vec![(id, ch)];
+                            let ch = vec![(id.clone(), ch)];
                             let prs = self.prs.clone();
                             self.set_digest(&ch, &prs, false);
                             self.notify(&ch, &prs);
@@ -1697,6 +1804,11 @@ impl App {
                         }
                         self.ensure_files(false);
                         self.ensure_runs(false);
+                        // The needs-rebase compare follows the detail's cadence.
+                        if self.selected_pr().is_some_and(|p| p.id == id) {
+                            self.ensure_links(true);
+                        }
+                        self.ensure_stack_data();
                     }
                     Err(e) => {
                         self.detail_errors.insert(id, format!("{e:#}"));
@@ -1910,6 +2022,57 @@ impl App {
                 self.restore_search_sel(anchor);
             }
             Msg::Remote { generation, key, res } => self.on_remote(generation, key, res),
+            Msg::Links { key, res } => {
+                self.links_loading.remove(&key);
+                match res {
+                    Ok((links, rate)) => {
+                        self.rate = rate.or(self.rate.take());
+                        self.links.insert(key, (links, Instant::now()));
+                    }
+                    // A signal, not a feature: keep the last answer and try again next refresh.
+                    Err(_) => {
+                        if let Some(e) = self.links.get_mut(&key) {
+                            e.1 = Instant::now();
+                        } else {
+                            self.links.insert(key, (Vec::new(), Instant::now()));
+                        }
+                    }
+                }
+            }
+            Msg::StackFiles { key, res } => {
+                self.stack_files_loading.remove(&key);
+                match res {
+                    Ok(files) => {
+                        self.stack_files_errors.remove(&key);
+                        self.stack_files.insert(key, (files, Instant::now()));
+                    }
+                    Err(e) => {
+                        self.stack_files_errors.insert(key, format!("{e:#}"));
+                    }
+                }
+            }
+            Msg::Splice { id, res } => {
+                self.splicing.remove(&id);
+                match res {
+                    Ok((prs, rate)) => {
+                        self.rate = rate.or(self.rate.take());
+                        let Some(pr) = prs.into_iter().find(|p| p.id == id) else {
+                            return self.toast("That PR couldn't be loaded", ToastKind::Error);
+                        };
+                        if !self.prs.iter().any(|p| p.id == id) {
+                            let prev = self.selected_pr().map(|p| p.id.clone());
+                            self.queue_bodies(vec![(id.clone(), pr.updated_at.clone())]);
+                            self.prs.insert(0, pr);
+                            self.prs_rev += 1;
+                            self.search.spliced.insert(id.clone());
+                            self.rebuild_stacks();
+                            self.keep_selected(prev);
+                        }
+                        self.run(Action::JumpTo(id));
+                    }
+                    Err(e) => self.toast(format!("Couldn't load that PR: {e:#}"), ToastKind::Error),
+                }
+            }
             Msg::Image(m) => {
                 // Rows change when an image arrives; rebuilding re-lays out the tabs.
                 if self.images.apply(m) {
@@ -1962,6 +2125,7 @@ impl App {
         let in_detail_pane = self.screen == Screen::Detail && self.focus == Focus::Detail;
         let actions = self.screen == Screen::Detail && self.tab == Tab::Actions;
         let searching = self.log_view.search.is_some();
+        let stack_tab = self.screen == Screen::Detail && self.tab == Tab::Stack;
         let action = match k.code {
             // Actions tab first: it reuses keys that mean something else elsewhere.
             KeyCode::Char('f') if ctrl && actions => Some(Action::LogSearch),
@@ -1980,6 +2144,14 @@ impl App {
             KeyCode::Char('z') if actions => Some(Action::LogFold),
             KeyCode::Char('Z') if actions => Some(Action::LogFoldAll),
             KeyCode::Char('t') if actions => Some(Action::LogTimestamps),
+            // Stack tab: members (or an opened member's files) like the Actions tree.
+            KeyCode::Char('n') if stack_tab => Some(Action::StackMove(1)),
+            KeyCode::Char('p') if stack_tab => Some(Action::StackMove(-1)),
+            KeyCode::Down if in_detail_pane && stack_tab => Some(Action::StackMove(1)),
+            KeyCode::Up if in_detail_pane && stack_tab => Some(Action::StackMove(-1)),
+            KeyCode::Enter if in_detail_pane && stack_tab => Some(Action::StackOpen),
+            KeyCode::Esc if stack_tab && self.stack_open => Some(Action::StackBack),
+            KeyCode::Char('O') if stack_tab => Some(Action::StackOpenBrowser),
             KeyCode::Char('q') => Some(if self.screen == Screen::Detail { Action::Back } else { Action::Quit }),
             KeyCode::Esc => Some(match self.screen {
                 Screen::Detail => Action::Back,
@@ -2006,7 +2178,12 @@ impl App {
             KeyCode::Char('R') => Some(Action::RequestChanges),
             KeyCode::Char('x') => Some(Action::CloseOrReopen),
             KeyCode::Char('y') => Some(Action::CopyCheckout),
-            KeyCode::Char(c @ '1'..='7') if self.screen == Screen::Detail => Some(Action::SetTab(Tab::ALL[c as usize - '1' as usize])),
+            KeyCode::Char('<') => Some(Action::StackPrev),
+            KeyCode::Char('>') => Some(Action::StackNext),
+            KeyCode::Char('b') => Some(Action::StackUpdateBranch),
+            KeyCode::Char('L') => Some(Action::StackLink),
+            KeyCode::Char('M') => Some(Action::StackMergeUpTo),
+            KeyCode::Char(c @ '1'..='8') if self.screen == Screen::Detail => Some(Action::SetTab(Tab::ALL[c as usize - '1' as usize])),
             KeyCode::Char(']') if self.screen == Screen::Detail => Some(Action::NextTab),
             KeyCode::Char('[') if self.screen == Screen::Detail => Some(Action::PrevTab),
             KeyCode::Char('n') if self.screen == Screen::Detail && self.tab == Tab::Changes => Some(Action::NextFile),
@@ -2236,6 +2413,11 @@ impl App {
             let n = self.hits.actions_tree_rows.len();
             self.actions_tree_scroll = (offset as isize + delta).clamp(0, n.saturating_sub(r.height as usize) as isize) as usize;
             self.actions_tree_follow = false;
+        } else if let Some((r, offset)) = self.hits.stack_list
+            && r.contains(pos)
+        {
+            let n = self.hits.stack_list_rows.len();
+            self.stack_list_scroll = (offset as isize + delta).clamp(0, n.saturating_sub(r.height as usize) as isize) as usize;
         } else if self.hits.info.is_some_and(|r| r.contains(pos)) {
             self.focus = Focus::Detail;
             self.scroll_info(delta);
@@ -2337,6 +2519,15 @@ impl App {
                 if self.actions_sel == node {
                     self.run(Action::TreeToggle);
                 }
+            }
+            return;
+        }
+        if let Some((r, offset)) = self.hits.stack_list
+            && r.contains(pos)
+        {
+            self.focus = Focus::Detail;
+            if let Some(Some(entry)) = self.hits.stack_list_rows.get(offset + (pos.y - r.y) as usize).copied() {
+                self.run(Action::StackSelect(entry));
             }
             return;
         }
@@ -2589,6 +2780,7 @@ impl App {
                 self.focus = Focus::Detail;
                 self.ensure_files(false);
                 self.ensure_runs(false);
+                self.ensure_stack_data();
             }
             Action::NextTab => self.run(Action::SetTab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()])),
             Action::PrevTab => self.run(Action::SetTab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])),
@@ -2721,6 +2913,12 @@ impl App {
                 if link == "nextnew" {
                     return self.jump_new_entry(false);
                 }
+                if let Some(id) = link.strip_prefix("pr:") {
+                    return self.open_member(id);
+                }
+                if link == "stackback" {
+                    return self.run(Action::StackBack);
+                }
                 if let Some(key) = link.strip_prefix("image:") {
                     return self.run(Action::ViewImage(key.to_string()));
                 }
@@ -2736,6 +2934,11 @@ impl App {
                         }
                     }
                     ("line", Ok(line)) => self.jump_to_line(line as usize),
+                    ("stackfile", Ok(i)) => {
+                        self.stack_open = true;
+                        self.stack_file_sel = i as usize;
+                        self.detail_scroll = 0;
+                    }
                     ("job", Ok(job)) => {
                         let Some(run) = self.find_job(job).map(|j| j.run_id) else { return };
                         self.actions_expanded.insert(run);
@@ -2759,6 +2962,99 @@ impl App {
                 }
             }
             Action::Help => self.modal = Some(Modal::Help),
+            Action::StackPrev | Action::StackNext => {
+                let up = action == Action::StackNext;
+                let Some(s) = self.selected_stack() else { return self.toast("Not in a stack", ToastKind::Info) };
+                let Some(id) = self.selected_pr().map(|p| p.id.clone()) else { return };
+                match stacks::neighbour(s, &id, up) {
+                    Some(m) => {
+                        let id = m.id.clone();
+                        self.open_member(&id);
+                    }
+                    None => {
+                        let end = if up { "top" } else { "bottom" };
+                        let n = s.member(&id).map(|m| m.number).unwrap_or_default();
+                        self.toast(format!("#{n} is the {end} of the stack"), ToastKind::Info);
+                    }
+                }
+            }
+            Action::StackMove(d) => {
+                if self.stack_open {
+                    let n = self.stack_entry_files().map_or(0, |f| f.len());
+                    if n > 0 {
+                        let i = (self.stack_file_sel as isize + d).clamp(0, n as isize - 1) as usize;
+                        if i != self.stack_file_sel {
+                            self.stack_file_sel = i;
+                            self.detail_scroll = 0;
+                        }
+                    }
+                    return;
+                }
+                let n = self.stack_entries().len();
+                if n > 0 {
+                    let i = (self.stack_cursor() as isize + d).clamp(0, n as isize - 1) as usize;
+                    self.run(Action::StackSelect(i));
+                }
+            }
+            Action::StackSelect(i) => {
+                if Some(i) != self.stack_sel.or(Some(self.stack_cursor())) || self.stack_open {
+                    self.detail_scroll = 0;
+                }
+                self.stack_sel = Some(i);
+                self.stack_open = false;
+                self.stack_file_sel = 0;
+                self.ensure_stack_data();
+            }
+            Action::StackOpen => {
+                if self.stack_open {
+                    return;
+                }
+                match self.stack_entry_files().map(|f| f.len()) {
+                    Some(n) if n > 0 => {
+                        self.stack_open = true;
+                        self.stack_file_sel = self.stack_file_sel.min(n - 1);
+                        self.detail_scroll = 0;
+                    }
+                    Some(_) => self.toast("No file changes here", ToastKind::Info),
+                    None => self.toast("Files are still loading", ToastKind::Info),
+                }
+            }
+            Action::StackBack => {
+                if self.stack_open {
+                    self.stack_open = false;
+                    self.detail_scroll = 0;
+                } else {
+                    self.run(Action::Back);
+                }
+            }
+            Action::StackOpenBrowser => {
+                let target = self.stack_cursor_member().map(|m| m.number);
+                match (target, self.selected_stack()) {
+                    (Some(n), Some(s)) => {
+                        let url = format!("https://github.com/{}/pull/{n}", s.repo);
+                        self.run(Action::OpenUrl(url));
+                    }
+                    _ => self.run(Action::Browser),
+                }
+            }
+            Action::StackOnGitHub => {
+                let Some(s) = self.selected_stack() else { return self.toast("Not in a stack", ToastKind::Info) };
+                let bottom = s.members.iter().find(|m| !m.merged()).or(s.members.first()).map(|m| m.number);
+                if let Some(n) = bottom {
+                    let url = format!("https://github.com/{}/pull/{n}", s.repo);
+                    self.run(Action::OpenUrl(url));
+                }
+            }
+            Action::StackUpdateBranch => self.stack_update_branch(),
+            Action::StackLink => self.stack_link(),
+            Action::StackMergeUpTo => self.stack_merge_menu(),
+            Action::ToggleGroupStacks => {
+                let prev = self.selected_pr().map(|p| p.id.clone());
+                self.state.group_stacks = !self.state.group_stacks;
+                crate::state::save(&self.state);
+                self.keep_selected(prev);
+                self.toast(if self.state.group_stacks { "Grouping stacked PRs together" } else { "Stacks not grouped" }, ToastKind::Info);
+            }
             Action::ModalPick(i) => self.modal_pick(i),
             Action::ModalCancel if matches!(self.modal, Some(Modal::Search)) => self.close_search(),
             Action::ModalCancel => {
@@ -2887,6 +3183,13 @@ impl App {
                 format!("Only PRs in {}", d.repository.name_with_owner)
             };
             entries.push(MenuEntry { item: MenuItem::ToggleRepo, label, key: 'e', disabled: None });
+            // Stacked PRs (docs/stacks.md); `b` is the browser here, so update-branch is `B`.
+            if self.selected_stack().is_some() {
+                let block = |c| self.stack_block(c);
+                entries.push(MenuEntry { item: MenuItem::StackUpdate, label: "Update branch onto its parent (rebase)".into(), key: 'B', disabled: block(Command::StackUpdate) });
+                entries.push(MenuEntry { item: MenuItem::StackLink, label: "Link into a GitHub stack".into(), key: 'L', disabled: block(Command::StackLink) });
+                entries.push(MenuEntry { item: MenuItem::StackMerge, label: "Merge the stack up to here…".into(), key: 'M', disabled: block(Command::StackMerge) });
+            }
         }
         entries
     }
@@ -2901,11 +3204,20 @@ impl App {
                     MergeMethod::Merge => "Merge (merge commit)",
                     MergeMethod::Rebase => "Rebase and merge",
                 };
-                (verb.to_string(), format!("{verb} {what}\n“{}”\n\n{} → {}", d.title, d.head_ref_name, d.base_ref_name))
+                let mut msg = format!("{verb} {what}\n“{}”\n\n{} → {}", d.title, d.head_ref_name, d.base_ref_name);
+                // An unlinked chain: GitHub won't retarget the PR built on this one.
+                if let Some(s) = self.selected_stack().filter(|s| !s.native())
+                    && let Some(up) = stacks::neighbour(s, &d.id, true).filter(|m| m.open())
+                {
+                    msg.push_str(&format!("\n\n#{} targets this branch and won't be retargeted\n(link the chain with L to merge it as a stack)", up.number));
+                }
+                (verb.to_string(), msg)
             }
             PendingOp::Close => ("Close PR".into(), format!("Close {what} without merging?\n“{}”", d.title)),
             PendingOp::Reopen => ("Reopen PR".into(), format!("Reopen {what}?\n“{}”", d.title)),
             PendingOp::Approve => ("Approve PR".into(), format!("Submit an approving review on {what}?\n“{}”", d.title)),
+            // Built by their own actions, with the stack member as the target.
+            PendingOp::UpdateBranch { .. } | PendingOp::LinkStack { .. } | PendingOp::MergeStack { .. } => return,
         };
         self.modal = Some(Modal::Confirm { pr_id: d.id.clone(), title, message, op });
     }
@@ -2949,10 +3261,17 @@ impl App {
                     return;
                 }
                 match e.item {
+                    // A native stack member merges through merge-async, its open downstack with it
+                    // (plain merge refuses stacked PRs).
+                    MenuItem::Merge(m) if self.selected_stack().is_some_and(|s| s.native()) => self.confirm_merge_stack(&pr_id, m),
                     MenuItem::Merge(m) => {
                         let oid = self.selected_detail().map(|d| d.head_ref_oid.clone()).unwrap_or_default();
                         self.confirm(PendingOp::Merge(m, oid))
                     }
+                    MenuItem::MergeStack(m) => self.confirm_merge_stack(&pr_id, m),
+                    MenuItem::StackUpdate => self.run(Action::StackUpdateBranch),
+                    MenuItem::StackLink => self.run(Action::StackLink),
+                    MenuItem::StackMerge => self.run(Action::StackMergeUpTo),
                     MenuItem::Comment => self.open_composer(ComposeKind::Comment),
                     MenuItem::Approve => self.confirm(PendingOp::Approve),
                     MenuItem::RequestChanges => self.open_composer(ComposeKind::RequestChanges),
@@ -2981,6 +3300,15 @@ impl App {
                 PendingOp::Close => client.close(&id).await.map(|_| "Pull request closed".to_string()),
                 PendingOp::Reopen => client.reopen(&id).await.map(|_| "Pull request reopened".to_string()),
                 PendingOp::Approve => client.review(&id, ReviewEvent::Approve, "").await.map(|_| "Approved".to_string()),
+                PendingOp::UpdateBranch { oid } => {
+                    crate::github::rebase_or_merge(|m| {
+                        let (c, id, oid) = (client.clone(), id.clone(), oid.clone());
+                        async move { c.update_branch(&id, &oid, m).await }
+                    })
+                    .await
+                }
+                PendingOp::LinkStack { nwo, numbers } => client.create_stack(&nwo, &numbers).await.map(|n| format!("Linked into GitHub stack {n}")),
+                PendingOp::MergeStack { nwo, up_to, method, sha, label } => run_merge_async(&client, &nwo, up_to, &sha, method, &label).await,
             };
             let _ = tx.send(Msg::Done { id, res });
         });
@@ -3278,7 +3606,7 @@ impl App {
             Tab::Checks => v.checks.len(),
             Tab::Actions => v.runs.len(),
             Tab::Reviews => m.reviews.iter().filter(review).count() + m.threads.len(),
-            Tab::Changes => 0,
+            Tab::Changes | Tab::Stack => 0,
         }
     }
 
@@ -3392,10 +3720,308 @@ impl App {
             self.actions_sel = 0;
             self.actions_tree_scroll = 0;
             self.actions_tree_follow = true;
+            self.reset_stack_view();
             if self.screen == Screen::Detail {
                 self.ensure_detail();
             }
         }
+    }
+
+    // ---------- stacks (docs/stacks.md) ----------
+
+    /// Recompute stacks and membership from the loaded PRs and details (selection not kept).
+    fn rebuild_stacks(&mut self) {
+        let details: Vec<&PrDetail> = self.details.values().map(|(d, _)| d).filter(|d| d.stack.is_some()).collect();
+        let db = &self.default_branches;
+        // Unknown default branch: `main` / `master` count as trunks (so a `main → release` PR
+        // never becomes everyone's parent).
+        let is_trunk = |repo: &str, b: &str| match db.get(&repo.to_lowercase()) {
+            Some(d) => d == b,
+            None => b == "main" || b == "master",
+        };
+        self.stacks = stacks::build(&self.prs, &details, &is_trunk);
+        self.membership = stacks::membership(&self.stacks);
+    }
+
+    /// `rebuild_stacks`, keeping the selected PR selected (grouping can move rows).
+    fn rebuild_stacks_keep(&mut self) {
+        let id = self.selected_pr().map(|p| p.id.clone());
+        self.rebuild_stacks();
+        if let Some(id) = id
+            && let Some(pos) = self.visible().iter().position(|&i| self.prs[i].id == id)
+        {
+            self.sel = pos;
+        }
+    }
+
+    fn reset_stack_view(&mut self) {
+        self.stack_sel = None;
+        self.stack_open = false;
+        self.stack_file_sel = 0;
+        self.stack_list_scroll = 0;
+    }
+
+    /// The stack the selected PR belongs to.
+    pub fn selected_stack(&self) -> Option<&Stack> {
+        let p = self.selected_pr()?;
+        self.membership.get(&p.id).map(|&(s, _)| &self.stacks[s])
+    }
+
+    /// The Stack tab's left column: `None` for `Whole stack`, then members top-down.
+    pub fn stack_entries(&self) -> Vec<Option<usize>> {
+        let Some(s) = self.selected_stack() else { return Vec::new() };
+        std::iter::once(None).chain((0..s.members.len()).rev().map(Some)).collect()
+    }
+
+    /// The Stack tab cursor: as moved, else on the open PR.
+    pub fn stack_cursor(&self) -> usize {
+        let entries = self.stack_entries();
+        if let Some(i) = self.stack_sel.filter(|&i| i < entries.len()) {
+            return i;
+        }
+        let me = self.selected_stack().zip(self.selected_pr()).and_then(|(s, p)| s.index_of(&p.id));
+        entries.iter().position(|e| *e == me && me.is_some()).unwrap_or(0)
+    }
+
+    /// The member under the Stack tab cursor (`None` on `Whole stack`).
+    pub fn stack_cursor_member(&self) -> Option<&Member> {
+        let s = self.selected_stack()?;
+        self.stack_entries().get(self.stack_cursor()).copied().flatten().map(|i| &s.members[i])
+    }
+
+    /// What `b` / `M` act on: the Stack tab's member, else the selected PR.
+    fn stack_target(&self) -> Option<&Member> {
+        let s = self.selected_stack()?;
+        let tab = if self.screen == Screen::Detail && self.tab == Tab::Stack { self.stack_cursor_member() } else { None };
+        tab.or_else(|| s.member(&self.selected_pr()?.id))
+    }
+
+    /// `Whole stack`'s compare: (cache key, base, head). The base is the lowest open member's
+    /// base (merged ones are already in it), the head the top's commit.
+    pub fn whole_stack_key(s: &Stack) -> Option<(String, String, String)> {
+        let base = s.members.iter().find(|m| !m.merged()).map_or(s.trunk.clone(), |m| m.base.clone());
+        let top = s.members.last()?;
+        let head = if top.head_oid.is_empty() { top.head.clone() } else { top.head_oid.clone() };
+        Some((format!("{}:{base}...{head}", s.repo), base, head))
+    }
+
+    /// The files of the Stack tab's cursor entry, once loaded.
+    pub fn stack_entry_files(&self) -> Option<&Vec<FileDiff>> {
+        let s = self.selected_stack()?;
+        match self.stack_cursor_member() {
+            Some(m) => self.files.get(&m.id).filter(|(_, _, sha)| m.head_oid.is_empty() || *sha == m.head_oid).map(|(f, ..)| f),
+            None => self.stack_files.get(&Self::whole_stack_key(s)?.0).map(|(f, _)| f),
+        }
+    }
+
+    /// The open PR's stack: its needs-rebase links, and the Stack tab's files (lazily).
+    fn ensure_stack_data(&mut self) {
+        if self.screen != Screen::Detail {
+            return;
+        }
+        self.ensure_links(false);
+        if self.tab != Tab::Stack {
+            return;
+        }
+        let Some(s) = self.selected_stack().cloned() else { return };
+        match self.stack_cursor_member().cloned() {
+            Some(m) => {
+                let stale = self.files.get(&m.id).is_none_or(|(_, at, sha)| (!m.head_oid.is_empty() && *sha != m.head_oid) || at.elapsed() > Duration::from_secs(60));
+                if !stale || !self.files_loading.insert(m.id.clone()) {
+                    return;
+                }
+                let (client, tx, nwo) = (self.client.clone(), self.tx.clone(), s.repo.clone());
+                tokio::spawn(async move {
+                    let res = client.pr_files(&nwo, m.number).await;
+                    let _ = tx.send(Msg::Files { id: m.id, sha: m.head_oid, res });
+                });
+            }
+            None => {
+                let Some((key, base, head)) = Self::whole_stack_key(&s) else { return };
+                if self.stack_files.contains_key(&key) || self.stack_files_errors.contains_key(&key) || !self.stack_files_loading.insert(key.clone()) {
+                    return;
+                }
+                let (client, tx, nwo) = (self.client.clone(), self.tx.clone(), s.repo.clone());
+                tokio::spawn(async move {
+                    let res = client.compare_files(&nwo, &base, &head).await;
+                    let _ = tx.send(Msg::StackFiles { key, res });
+                });
+            }
+        }
+    }
+
+    /// One aliased compare query per stack (1 point): which open members lack commits of their
+    /// base. `fresh` asks again unless it ran in the last 10 s (a detail refresh).
+    fn ensure_links(&mut self, fresh: bool) {
+        let Some(s) = self.selected_stack() else { return };
+        let (key, pairs, nwo) = (s.key(), s.link_pairs(), s.repo.clone());
+        let max = if fresh { 10 } else { self.cfg.detail_refresh_secs.max(20) };
+        let stale = self.links.get(&key).is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(max));
+        if pairs.is_empty() || !stale || self.rate.as_ref().is_some_and(|r| r.remaining < 100) || !self.links_loading.insert(key.clone()) {
+            return;
+        }
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let res = client.compare_links(&nwo, &pairs).await;
+            let _ = tx.send(Msg::Links { key, res });
+        });
+    }
+
+    /// The (position, size, native) chip of PR `id`.
+    pub fn chip(&self, id: &str) -> Option<(usize, usize, bool)> {
+        let &(s, m) = self.membership.get(id)?;
+        let st = &self.stacks[s];
+        Some((st.members[m].position, st.size, st.native()))
+    }
+
+    /// Commits PR `id` lacks from its base, when the open stack's compare says it needs a rebase.
+    pub fn needs_rebase_of(&self, id: &str) -> Option<usize> {
+        let &(s, m) = self.membership.get(id)?;
+        let st = &self.stacks[s];
+        let mem = &st.members[m];
+        if !mem.open() {
+            return None;
+        }
+        stacks::needs_rebase(&self.links.get(&st.key())?.0, &mem.head)
+    }
+
+    /// `2/4 of stack 196`, `2/4 · not linked`.
+    pub fn stack_words(&self, id: &str) -> Option<String> {
+        let &(s, _) = self.membership.get(id)?;
+        let (pos, size, _) = self.chip(id)?;
+        Some(match self.stacks[s].number() {
+            Some(n) => format!("{pos}/{size} of stack {n}"),
+            None => format!("{pos}/{size} · not linked"),
+        })
+    }
+
+    /// Why a stack command can't run on the selected PR (or the Stack tab's member).
+    pub fn stack_block(&self, c: Command) -> Option<String> {
+        let Some(s) = self.selected_stack() else { return Some("not stacked".into()) };
+        let no_write = self.selected_detail().is_some_and(|d| !d.repository.can_write());
+        let id = self.selected_pr().map(|p| p.id.clone()).unwrap_or_default();
+        match c {
+            Command::StackPrev => stacks::neighbour(s, &id, false).is_none().then(|| "bottom of the stack".into()),
+            Command::StackNext => stacks::neighbour(s, &id, true).is_none().then(|| "top of the stack".into()),
+            Command::StackLink => stacks::link_plan(s).err().or_else(|| no_write.then(|| "no write access".into())),
+            Command::StackMerge => {
+                let m = self.stack_target()?;
+                stacks::merge_plan(s, &m.id).err().or_else(|| no_write.then(|| "no write access".into()))
+            }
+            Command::StackUpdate => {
+                let m = self.stack_target()?;
+                if !m.open() {
+                    Some(format!("#{} is {}", m.number, m.state.to_lowercase()))
+                } else if m.head_oid.is_empty() {
+                    Some("head commit not known yet".into())
+                } else {
+                    no_write.then(|| "no write access".into())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Select PR `id` (a stack member), fetching it into the list first when it isn't loaded.
+    fn open_member(&mut self, id: &str) {
+        if self.prs.iter().any(|p| p.id == id) {
+            return self.run(Action::JumpTo(id.to_string()));
+        }
+        let Some((nwo, n)) = self.stacks.iter().find_map(|s| s.member(id).map(|m| (s.repo.clone(), m.number))) else {
+            return self.toast("That PR isn't loaded", ToastKind::Info);
+        };
+        if !self.splicing.insert(id.to_string()) {
+            return;
+        }
+        self.toast(format!("Loading #{n}…"), ToastKind::Info);
+        let (client, tx, id) = (self.client.clone(), self.tx.clone(), id.to_string());
+        tokio::spawn(async move {
+            let res = client.prs_by_number(&[nwo], n).await;
+            let _ = tx.send(Msg::Splice { id, res });
+        });
+    }
+
+    /// `b`: confirm bringing the member's branch up to date with its parent.
+    fn stack_update_branch(&mut self) {
+        let Some(_) = self.need_detail() else { return };
+        if let Some(why) = self.stack_block(Command::StackUpdate) {
+            return self.toast(format!("Can't update the branch: {why}"), ToastKind::Error);
+        }
+        let (Some(s), Some(m)) = (self.selected_stack().cloned(), self.stack_target().cloned()) else { return };
+        let onto = match s.parent_of(&m.id).filter(|p| !p.merged()) {
+            Some(p) => format!("#{} ({})", p.number, m.base),
+            None => m.base.clone(),
+        };
+        let message = format!(
+            "Rebase #{} ({}) onto {onto}?\n“{}”\n\nIf GitHub refuses the rebase, the base is merged in instead.",
+            m.number,
+            m.head,
+            truncate_chars(&m.title, 56)
+        );
+        self.modal = Some(Modal::Confirm { pr_id: m.id.clone(), title: "Update branch".into(), message, op: PendingOp::UpdateBranch { oid: m.head_oid.clone() } });
+    }
+
+    /// `L`: confirm linking the implicit chain into a GitHub stack.
+    fn stack_link(&mut self) {
+        let Some(d) = self.need_detail() else { return };
+        if let Some(why) = self.stack_block(Command::StackLink) {
+            return self.toast(format!("Can't link: {why}"), ToastKind::Error);
+        }
+        let Some(s) = self.selected_stack().cloned() else { return };
+        let Ok(numbers) = stacks::link_plan(&s) else { return };
+        let chain = numbers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(" → ");
+        let message = format!(
+            "Link {chain} into a GitHub stack on {}?\n\nGitHub refuses (422) when stacked PRs aren't enabled\nfor the repository or a base doesn't match.",
+            s.repo
+        );
+        self.modal = Some(Modal::Confirm { pr_id: d.id.clone(), title: "Link stack".into(), message, op: PendingOp::LinkStack { nwo: s.repo.clone(), numbers } });
+    }
+
+    /// `M`: pick a merge method for "merge the stack up to here".
+    fn stack_merge_menu(&mut self) {
+        let Some(d) = self.need_detail() else { return };
+        if let Some(why) = self.stack_block(Command::StackMerge) {
+            return self.toast(format!("Can't merge the stack: {why}"), ToastKind::Error);
+        }
+        let Some(m) = self.stack_target().cloned() else { return };
+        let repo = &d.repository;
+        let entries: Vec<MenuEntry> = [
+            (repo.squash_merge_allowed, MergeMethod::Squash, 's', "Squash and merge"),
+            (repo.merge_commit_allowed, MergeMethod::Merge, 'm', "Create merge commits"),
+            (repo.rebase_merge_allowed, MergeMethod::Rebase, 'r', "Rebase and merge"),
+        ]
+        .into_iter()
+        .filter(|(ok, ..)| *ok)
+        .map(|(_, method, key, label)| MenuEntry { item: MenuItem::MergeStack(method), label: format!("{label} up to #{}", m.number), key, disabled: None })
+        .collect();
+        if entries.is_empty() {
+            return self.toast("This repository allows no merge methods", ToastKind::Error);
+        }
+        self.modal = Some(Modal::Menu { pr_id: m.id.clone(), entries, sel: 0 });
+    }
+
+    /// Confirm merge-async of member `id` and its open downstack.
+    fn confirm_merge_stack(&mut self, id: &str, method: MergeMethod) {
+        let Some(&(si, _)) = self.membership.get(id) else { return };
+        let s = self.stacks[si].clone();
+        let plan = match stacks::merge_plan(&s, id) {
+            Ok(p) => p,
+            Err(e) => return self.toast(format!("Can't merge the stack: {e}"), ToastKind::Error),
+        };
+        let Some(top) = plan.last().copied().cloned() else { return };
+        let label = plan.iter().map(|m| format!("#{}", m.number)).collect::<Vec<_>>().join(", ");
+        let how = match method {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge commit",
+            MergeMethod::Rebase => "rebase",
+        };
+        let title = if plan.len() == 1 { "Merge stacked PR" } else { "Merge stack" };
+        let message = format!(
+            "Merge {label} (up to #{}) into {}\n{how} · all or nothing\n\nGitHub merges the open PRs below it too (merge-async);\nit stops if #{}'s head moved.",
+            top.number, s.trunk, top.number
+        );
+        let op = PendingOp::MergeStack { nwo: s.repo.clone(), up_to: top.number, method, sha: top.head_oid.clone(), label };
+        self.modal = Some(Modal::Confirm { pr_id: top.id.clone(), title: title.into(), message, op });
     }
 
     // ---------- search palette ----------
@@ -3601,6 +4227,7 @@ impl App {
             self.actions_sel = 0;
             self.actions_tree_scroll = 0;
             self.actions_tree_follow = true;
+            self.reset_stack_view();
             if self.screen == Screen::Detail {
                 self.ensure_detail();
             }
@@ -4019,6 +4646,9 @@ impl App {
         if c == Command::NextNew && !(self.screen == Screen::Detail && self.tab.has_new()) {
             return Some("open a PR's Conversation, Commits or Reviews".into());
         }
+        if matches!(c, Command::StackPrev | Command::StackNext | Command::StackUpdate | Command::StackLink | Command::StackMerge | Command::StackBrowser) {
+            return self.stack_block(c);
+        }
         let d = self.selected_detail()?;
         let entries = self.menu_entries(d, false);
         let reason = |f: fn(&MenuItem) -> bool| entries.iter().find(|e| f(&e.item)).and_then(|e| e.disabled.clone());
@@ -4039,6 +4669,12 @@ impl App {
     }
 
     fn run_command(&mut self, c: Command) {
+        if c == Command::StackView {
+            if self.screen == Screen::List {
+                self.run(Action::OpenSelected);
+            }
+            return self.run(Action::SetTab(Tab::Stack));
+        }
         let action = match c {
             Command::Comment => Action::Comment,
             Command::Merge => Action::MergeMenu,
@@ -4060,11 +4696,42 @@ impl App {
             Command::MarkAllRead => Action::MarkAllRead,
             Command::UnreadFirst => Action::ToggleUnreadFirst,
             Command::NextNew => Action::NextNew,
+            Command::StackView => return,
+            Command::StackPrev => Action::StackPrev,
+            Command::StackNext => Action::StackNext,
+            Command::StackUpdate => Action::StackUpdateBranch,
+            Command::StackLink => Action::StackLink,
+            Command::StackMerge => Action::StackMergeUpTo,
+            Command::StackBrowser => Action::StackOnGitHub,
+            Command::GroupStacks => Action::ToggleGroupStacks,
             Command::Help => Action::Help,
             Command::Quit => Action::Quit,
         };
         self.run(action);
     }
+}
+
+/// merge-async PR `n`, following a pending request every `MERGE_POLL` for up to `MERGE_CAP`.
+async fn run_merge_async(client: &Client, nwo: &str, n: u64, sha: &str, method: MergeMethod, label: &str) -> Result<String> {
+    let start = Instant::now();
+    let mut job = client.merge_async(nwo, n, sha, method).await?;
+    loop {
+        match stacks::merge_step(&job, start.elapsed()) {
+            stacks::MergeStep::Merged => return Ok(format!("Merged {label}")),
+            stacks::MergeStep::Enqueued => return Ok(format!("{label}: added to the merge queue")),
+            stacks::MergeStep::Failed(m) => anyhow::bail!("Merge failed: {m}"),
+            stacks::MergeStep::TimedOut => anyhow::bail!("The merge is still pending after {} s; check the PR on GitHub", stacks::MERGE_CAP.as_secs()),
+            stacks::MergeStep::Poll(uuid) => {
+                tokio::time::sleep(stacks::MERGE_POLL).await;
+                job = client.merge_async_status(nwo, n, &uuid).await?;
+            }
+        }
+    }
+}
+
+/// `s` cut to `max` characters with `…`.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>()) }
 }
 
 fn delete_word(s: &str) -> String {
@@ -5372,3 +6039,277 @@ mod change_tests {
     }
 }
 
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use crate::github::{StackEntryRef, StackRef};
+    use crate::search::tests::pr;
+    use ratatui::crossterm::event::KeyEvent;
+    use serde_json::json;
+
+    fn test_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.search.bodies = false;
+        let detection = crate::images::Detection { picker: None, note: None, off_reason: String::new() };
+        let mut app = App::new(Client::new("test".into()).unwrap(), tx, cfg, detection);
+        app.state = State::default();
+        app.viewer = Some(Viewer { login: "wiiiimm".into(), orgs: Vec::new() });
+        app
+    }
+
+    fn load(app: &mut App, prs: Vec<PrSummary>) {
+        app.list_gen += 1;
+        app.loading_query = app.search_query();
+        let total = prs.len();
+        app.handle(Msg::Prs { generation: app.list_gen, first: true, res: Ok(SearchPage { prs, total, next: None, rate: None }) });
+    }
+
+    fn key(app: &mut App, c: KeyCode) {
+        app.handle(Msg::Input(Event::Key(KeyEvent::new(c, KeyModifiers::NONE))));
+    }
+
+    /// The implicit chain #1 → #2 → #3 → #4 (newest first) and an unrelated #9 in between.
+    fn chain() -> Vec<PrSummary> {
+        let mk = |n: u64, head: &str, base: &str| {
+            let mut p = pr(n, "acme/app", &format!("pr {n}"), "2026-10-19T00:00:00Z");
+            p.head_ref_name = head.into();
+            p.base_ref_name = base.into();
+            p.head_ref_oid = format!("oid{n}");
+            p
+        };
+        vec![mk(4, "d", "c"), mk(9, "solo", "main"), mk(3, "c", "b"), mk(2, "b", "a"), mk(1, "a", "main")]
+    }
+
+    fn detail(p: &PrSummary, stack: Option<serde_json::Value>) -> PrDetail {
+        serde_json::from_value(json!({
+            "id": p.id, "number": p.number, "title": p.title, "body": "", "bodyHTML": "", "state": p.state, "isDraft": p.is_draft,
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": null, "createdAt": "2026-10-18T00:00:00Z", "updatedAt": "2026-10-19T00:00:00Z",
+            "author": { "login": "alice" }, "headRefName": p.head_ref_name, "baseRefName": p.base_ref_name, "additions": 1, "deletions": 1, "changedFiles": 1,
+            "headRefOid": p.head_ref_oid, "canBeRebased": false, "viewerCanClose": true, "viewerCanReopen": false, "viewerCanMergeAsAdmin": false,
+            "labels": { "nodes": [] }, "assignees": { "nodes": [] }, "reviewRequests": { "nodes": [] }, "participants": { "nodes": [] },
+            "repository": { "nameWithOwner": "acme/app", "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": false,
+                "viewerPermission": "WRITE", "mentionableUsers": { "nodes": [] }, "defaultBranchRef": { "name": "main" } },
+            "commits": { "totalCount": 1, "nodes": [] }, "reviews": { "nodes": [] }, "comments": { "nodes": [] }, "reviewThreads": { "nodes": [] },
+            "stack": stack
+        }))
+        .unwrap()
+    }
+
+    fn numbers(app: &App) -> Vec<u64> {
+        app.visible().iter().map(|&i| app.prs[i].number).collect()
+    }
+
+    /// Open #n in the detail view with its detail loaded.
+    fn open(app: &mut App, n: u64) {
+        open_with(app, n, None);
+    }
+
+    fn open_with(app: &mut App, n: u64, stack: Option<serde_json::Value>) {
+        let pos = app.visible().iter().position(|&i| app.prs[i].number == n).unwrap();
+        app.select(pos);
+        key(app, KeyCode::Enter);
+        let p = app.selected_pr().unwrap().clone();
+        let d = detail(&p, stack);
+        app.handle(Msg::Detail { id: p.id.clone(), res: Ok((d, None)) });
+    }
+
+    #[test]
+    fn grouping_is_on_by_default_and_keeps_the_selection() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        assert_eq!(numbers(&app), vec![1, 2, 3, 4, 9]);
+        let glyphs: Vec<Option<&str>> = app.visible_rows().iter().map(|r| r.glyph).collect();
+        assert_eq!(glyphs, vec![None, Some("├"), Some("├"), Some("└"), None]);
+        assert_eq!(app.chip(&app.prs[0].id), Some((4, 4, false)));
+        app.select(4);
+        assert_eq!(app.selected_pr().unwrap().number, 9);
+        app.run(Action::ToggleGroupStacks);
+        assert_eq!(numbers(&app), vec![4, 9, 3, 2, 1]);
+        assert_eq!(app.selected_pr().unwrap().number, 9);
+        app.run(Action::ToggleGroupStacks);
+        assert_eq!(app.selected_pr().unwrap().number, 9);
+    }
+
+    #[tokio::test]
+    async fn tab_8_and_neighbour_keys() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        open(&mut app, 2);
+        key(&mut app, KeyCode::Char('8'));
+        assert_eq!(app.tab, Tab::Stack);
+        // Cursor on the open PR: entries are Whole stack, #4, #3, #2, #1.
+        assert_eq!(app.stack_cursor(), 3);
+        assert_eq!(app.stack_cursor_member().unwrap().number, 2);
+        key(&mut app, KeyCode::Char('>'));
+        assert_eq!(app.selected_pr().unwrap().number, 3);
+        assert_eq!(app.stack_cursor_member().unwrap().number, 3);
+        key(&mut app, KeyCode::Char('<'));
+        key(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        key(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("#1 is the bottom of the stack"));
+        // n / p move the cursor; to Whole stack at the top.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Char('p'));
+        }
+        assert_eq!(app.stack_cursor(), 0);
+        assert!(app.stack_cursor_member().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unloaded_member_is_spliced_in() {
+        let mut app = test_app();
+        let mut list = chain();
+        // #3 and #4 are a native stack whose bottom (#7) isn't loaded.
+        for (i, pos) in [(0usize, 3usize), (2, 2)] {
+            list[i].stack = Some(StackRef { id: "PRS_1".into(), number: 12, size: 3, base_ref_name: "main".into() });
+            list[i].stack_entry = Some(StackEntryRef { position: pos });
+        }
+        load(&mut app, list.clone());
+        open(&mut app, 3);
+        let entry = |n: u64, pos: usize| json!({ "position": pos, "pullRequest": { "id": format!("acme/app#{n}"), "number": n, "title": format!("pr {n}"),
+            "state": "OPEN", "headRefName": format!("h{n}"), "baseRefName": "main", "headRefOid": format!("oid{n}") } });
+        let stack = json!({ "id": "PRS_1", "number": 12, "size": 3, "baseRefName": "main", "entries": { "nodes": [entry(7, 1), entry(3, 2), entry(4, 3)] } });
+        let d = detail(&list[2], Some(stack));
+        app.handle(Msg::Detail { id: list[2].id.clone(), res: Ok((d, None)) });
+        let s = app.selected_stack().unwrap();
+        assert_eq!(s.members.iter().map(|m| (m.number, m.loaded)).collect::<Vec<_>>(), vec![(7, false), (3, true), (4, true)]);
+        key(&mut app, KeyCode::Char('<'));
+        assert!(app.splicing.contains("acme/app#7"));
+        app.handle(Msg::Splice { id: "acme/app#7".into(), res: Ok((vec![pr(7, "acme/app", "pr 7", "2026-10-01T00:00:00Z")], None)) });
+        assert_eq!(app.selected_pr().unwrap().number, 7);
+        assert!(app.search.spliced.contains("acme/app#7"));
+    }
+
+    #[tokio::test]
+    async fn actions_stop_at_their_confirm() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        open(&mut app, 3);
+        key(&mut app, KeyCode::Char('b'));
+        match &app.modal {
+            Some(Modal::Confirm { pr_id, message, op: PendingOp::UpdateBranch { oid }, .. }) => {
+                assert_eq!((pr_id.as_str(), oid.as_str()), ("acme/app#3", "oid3"));
+                assert!(message.starts_with("Rebase #3 (c) onto #2 (b)?"), "{message}");
+            }
+            _ => panic!("no update-branch confirm"),
+        }
+        key(&mut app, KeyCode::Char('n'));
+        assert!(app.modal.is_none() && app.busy.is_empty());
+        key(&mut app, KeyCode::Char('L'));
+        match &app.modal {
+            Some(Modal::Confirm { message, op: PendingOp::LinkStack { nwo, numbers }, .. }) => {
+                assert_eq!((nwo.as_str(), numbers.clone()), ("acme/app", vec![1, 2, 3, 4]));
+                assert!(message.starts_with("Link #1 → #2 → #3 → #4 into a GitHub stack on acme/app?"), "{message}");
+            }
+            _ => panic!("no link confirm"),
+        }
+        key(&mut app, KeyCode::Esc);
+        // An implicit chain never merges as a stack.
+        key(&mut app, KeyCode::Char('M'));
+        assert!(app.modal.is_none());
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("link it first")), "{:?}", app.toast);
+        // The plain merge menu warns that #4 won't be retargeted.
+        key(&mut app, KeyCode::Char('m'));
+        key(&mut app, KeyCode::Char('s'));
+        match &app.modal {
+            Some(Modal::Confirm { message, op: PendingOp::Merge(..), .. }) => assert!(message.contains("#4 targets this branch"), "{message}"),
+            _ => panic!("no merge confirm"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_members_merge_through_merge_async() {
+        let mut app = test_app();
+        let mut list = chain();
+        for (i, pos) in [(4usize, 1usize), (3, 2), (2, 3), (0, 4)] {
+            list[i].stack = Some(StackRef { id: "PRS_9".into(), number: 31, size: 4, base_ref_name: "main".into() });
+            list[i].stack_entry = Some(StackEntryRef { position: pos });
+        }
+        load(&mut app, list.clone());
+        let entry = |i: usize, pos: usize| json!({ "position": pos, "pullRequest": { "id": list[i].id, "number": list[i].number, "title": list[i].title,
+            "state": "OPEN", "headRefName": list[i].head_ref_name, "baseRefName": list[i].base_ref_name, "headRefOid": list[i].head_ref_oid } });
+        let stack = json!({ "id": "PRS_9", "number": 31, "size": 4, "baseRefName": "main", "entries": { "nodes": [entry(4, 1), entry(3, 2), entry(2, 3), entry(0, 4)] } });
+        open_with(&mut app, 3, Some(stack));
+        assert!(app.selected_stack().unwrap().native());
+        // `M` picks a method, then confirms the downstack.
+        key(&mut app, KeyCode::Char('M'));
+        assert!(matches!(&app.modal, Some(Modal::Menu { entries, .. }) if entries.len() == 2));
+        key(&mut app, KeyCode::Char('s'));
+        match &app.modal {
+            Some(Modal::Confirm { pr_id, message, op: PendingOp::MergeStack { up_to, method, sha, .. }, .. }) => {
+                assert_eq!((pr_id.as_str(), *up_to, *method, sha.as_str()), ("acme/app#3", 3, MergeMethod::Squash, "oid3"));
+                assert!(message.starts_with("Merge #1, #2, #3 (up to #3) into main\nsquash · all or nothing"), "{message}");
+            }
+            _ => panic!("no merge-stack confirm"),
+        }
+        key(&mut app, KeyCode::Esc);
+        // The Merge menu routes a native member to merge-async too.
+        key(&mut app, KeyCode::Char('m'));
+        key(&mut app, KeyCode::Char('m'));
+        assert!(matches!(&app.modal, Some(Modal::Confirm { op: PendingOp::MergeStack { method: MergeMethod::Merge, .. }, .. })));
+        key(&mut app, KeyCode::Esc);
+        // Linking an already-linked stack is refused.
+        key(&mut app, KeyCode::Char('L'));
+        assert!(app.modal.is_none());
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("already linked (stack 31)")));
+        // Done refetches like any mutation.
+        app.handle(Msg::Done { id: "acme/app#3".into(), res: Ok("Merged #1, #2, #3".into()) });
+        assert!(app.own_pending.contains_key("acme/app#3"));
+        assert!(app.detail_loading.contains("acme/app#3"));
+    }
+
+    #[tokio::test]
+    async fn chips_and_the_strip_render_in_every_density() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        for d in [crate::state::Density::Comfortable, crate::state::Density::Cozy, crate::state::Density::Compact] {
+            app.state.density = d;
+            app.screen = Screen::List;
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let text = |y: u16| (0..140).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>();
+            let (r, _) = app.hits.table.unwrap();
+            let per = d.table_row_h() as u16;
+            assert!(text(r.y).contains("#1 ⧉1/4"), "{d:?}: {}", text(r.y));
+            assert!(text(r.y + per).contains("├#2 ⧉2/4"), "{d:?}: {}", text(r.y + per));
+            assert!(text(r.y + 3 * per).contains("└#4 ⧉4/4"), "{d:?}: {}", text(r.y + 3 * per));
+            // Clicks still land on the right PR.
+            app.on_click(Position::new(r.x + 40, r.y + 2 * per));
+            assert_eq!(app.selected_pr().unwrap().number, 3);
+        }
+        app.state.density = crate::state::Density::Cozy;
+        open(&mut app, 2);
+        app.links.insert(app.selected_stack().unwrap().key(), (vec![Link { child: "b".into(), parent: "a".into(), ahead: 2, behind: 0, status: "DIVERGED".into() }], Instant::now()));
+        key(&mut app, KeyCode::Char('8'));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let screen: String = (0..30).map(|y| (0..160).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
+        assert!(screen.contains("main ← #1 ← [#2]! ← #3 ← #4   2/4 · not linked"), "{screen}");
+        assert!(screen.contains(" 8 Stack 2/4 "), "{screen}");
+        assert!(screen.contains("Whole stack"), "{screen}");
+        assert!(screen.contains("needs rebase: 2 commits behind"), "{screen}");
+        // A long base ← head line wraps; the strip still follows it, collapsed or not.
+        let long = "feature/a-very-long-branch-name-that-needs-the-whole-width-of-the-pane";
+        let id = app.selected_pr().unwrap().id.clone();
+        if let Some((d, _)) = app.details.get_mut(&id) {
+            d.base_ref_name = long.into();
+            d.head_ref_name = format!("{long}-2");
+        }
+        app.detail_cache = None;
+        for collapsed in [true, false] {
+            app.changes_info_expanded = !collapsed;
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen: String = (0..30).map(|y| (0..120).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect();
+            assert!(screen.contains("Stack      main ← #1 ← [#2]!"), "{screen}");
+        }
+        // Clicking #3 in the strip opens it.
+        let (row, link) = app.hits.info_links.iter().enumerate().find_map(|(i, l)| l.iter().find(|(_, _, u)| u == "#pr:acme/app#3").map(|l| (i, l.clone()))).unwrap();
+        let info = app.hits.info.unwrap();
+        app.on_click(Position::new(app.hits.detail_text_x + link.0, info.y + row as u16));
+        assert_eq!(app.selected_pr().unwrap().number, 3);
+    }
+}

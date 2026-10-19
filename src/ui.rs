@@ -22,6 +22,7 @@ use crate::changes::{Change, NewMarks, Snapshot, clean_body};
 use crate::search::Command;
 use crate::state::Density;
 use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, TimelineEvent, WorkflowRunInfo, login_of};
+use crate::stacks::{Member, Stack};
 use crate::images::{self, ImagePlacement, ImageStore, Look};
 
 const ACCENT: Color = Color::Cyan;
@@ -30,6 +31,8 @@ const DIM: Color = Color::DarkGray;
 const NEW: Color = Color::Yellow;
 /// The zero-width link on a `NEW` entry's header row (found by `n`/`p`, never clicked).
 const NEW_LINK: &str = "#new";
+/// The zero-width tag on the info header's `base ← head` row(s).
+const ARROW_LINK: &str = "#arrow";
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 thread_local! {
@@ -326,6 +329,17 @@ fn unread_dot(unread: bool) -> Span<'static> {
     if unread { Span::styled("•", Style::new().fg(ACCENT).bold()) } else { Span::raw(" ") }
 }
 
+/// `⧉2/4`: position / size in a stack; GitHub stacks in the accent, implicit chains gray.
+fn chip_span(chip: Option<(usize, usize, bool)>) -> Option<Span<'static>> {
+    let (pos, size, native) = chip?;
+    Some(Span::styled(format!("⧉{pos}/{size}"), Style::new().fg(if native { ACCENT } else { Color::Gray })))
+}
+
+/// A native chip from a row's own fields (a GitHub result that isn't loaded).
+fn summary_chip(p: &PrSummary) -> Option<(usize, usize, bool)> {
+    Some((p.stack_entry.as_ref()?.position, p.stack.as_ref()?.size, true))
+}
+
 /// New comments since you last looked (list counts can't tell bots or yourself apart).
 fn new_comments(changes: Option<&Vec<Change>>) -> usize {
     changes.and_then(|c| c.iter().find_map(|c| if let Change::Comments(n) = c { Some(*n) } else { None })).unwrap_or(0)
@@ -564,6 +578,20 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("?", "Help", Action::Help),
             ("q", "Quit", Action::Quit),
         ],
+        (None, Screen::Detail) if app.tab == Tab::Stack => vec![
+            ("Esc", "Back", Action::StackBack),
+            ("Tab", "Switch pane", Action::ToggleFocus),
+            ("[ ]", "Tabs", Action::NextTab),
+            ("↵", "Show files", Action::StackOpen),
+            ("n p", "Move", Action::StackMove(1)),
+            ("< >", "Prev / next PR", Action::StackNext),
+            ("b", "Update branch", Action::StackUpdateBranch),
+            ("L", "Link", Action::StackLink),
+            ("M", "Merge up to here", Action::StackMergeUpTo),
+            ("O", "Browser", Action::StackOpenBrowser),
+            ("r", "Refresh", Action::Refresh),
+            ("?", "Help", Action::Help),
+        ],
         (None, Screen::Detail) if app.tab == Tab::Actions => vec![
             ("Esc", "Back", Action::ActionsBack),
             ("Tab", "Switch pane", Action::ToggleFocus),
@@ -617,7 +645,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let vis = app.visible();
+    let vis = app.visible_rows();
     if vis.is_empty() {
         let msg = if let Some(e) = &app.list_error {
             vec![Line::styled(format!("Failed to load PRs: {e}"), Style::new().fg(Color::Red)), Line::raw(""), Line::raw("Press r to retry")]
@@ -649,10 +677,21 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let pinned = app.search.pinned_query();
     let page = inner.height as usize;
     let near = app.table_state.offset().min(app.sel).saturating_sub(page)..app.table_state.offset().max(app.sel) + 2 * page;
+    // The `#` column grows to hold a stack's tree glyph and `⧉ 2/4` chip.
+    let num_w = vis
+        .iter()
+        .map(|r| {
+            let p = &app.prs[r.idx];
+            r.glyph.map_or(0, |g| g.width()) + format!("#{}", p.number).width() + chip_span(app.chip(&p.id)).map_or(0, |c| c.width() + 1)
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(6, 18) as u16;
     let rows: Vec<Row> = vis
         .iter()
         .enumerate()
-        .map(|(row, &i)| {
+        .map(|(row, rv)| {
+            let i = rv.idx;
             let p = &app.prs[i];
             let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, Some(60))).unwrap_or_default();
             let changes = app.unread.get(&p.id);
@@ -667,22 +706,34 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 title.push(Span::styled(" · ", Style::new().fg(DIM)));
                 title.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), usize::MAX));
             }
-            // Comfortable spends its second row on what changed, in words.
+            // Comfortable spends its second row on what changed, in words, then the stack's.
             let mut title_cell = vec![Line::from(title)];
-            if density == Density::Comfortable
-                && let Some(c) = changes
-            {
-                let words = if c.is_empty() {
-                    if p.is_read_by_viewer == Some(false) { "unread on GitHub".to_string() } else { "unread".to_string() }
-                } else {
-                    c.iter().map(Change::words).collect::<Vec<_>>().join(" · ")
+            if density == Density::Comfortable {
+                let mut words: Vec<String> = match changes {
+                    Some(c) if c.is_empty() => vec![if p.is_read_by_viewer == Some(false) { "unread on GitHub".to_string() } else { "unread".to_string() }],
+                    Some(c) => c.iter().map(Change::words).collect(),
+                    None => Vec::new(),
                 };
-                title_cell.push(Line::styled(words, Style::new().fg(ACCENT)));
+                if let Some(n) = app.needs_rebase_of(&p.id) {
+                    words.push(format!("needs rebase ({n} behind)"));
+                }
+                if !words.is_empty() {
+                    title_cell.push(Line::styled(words.join(" · "), Style::new().fg(ACCENT)));
+                }
+            }
+            let mut num = Vec::new();
+            if let Some(g) = rv.glyph {
+                num.push(Span::styled(g, Style::new().fg(DIM)));
+            }
+            num.extend(number_spans(p.number, &mk.number));
+            if let Some(c) = chip_span(app.chip(&p.id)) {
+                num.push(Span::raw(" "));
+                num.push(c);
             }
             Row::new(vec![
                 Cell::from(Line::from(vec![unread_dot(changes.is_some()), state_icon(&p.state, p.is_draft)])),
                 Cell::from(Line::from(hl_spans(&p.repository.name_with_owner, &mk.repo, |_| Style::new().fg(Color::Blue), usize::MAX))),
-                Cell::from(Line::from(number_spans(p.number, &mk.number))),
+                Cell::from(Line::from(num)),
                 Cell::from(ratatui::text::Text::from(title_cell)),
                 Cell::from(Line::from(hl_spans(login_of(&p.author), &mk.author, |_| Style::new(), usize::MAX))),
                 Cell::from(bold_if(ci_icon(p.ci_state()), changed(|c| matches!(c, Change::Ci { .. })))),
@@ -698,7 +749,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(2),
         Constraint::Percentage(20),
-        Constraint::Length(6),
+        Constraint::Length(num_w),
         Constraint::Fill(1),
         Constraint::Length(14),
         Constraint::Length(2),
@@ -750,14 +801,16 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let page = inner.height as usize / app.state.density.sidebar_item_h();
     let near = app.side_state.offset().min(app.sel).saturating_sub(page)..app.side_state.offset().max(app.sel) + 2 * page;
     let items: Vec<ListItem> = app
-        .visible()
+        .visible_rows()
         .iter()
         .enumerate()
-        .map(|(row, &i)| {
+        .map(|(row, rv)| {
+            let i = rv.idx;
             let p = &app.prs[i];
             let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, None)).unwrap_or_default();
             let changes = app.unread.get(&p.id);
-            let num = format!("#{} ", p.number);
+            let chip = chip_span(app.chip(&p.id));
+            let num = format!("{}#{} {}", rv.glyph.unwrap_or(""), p.number, chip.as_ref().map_or(String::new(), |c| format!("{} ", c.content)));
             // Compact has no second line, so the new-comment count follows the title.
             let extra = match (app.state.density, new_comments(changes)) {
                 (Density::Compact, n) if n > 0 => format!(" +{n}"),
@@ -765,8 +818,15 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let title_style = if changes.is_some() { Style::new().bold() } else { Style::new() };
             let mut l1 = vec![unread_dot(changes.is_some()), state_icon(&p.state, p.is_draft), Span::raw(" "), ci_icon(p.ci_state()), Span::raw(" ")];
+            if let Some(g) = rv.glyph {
+                l1.push(Span::styled(g, Style::new().fg(DIM)));
+            }
             l1.extend(number_spans(p.number, &mk.number));
             l1.push(Span::raw(" "));
+            if let Some(c) = chip {
+                l1.push(c);
+                l1.push(Span::raw(" "));
+            }
             l1.extend(hl_spans(&p.title, &mk.title, |_| title_style, w.saturating_sub(5 + num.width() + extra.width())));
             if !extra.is_empty() {
                 l1.push(Span::styled(extra, Style::new().fg(ACCENT).bold()));
@@ -774,14 +834,26 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             let l1 = Line::from(l1);
             // The dim second line ends with the top two changes.
             let mut meta = format!("     {} · {} · {}", p.repository.name_with_owner, login_of(&p.author), ago(&p.updated_at));
-            let what: Vec<String> = changes.map(|c| c.iter().take(2).map(Change::label).collect()).unwrap_or_default();
-            let l2 = if what.is_empty() {
+            let mut tail: Vec<(String, Color)> = changes.map(|c| c.iter().take(2).map(|c| (c.label(), ACCENT)).collect()).unwrap_or_default();
+            // Then the stack: `needs rebase` (accent) or `2/4 of stack 196`.
+            match app.needs_rebase_of(&p.id) {
+                Some(_) => tail.push(("needs rebase".into(), ACCENT)),
+                None => tail.extend(app.stack_words(&p.id).map(|w| (w, DIM))),
+            }
+            let l2 = if tail.is_empty() {
                 Line::styled(truncate(&meta, w), Style::new().fg(DIM))
             } else {
-                let what = format!(" · {}", what.join(" · "));
+                let tail_w: usize = tail.iter().map(|(t, _)| t.width() + 3).sum();
                 // Keep the changes in view: shorten the repo/author part first.
-                meta = truncate(&meta, w.saturating_sub(what.width()).max(w / 3));
-                Line::from(vec![Span::styled(meta, Style::new().fg(DIM)), Span::styled(truncate(&what, w), Style::new().fg(ACCENT))])
+                meta = truncate(&meta, w.saturating_sub(tail_w).max(w / 3));
+                let mut spans = vec![Span::styled(meta.clone(), Style::new().fg(DIM))];
+                let mut used = meta.width();
+                for (t, color) in tail {
+                    let piece = truncate(&format!(" · {t}"), w.saturating_sub(used));
+                    used += piece.width();
+                    spans.push(Span::styled(piece, Style::new().fg(color)));
+                }
+                Line::from(spans)
             };
             match app.state.density {
                 Density::Comfortable => ListItem::new(vec![l1, l2, Line::raw("")]),
@@ -861,16 +933,18 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(b) = app.details.get(&pr.id).and_then(|(d, _)| state_banner(d, app.visit.as_ref().filter(|v| v.id == pr.id)?.since.as_ref()?.snap.state.as_str(), text_w)) {
         info.insert(0, (b, Vec::new()));
     }
+    // The base ← head line (its last row when it wraps), found by its tag rather than the blank
+    // line after it (which Compact density leaves out); the stack strip goes right under it.
+    let arrow = info.iter().rposition(|(_, links)| links.iter().any(|(a, b, u)| a == b && u == ARROW_LINK));
+    let strip = stack_strip(app, &pr.id, text_w);
+    let strip_len = strip.len();
+    if let Some(i) = arrow {
+        info.splice(i + 1..i + 1, strip);
+    }
     let collapsed = app.info_collapsed();
     if collapsed {
-        // Keep just the title block: title, badges and the base ← head line. Found by its
-        // arrow rather than the blank line after it, which Compact density leaves out.
-        let end = info
-            .iter()
-            .position(|(l, _)| l.spans.iter().any(|s| s.content == " ← "))
-            .map(|i| i + 1)
-            .or_else(|| info.iter().position(|(l, _)| l.width() == 0))
-            .unwrap_or(info.len());
+        // Keep just the title block: title, badges, the base ← head line and the stack strip.
+        let end = arrow.map(|i| i + 1 + strip_len).or_else(|| info.iter().position(|(l, _)| l.width() == 0)).unwrap_or(info.len());
         info.truncate(end);
     }
     let cap = if collapsed { info.len() } else { (rest.height as usize * 45 / 100).max(5) };
@@ -901,6 +975,10 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if app.tab == Tab::Actions && app.details.contains_key(&pr.id) {
         return draw_actions(f, app, &pr.id, content);
     }
+    // Stack: members on the left, the selected one's files (or a file's patch) on the right.
+    if app.tab == Tab::Stack && app.details.contains_key(&pr.id) {
+        return draw_stack(f, app, &pr.id, content);
+    }
 
     // Active tab content. Inline images are capped at 2/5 of the screen's height, so the
     // cap is part of the cache key like the width.
@@ -926,7 +1004,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
                             Tab::Changes => {}
                             Tab::Commits => commits_lines(d, text_w, &mut rows, news),
                             Tab::Checks => checks_lines(d, text_w, &mut rows),
-                            Tab::Actions => {}
+                            Tab::Actions | Tab::Stack => {}
                             Tab::Reviews => reviews_lines(d, text_w, &mut rows, &mut img, news),
                         }
                         app.tab_cache.insert(key.clone(), (stamp, (rows, img.out)));
@@ -1061,6 +1139,419 @@ fn draw_changes(f: &mut Frame, app: &mut App, id: &str, area: Rect) {
     app.hits.detail_max_scroll = max;
     app.hits.detail_height = patch_area.height as usize;
     app.hits.detail_links = links;
+}
+
+// ---------- stacks ----------
+
+/// `○` open, `◌` draft, `◆` merged, `✕` closed.
+fn member_state(m: &Member) -> Span<'static> {
+    match (m.state.as_str(), m.is_draft) {
+        ("OPEN", true) => Span::styled("◌", Style::new().fg(DIM)),
+        ("OPEN", false) => Span::styled("○", Style::new().fg(Color::Green)),
+        ("MERGED", _) => Span::styled("◆", Style::new().fg(Color::Magenta)),
+        _ => Span::styled("✕", Style::new().fg(Color::Red)),
+    }
+}
+
+fn member_state_word(m: &Member) -> &'static str {
+    match (m.state.as_str(), m.is_draft) {
+        ("OPEN", true) => "draft",
+        ("OPEN", false) => "open",
+        ("MERGED", _) => "merged",
+        _ => "closed",
+    }
+}
+
+/// `✓A` approved, `✗C` changes requested, `—` otherwise (two columns).
+fn member_review(m: &Member) -> Span<'static> {
+    match m.review.as_deref() {
+        Some("APPROVED") => Span::styled("✓A", Style::new().fg(Color::Green)),
+        Some("CHANGES_REQUESTED") => Span::styled("✗C", Style::new().fg(Color::Red)),
+        _ => Span::styled("— ", Style::new().fg(DIM)),
+    }
+}
+
+/// The right-edge flags of a member: `!` needs rebase, `✗` conflicts, `⊘` blocked.
+fn member_flags(m: &Member, behind: Option<usize>) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if behind.is_some() {
+        out.push(Span::styled("!", Style::new().fg(Color::Yellow).bold()));
+    }
+    if m.open() && (m.mergeable.as_deref() == Some("CONFLICTING") || m.merge_state.as_deref() == Some("DIRTY")) {
+        out.push(Span::styled("✗", Style::new().fg(Color::Red).bold()));
+    } else if m.open() && m.merge_state.as_deref() == Some("BLOCKED") {
+        out.push(Span::styled("⊘", Style::new().fg(Color::Yellow)));
+    }
+    out
+}
+
+/// A member's merge readiness in words (glyph, text, colour), when GitHub says.
+fn member_merge_words(m: &Member) -> Option<(&'static str, &'static str, Color)> {
+    if !m.open() {
+        return None;
+    }
+    if m.mergeable.as_deref() == Some("CONFLICTING") || m.merge_state.as_deref() == Some("DIRTY") {
+        return Some(("✗", "conflicts", Color::Red));
+    }
+    match m.merge_state.as_deref() {
+        Some("CLEAN" | "HAS_HOOKS") => Some(("✓", "ready to merge", Color::Green)),
+        Some("UNSTABLE") => Some(("!", "checks failing", Color::Yellow)),
+        Some("BLOCKED") => Some(("⊘", "blocked", Color::Yellow)),
+        Some("BEHIND") => Some(("↓", "behind its base", Color::Yellow)),
+        Some("DRAFT") => Some(("◌", "draft", DIM)),
+        _ if m.mergeable.as_deref() == Some("MERGEABLE") => Some(("✓", "mergeable", Color::Green)),
+        _ => None,
+    }
+}
+
+fn ci_words(state: Option<&str>) -> &'static str {
+    match state {
+        Some("SUCCESS") => "CI passed",
+        Some("FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE") => "CI failed",
+        Some("PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING") => "CI running",
+        Some(_) => "CI neutral",
+        None => "no CI",
+    }
+}
+
+/// `Stack      main ← #1 ← #2 ← [#3] ← #4   3/4 · stack 196`, each `#n` opening that PR. Too
+/// wide: members far from the open one fold into `…`.
+fn stack_strip(app: &App, id: &str, w: usize) -> Vec<DetailRow> {
+    let Some(s) = app.selected_stack() else { return Vec::new() };
+    let Some(cur) = s.index_of(id) else { return Vec::new() };
+    let gray = Style::new().fg(Color::Gray);
+    let field = format!("{:<11}", "Stack");
+    let trunk = s.trunk.clone();
+    // Each member: its spans, width and link.
+    let tokens: Vec<(Vec<Span<'static>>, usize, Option<String>)> = s
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut spans = vec![Span::styled(" ← ", gray)];
+            let label = if i == cur { format!("[#{}]", m.number) } else { format!("#{}", m.number) };
+            let style = if i == cur {
+                Style::new().fg(ACCENT).bold()
+            } else if m.merged() || m.state == "CLOSED" {
+                Style::new().fg(DIM)
+            } else {
+                Style::new().underlined()
+            };
+            spans.push(Span::styled(label, style));
+            if m.merged() {
+                spans.push(Span::styled("✓", Style::new().fg(DIM)));
+            } else if m.state == "CLOSED" {
+                spans.push(Span::styled("✕", Style::new().fg(DIM)));
+            }
+            spans.extend(member_flags(m, app.needs_rebase_of(&m.id)).into_iter().filter(|f| f.content != "⊘"));
+            let width = spans.iter().map(|s| s.width()).sum();
+            (spans, width, (i != cur).then(|| format!("#pr:{}", m.id)))
+        })
+        .collect();
+    let (pos, size, _) = app.chip(id).unwrap_or((cur + 1, s.size, s.native()));
+    let right = match s.number() {
+        Some(n) => format!("   {pos}/{size} · stack {n}"),
+        None => format!("   {pos}/{size} · not linked"),
+    };
+    let fixed = field.width() + trunk.width() + right.width();
+    let ell = " ← …".width();
+    let fits = |lo: usize, hi: usize| {
+        let mid: usize = tokens[lo..=hi].iter().map(|t| t.1).sum();
+        fixed + mid + if lo > 0 { ell } else { 0 } + if hi + 1 < tokens.len() { ell } else { 0 } <= w
+    };
+    let (mut lo, mut hi) = (cur, cur);
+    loop {
+        let grew_hi = hi + 1 < tokens.len() && fits(lo, hi + 1);
+        if grew_hi {
+            hi += 1;
+        }
+        let grew_lo = lo > 0 && fits(lo - 1, hi);
+        if grew_lo {
+            lo -= 1;
+        }
+        if !grew_hi && !grew_lo {
+            break;
+        }
+    }
+    let mut spans = vec![Span::styled(field, Style::new().fg(DIM)), Span::styled(truncate(&trunk, 24), Style::new().fg(Color::Magenta))];
+    let mut x: usize = spans.iter().map(|s| s.width()).sum();
+    let mut links = Vec::new();
+    if lo > 0 {
+        spans.push(Span::styled(" ← …", gray));
+        x += ell;
+    }
+    for (t, width, link) in &tokens[lo..=hi] {
+        if let Some(l) = link {
+            // The link covers the number, not the arrow before it.
+            links.push(((x + 3) as u16, (x + width) as u16, l.clone()));
+        }
+        spans.extend(t.iter().cloned());
+        x += width;
+    }
+    if hi + 1 < tokens.len() {
+        spans.push(Span::styled(" ← …", gray));
+    }
+    spans.push(Span::styled(right, Style::new().fg(DIM)));
+    vec![(Line::from(spans), links)]
+}
+
+fn draw_stack(f: &mut Frame, app: &mut App, id: &str, area: Rect) {
+    let Some(s) = app.selected_stack().cloned() else {
+        let rows: Vec<DetailRow> = vec![
+            (Line::raw("Not in a stack."), Vec::new()),
+            (Line::styled("A stack is a GitHub stacked PR, or a chain of loaded PRs where each targets the one below's branch.", Style::new().fg(DIM)), Vec::new()),
+        ];
+        let (max, links) = render_rows(f, area, &rows, &mut app.detail_scroll);
+        app.hits.detail = Some(area);
+        app.hits.detail_max_scroll = max;
+        app.hits.detail_height = area.height as usize;
+        app.hits.detail_links = links;
+        return;
+    };
+    let list_w = (area.width * 32 / 100).clamp(24.min(area.width), 56);
+    let [list_area, rule, pane_area] = Layout::horizontal([Constraint::Length(list_w), Constraint::Length(1), Constraint::Min(10)]).areas(area);
+    f.render_widget(Paragraph::new(vec![Line::styled("│", Style::new().fg(DIM)); rule.height as usize]), rule);
+    draw_stack_list(f, app, &s, id, list_area);
+
+    let entry = app.stack_entries().get(app.stack_cursor()).copied().flatten();
+    let member = entry.map(|i| s.members[i].clone());
+    let text_w = pane_area.width.saturating_sub(text_pad() + 1) as usize;
+    let whole = App::whole_stack_key(&s);
+    // (files, when they were fetched, an error) of the entry under the cursor.
+    let (files, stamp, error): (Option<Vec<FileDiff>>, Option<std::time::Instant>, Option<String>) = match &member {
+        Some(m) => {
+            let got = app.files.get(&m.id).filter(|(_, _, sha)| m.head_oid.is_empty() || *sha == m.head_oid);
+            (got.map(|(f, ..)| f.clone()), got.map(|(_, at, _)| *at), app.files_errors.get(&m.id).cloned())
+        }
+        None => {
+            let key = whole.as_ref().map(|w| w.0.clone()).unwrap_or_default();
+            let got = app.stack_files.get(&key);
+            (got.map(|(f, _)| f.clone()), got.map(|(_, at)| *at), app.stack_files_errors.get(&key).cloned())
+        }
+    };
+
+    // A file's patch, with a one-line way back.
+    if app.stack_open
+        && let (Some(files), Some(stamp)) = (&files, stamp)
+        && !files.is_empty()
+    {
+        app.stack_file_sel = app.stack_file_sel.min(files.len() - 1);
+        let j = app.stack_file_sel;
+        let who = member.as_ref().map_or("Whole stack".to_string(), |m| format!("#{}", m.number));
+        let key = format!("stack:{}:{}:{j}:{text_w}:{:?}", s.key(), who, density());
+        if app.tab_cache.get(&key).is_none_or(|(st, _)| *st != stamp) {
+            let mut rows = Vec::new();
+            file_diff_lines(&files[j], text_w, &mut rows);
+            app.tab_cache.insert(key.clone(), (stamp, (rows, Vec::new())));
+        }
+        let rows = app.tab_cache[&key].1.0.clone();
+        let [head_area, bar_area, patch_area] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(pane_area);
+        let head = Line::from(vec![
+            Span::styled(" ‹ back ", Style::new().fg(Color::Black).bg(ACCENT)),
+            Span::styled(format!("  {who} · file {} of {} · n p files · Esc back", j + 1, files.len()), Style::new().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(head), Rect::new(head_area.x + 1, head_area.y, head_area.width.saturating_sub(2), 1));
+        app.hits.buttons.push((Rect::new(head_area.x + 1, head_area.y, 8, 1), Action::StackBack));
+        if let Some((bar, _)) = rows.first() {
+            f.render_widget(Paragraph::new(bar.clone()), Rect::new(bar_area.x + 1, bar_area.y, bar_area.width.saturating_sub(2), 1));
+        }
+        let (max, links) = render_rows(f, patch_area, rows.get(1..).unwrap_or_default(), &mut app.detail_scroll);
+        app.hits.detail = Some(patch_area);
+        app.hits.detail_max_scroll = max;
+        app.hits.detail_height = patch_area.height as usize;
+        app.hits.detail_links = links;
+        return;
+    }
+    app.stack_open = false;
+
+    let mut rows: Vec<DetailRow> = Vec::new();
+    let gray = Style::new().fg(Color::Gray);
+    let totals = files.as_ref().map(|f| (f.len(), f.iter().map(|x| x.additions).sum::<u64>(), f.iter().map(|x| x.deletions).sum::<u64>()));
+    match &member {
+        Some(m) => {
+            let title = vec![
+                Span::styled(format!("#{} ", m.number), Style::new().fg(ACCENT).bold()),
+                Span::styled(m.title.clone(), if m.id == id { Style::new().bold() } else { Style::new().bold().underlined() }),
+            ];
+            push_wrapped(&mut rows, Line::from(title), text_w, "  ", (m.id != id).then(|| format!("#pr:{}", m.id)));
+            let mut status = vec![member_state(m), Span::styled(format!(" {}", member_state_word(m)), gray), Span::styled(" · ", Style::new().fg(DIM))];
+            status.push(ci_icon(m.ci.as_deref()));
+            status.push(Span::styled(format!(" {}", ci_words(m.ci.as_deref())), gray));
+            status.push(Span::styled(" · ", Style::new().fg(DIM)));
+            status.push(review_span(m.review.as_deref()));
+            if let Some((g, words, color)) = member_merge_words(m) {
+                status.push(Span::styled(" · ", Style::new().fg(DIM)));
+                status.push(Span::styled(format!("{g} {words}"), Style::new().fg(color)));
+            }
+            push_wrapped(&mut rows, Line::from(status), text_w, "  ", None);
+            let mut rel = match s.parent_of(&m.id) {
+                Some(p) => vec![Span::styled("parent ", Style::new().fg(DIM)), Span::styled(format!("#{} ", p.number), Style::new().underlined()), Span::styled(m.base.clone(), Style::new().fg(Color::Magenta))],
+                None => vec![Span::styled("base ", Style::new().fg(DIM)), Span::styled(m.base.clone(), Style::new().fg(Color::Magenta))],
+            };
+            let links_known = app.links.contains_key(&s.key());
+            match app.needs_rebase_of(&m.id) {
+                Some(n) => rel.push(Span::styled(format!(" · ! needs rebase: {n} commit{} behind", if n == 1 { "" } else { "s" }), Style::new().fg(Color::Yellow).bold())),
+                None if links_known && m.open() => rel.push(Span::styled(" · up to date with its base", Style::new().fg(Color::Green))),
+                None => {}
+            }
+            if let Some((n, a, d)) = totals {
+                rel.push(Span::styled(format!(" · {n} files "), gray));
+                rel.push(Span::styled(format!("+{a}"), Style::new().fg(Color::Green)));
+                rel.push(Span::raw(" "));
+                rel.push(Span::styled(format!("−{d}"), Style::new().fg(Color::Red)));
+            }
+            let link = s.parent_of(&m.id).map(|p| format!("#pr:{}", p.id));
+            push_wrapped(&mut rows, Line::from(rel), text_w, "  ", link);
+            if !m.loaded {
+                rows.push((Line::styled("not in the loaded list — < > or a click loads it", Style::new().fg(DIM).italic()), Vec::new()));
+            }
+        }
+        None => {
+            let (base, top) = (whole.as_ref().map(|w| w.1.clone()).unwrap_or_default(), s.members.last().map(|m| m.number).unwrap_or_default());
+            rows.push((Line::from(vec![Span::styled("Whole stack", Style::new().bold()), Span::styled(format!("  {base}…#{top}"), gray)]), Vec::new()));
+            let mut l = vec![Span::styled("every open PR's changes together (compare, GitHub stops at 300 files)", Style::new().fg(DIM))];
+            if let Some((n, a, d)) = totals {
+                l = vec![
+                    Span::styled(format!("{n} files "), gray),
+                    Span::styled(format!("+{a}"), Style::new().fg(Color::Green)),
+                    Span::raw(" "),
+                    Span::styled(format!("−{d}"), Style::new().fg(Color::Red)),
+                    Span::styled(" · cumulative, GitHub stops at 300 files", Style::new().fg(DIM)),
+                ];
+            }
+            push_wrapped(&mut rows, Line::from(l), text_w, "  ", None);
+        }
+    }
+    section(&mut rows, "Files", text_w);
+    match (&files, &error) {
+        (Some(files), _) if files.is_empty() => rows.push((Line::styled("No file changes.", Style::new().fg(DIM).italic()), Vec::new())),
+        (Some(files), _) => {
+            for (i, file) in files.iter().enumerate() {
+                let (letter, color) = file_status(&file.status);
+                let counts = format!("+{} −{}", file.additions, file.deletions);
+                let name = truncate(&file.filename, text_w.saturating_sub(counts.width() + 4));
+                let pad = text_w.saturating_sub(name.width() + counts.width() + 3);
+                rows.push((
+                    Line::from(vec![
+                        Span::styled(format!("{letter} "), Style::new().fg(color).bold()),
+                        Span::raw(name),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(format!("+{}", file.additions), Style::new().fg(Color::Green)),
+                        Span::raw(" "),
+                        Span::styled(format!("−{}", file.deletions), Style::new().fg(Color::Red)),
+                    ]),
+                    full_row_link(&Some(format!("#stackfile:{i}"))),
+                ));
+            }
+        }
+        (None, Some(e)) => rows.push((Line::styled(format!("Couldn't load the files: {e} — press r to retry"), Style::new().fg(Color::Red)), Vec::new())),
+        (None, None) => rows.push((Line::styled(format!("{} Loading files…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new())),
+    }
+    gap(&mut rows);
+    push_wrapped(
+        &mut rows,
+        Line::styled("Enter or click a file shows its diff · n p move · O browser · b update branch · L link · M merge up to here", Style::new().fg(DIM)),
+        text_w,
+        "",
+        None,
+    );
+    let (max, links) = render_rows(f, pane_area, &rows, &mut app.detail_scroll);
+    app.hits.detail = Some(pane_area);
+    app.hits.detail_max_scroll = max;
+    app.hits.detail_height = pane_area.height as usize;
+    app.hits.detail_links = links;
+}
+
+/// The Stack tab's left column: a header, `Whole stack`, members top-down, the trunk.
+fn draw_stack_list(f: &mut Frame, app: &mut App, s: &Stack, open_id: &str, area: Rect) {
+    let header = match s.number() {
+        Some(n) => vec![Span::styled(format!(" Stack {n} "), Style::new().bold()), Span::styled(format!("· {} PRs · base {}", s.size, truncate(&s.trunk, 16)), Style::new().fg(Color::Gray))],
+        None => vec![
+            Span::styled(" Chain ", Style::new().bold()),
+            Span::styled(format!("· {} PRs · {} · ", s.members.len(), truncate(&s.trunk, 12)), Style::new().fg(Color::Gray)),
+            Span::styled("not linked", Style::new().fg(DIM)),
+        ],
+    };
+    f.render_widget(Paragraph::new(Line::from(header)), Rect::new(area.x, area.y, area.width, 1));
+    let rows_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+    let w = rows_area.width as usize;
+    let comfy = density() == Density::Comfortable;
+    let cursor = app.stack_cursor();
+    let entries = app.stack_entries();
+    let mut rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    for (k, entry) in entries.iter().enumerate() {
+        let selected = k == cursor;
+        let bar = Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT));
+        let line = match entry {
+            None => {
+                let base = App::whole_stack_key(s).map(|w| w.1).unwrap_or_default();
+                let top = s.members.last().map(|m| m.number).unwrap_or_default();
+                let label = "  Whole stack";
+                let range = format!("{}…#{top}", truncate(&base, 12));
+                let stats = App::whole_stack_key(s)
+                    .and_then(|w| app.stack_files.get(&w.0))
+                    .map(|(files, _)| format!("+{} −{}", files.iter().map(|f| f.additions).sum::<u64>(), files.iter().map(|f| f.deletions).sum::<u64>()));
+                // Whatever fits: range and stats, either one, or nothing.
+                let room = w.saturating_sub(1 + label.width() + 2);
+                let right = [stats.as_ref().map(|st| format!("{range} {st}")), stats.clone(), Some(range)]
+                    .into_iter()
+                    .flatten()
+                    .find(|r| r.width() <= room)
+                    .unwrap_or_default();
+                let pad = w.saturating_sub(1 + label.width() + right.width() + 1);
+                Line::from(vec![bar, Span::styled(label, if selected { Style::new().bold() } else { Style::new() }), Span::raw(" ".repeat(pad)), Span::styled(right, Style::new().fg(DIM))])
+            }
+            Some(i) => {
+                let m = &s.members[*i];
+                if comfy {
+                    rows.push((Line::raw(""), Some(k)));
+                }
+                let num_style = if m.id == open_id { Style::new().fg(ACCENT).bold() } else if m.merged() { Style::new().fg(DIM) } else { Style::new() };
+                let mut spans = vec![bar, Span::styled(format!("{:<5}", format!("#{}", m.number)), num_style), member_state(m), Span::raw(" "), ci_icon(m.ci.as_deref()), Span::raw(" "), member_review(m), Span::raw(" ")];
+                let flags = member_flags(m, app.needs_rebase_of(&m.id));
+                let flags_w: usize = flags.iter().map(|s| s.width()).sum();
+                let used: usize = spans.iter().map(|s| s.width()).sum();
+                let title_style = if m.merged() || m.state == "CLOSED" { Style::new().fg(DIM) } else if selected { Style::new().bold() } else { Style::new() };
+                let title = truncate(&m.title, w.saturating_sub(used + flags_w + 1));
+                let pad = w.saturating_sub(used + title.width() + flags_w);
+                spans.push(Span::styled(title, title_style));
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.extend(flags);
+                Line::from(spans)
+            }
+        };
+        let line = if selected { line.style(Style::new().bg(Color::Indexed(238))) } else { line };
+        rows.push((line, Some(k)));
+        // Comfortable spells the signals out under the row.
+        if comfy && let Some(i) = entry {
+            let m = &s.members[*i];
+            let words = match (app.needs_rebase_of(&m.id), member_merge_words(m)) {
+                (Some(n), _) => {
+                    let parent = s.parent_of(&m.id).map_or(s.trunk.clone(), |p| format!("#{}", p.number));
+                    format!("needs rebase: {n} commit{} behind {parent}", if n == 1 { "" } else { "s" })
+                }
+                (None, Some((_, words, _))) => words.to_string(),
+                (None, None) => member_state_word(m).to_string(),
+            };
+            rows.push((Line::styled(format!("        {}", truncate(&words, w.saturating_sub(8))), Style::new().fg(DIM)), Some(k)));
+        }
+    }
+    rows.push((Line::styled(format!("   {}", truncate(&s.trunk, w.saturating_sub(4))), Style::new().fg(Color::Magenta)), None));
+    let h = rows_area.height as usize;
+    // Keep the cursor in view.
+    if let Some(cur) = rows.iter().rposition(|(_, e)| *e == Some(cursor)) {
+        let first = rows.iter().position(|(_, e)| *e == Some(cursor)).unwrap_or(cur);
+        if first < app.stack_list_scroll {
+            app.stack_list_scroll = first;
+        } else if h > 0 && cur >= app.stack_list_scroll + h {
+            app.stack_list_scroll = cur + 1 - h;
+        }
+    }
+    app.stack_list_scroll = app.stack_list_scroll.min(rows.len().saturating_sub(h));
+    let lines: Vec<Line> = rows.iter().skip(app.stack_list_scroll).take(h).map(|(l, _)| l.clone()).collect();
+    f.render_widget(Paragraph::new(lines), rows_area);
+    app.hits.stack_list = Some((rows_area, app.stack_list_scroll));
+    app.hits.stack_list_rows = rows.into_iter().map(|(_, e)| e).collect();
 }
 
 // ---------- Actions tab ----------
@@ -1733,7 +2224,11 @@ fn image_box(buf: &mut Buffer, area: Rect, r: Rect, y: isize, alt: &str) {
 fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
     let d = app.selected_detail();
+    let chip = app.selected_pr().and_then(|p| app.chip(&p.id));
     let count = |t: Tab| -> String {
+        if t == Tab::Stack {
+            return chip.map_or(" –".into(), |(pos, size, _)| format!(" {pos}/{size}"));
+        }
         let Some(d) = d else { return String::new() };
         match t {
             Tab::Description => String::new(),
@@ -1743,6 +2238,7 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
             Tab::Checks => d.rollup().map(|r| format!(" {}", r.contexts.iter().count())).unwrap_or_default(),
             Tab::Actions => app.current_runs().map(|e| format!(" {}", e.runs.iter().filter(|r| r.head_sha == e.sha).count())).unwrap_or_default(),
             Tab::Reviews => format!(" {}", d.reviews.iter().filter(|r| r.state != "COMMENTED" || !clean_body(&r.body).trim().is_empty()).count() + d.review_threads.iter().count()),
+            Tab::Stack => String::new(),
         }
     };
     let ci = d.and_then(|d| d.rollup()).map(|r| r.state.clone());
@@ -1753,11 +2249,34 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     });
     let counts: Vec<String> = Tab::ALL.into_iter().map(count).collect();
     let badges: Vec<Option<String>> = Tab::ALL.into_iter().map(|t| app.tab_badge(t)).collect();
+    // Eight tabs don't fit a narrow pane: shorten the inactive ones' names, then drop them.
+    let label_of = |i: usize, t: Tab, level: u8| -> String {
+        let name = match level {
+            _ if t == app.tab => t.label(),
+            0 => t.label(),
+            1 => t.short_label(),
+            _ => "",
+        };
+        let mut l = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
+        if (t == Tab::Checks && ci.is_some()) || (t == Tab::Actions && worst.is_some()) {
+            l.push_str("✓ ");
+        }
+        l
+    };
+    let room = area.width.saturating_sub(9) as usize;
+    let fits = |level: u8| Tab::ALL.into_iter().enumerate().map(|(i, t)| label_of(i, t, level).width() + badges[i].as_ref().map_or(0, |b| b.width() + 1)).sum::<usize>() <= room;
+    let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
     let mut x = area.x;
     let mut spans = Vec::new();
     for (i, t) in Tab::ALL.into_iter().enumerate() {
         let active = t == app.tab;
-        let mut label = format!(" {} {}{} ", i + 1, t.label(), counts[i]);
+        let name = match level {
+            _ if active => t.label(),
+            0 => t.label(),
+            1 => t.short_label(),
+            _ => "",
+        };
+        let mut label = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
         if t == Tab::Checks && ci.is_some() {
             label.push_str(&ci_icon(ci.as_deref()).content);
             label.push(' ');
@@ -1826,22 +2345,21 @@ fn info_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
     l.push(Span::styled(login_of(&d.author).to_string(), Style::new().fg(Color::Blue).bold()));
     l.push(Span::styled(format!(" opened {} ago · updated {} ago", ago(&d.created_at), ago(&d.updated_at)), gray));
     push_wrapped(rows, Line::from(l), w, "", None);
-    push_wrapped(
-        rows,
-        Line::from(vec![
-            Span::styled(d.base_ref_name.clone(), Style::new().fg(Color::Magenta)),
-            Span::styled(" ← ", gray),
-            Span::styled(d.head_ref_name.clone(), Style::new().fg(Color::Magenta)),
-            Span::raw("   "),
-            Span::styled(format!("+{}", d.additions), Style::new().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled(format!("−{}", d.deletions), Style::new().fg(Color::Red)),
-            Span::styled(format!(" · {} files", d.changed_files), gray),
-        ]),
-        w,
-        "",
-        None,
-    );
+    // Tagged (a zero-width link no click can hit) so the collapsed header and the stack strip
+    // find it even when it wraps.
+    let arrow = Line::from(vec![
+        Span::styled(d.base_ref_name.clone(), Style::new().fg(Color::Magenta)),
+        Span::styled(" ← ", gray),
+        Span::styled(d.head_ref_name.clone(), Style::new().fg(Color::Magenta)),
+        Span::raw("   "),
+        Span::styled(format!("+{}", d.additions), Style::new().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("−{}", d.deletions), Style::new().fg(Color::Red)),
+        Span::styled(format!(" · {} files", d.changed_files), gray),
+    ]);
+    for l in wrap(arrow, w, "") {
+        rows.push((l, vec![(0, 0, ARROW_LINK.into())]));
+    }
     gap(rows);
 
     let field = |name: &str| Span::styled(format!("{name:<11}"), Style::new().fg(DIM));
@@ -2919,7 +3437,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("Tab  h l  ← →  click", "Switch focus between list and details"),
         ("j k / wheel", "Scroll details (or move in the list when it has focus)"),
         ("J K", "Next / previous PR while reading details"),
-        ("1-7  [ ]  click tab", "Description · Conversation · Changes · Commits · Checks · Actions · Reviews"),
+        ("1-8  [ ]  click tab", "Description · Conversation · Changes · Commits · Checks · Actions · Reviews · Stack"),
         ("n p  ↑ ↓  click", "Pick a file in Changes (j k scroll its diff)"),
         ("n p  click +n / ── new", "Next / previous NEW entry (Conversation, Commits, Reviews)"),
         ("i", "Collapse / expand the PR info header"),
@@ -2940,6 +3458,13 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("t", "Show / hide log timestamps"),
         ("Ctrl+F  n N", "Search the log · next / previous match"),
         ("Esc", "Clear search, then back from a job to its run"),
+        ("", "Stacks (⧉ 2/4 = position / size; accent = GitHub stack, gray = branch chain)"),
+        ("< >  click #n in the strip", "Previous (toward the base) / next PR in the stack"),
+        ("8 · n p ↑ ↓ · Enter · Esc", "Stack tab: pick a member or Whole stack · its files, a file's diff · back"),
+        ("b", "Update the PR's branch onto its parent (rebase, else merge; asks first)"),
+        ("L", "Link a branch chain into a GitHub stack (asks first)"),
+        ("M", "Merge a GitHub stack up to here: the PRs below it merge too (asks first)"),
+        ("/ Group by stack", "Keep a stack's PRs together in the list, ├ └ (palette, on by default)"),
         ("", "Mouse"),
         ("click", "Select rows, buttons, menu items, check links"),
         ("click ↻ digest", "Jump to a PR the last refresh changed (status line)"),
@@ -3043,7 +3568,8 @@ fn search_input_spans(app: &App) -> Vec<Span<'static>> {
 }
 
 /// One PR row: marker, state (or `↗`), repo, #number, title, author · age on the right.
-fn search_pr_line(p: &PrSummary, mk: &Marks, lead: Span<'static>, repo_w: usize, w: usize, selected: bool, remote: bool) -> Line<'static> {
+#[allow(clippy::too_many_arguments)]
+fn search_pr_line(p: &PrSummary, mk: &Marks, lead: Span<'static>, chip: Option<Span<'static>>, repo_w: usize, w: usize, selected: bool, remote: bool) -> Line<'static> {
     let mut spans = vec![Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT)), lead, Span::raw(" ")];
     let nwo = &p.repository.name_with_owner;
     let owner_len = nwo.find('/').map_or(0, |i| nwo[..i].chars().count() + 1);
@@ -3055,6 +3581,10 @@ fn search_pr_line(p: &PrSummary, mk: &Marks, lead: Span<'static>, repo_w: usize,
     let num_used: usize = num.iter().map(|s| s.width()).sum();
     spans.extend(num);
     spans.push(Span::raw(" ".repeat(7usize.saturating_sub(num_used))));
+    if let Some(c) = chip {
+        spans.push(c);
+        spans.push(Span::raw(" "));
+    }
     let mut right = format!("{} · {}", login_of(&p.author), ago(&p.updated_at));
     let used: usize = spans.iter().map(|s| s.width()).sum();
     let mut title_w = w.saturating_sub(used + right.width() + 2);
@@ -3154,7 +3684,8 @@ fn draw_search(f: &mut Frame, app: &mut App) {
             Item::Pr { idx: i, m } => {
                 let p = &app.prs[*i];
                 let mk = app.marks(&q, *i, (snippets && m.body_hit.is_some()).then_some(lw.saturating_sub(8)));
-                rows.push((search_pr_line(p, &mk, state_icon(&p.state, p.is_draft), repo_w, lw, selected, false), idx, None));
+                let chip = chip_span(app.chip(&p.id).or_else(|| summary_chip(p)));
+                rows.push((search_pr_line(p, &mk, state_icon(&p.state, p.is_draft), chip, repo_w, lw, selected, false), idx, None));
                 if let Some((text, ranges)) = &mk.snippet {
                     let mut spans = vec![Span::raw("     ")];
                     spans.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), lw.saturating_sub(6)));
@@ -3164,7 +3695,7 @@ fn draw_search(f: &mut Frame, app: &mut App) {
             Item::Remote { i, m } => {
                 let Some(p) = remote.and_then(|r| r.hits.get(*i)) else { continue };
                 let mk = app.remote_marks(&q, *i, (snippets && m.body_hit.is_some()).then_some(lw.saturating_sub(8)));
-                rows.push((search_pr_line(p, &mk, Span::styled("↗", Style::new().fg(DIM)), repo_w, lw, selected, true), idx, None));
+                rows.push((search_pr_line(p, &mk, Span::styled("↗", Style::new().fg(DIM)), chip_span(summary_chip(p)), repo_w, lw, selected, true), idx, None));
                 if let Some((text, ranges)) = &mk.snippet {
                     let mut spans = vec![Span::raw("     ")];
                     spans.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), lw.saturating_sub(6)));
