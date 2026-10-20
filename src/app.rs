@@ -3764,11 +3764,13 @@ impl App {
         self.stack_entries().get(self.stack_cursor()).copied().flatten().map(|i| &s.members[i])
     }
 
-    /// What `b` / `M` act on: the Stack tab's member, else the selected PR.
+    /// What `b` / `M` act on: the Stack tab's member (none on `Whole stack`), else the selected PR.
     fn stack_target(&self) -> Option<&Member> {
         let s = self.selected_stack()?;
-        let tab = if self.screen == Screen::Detail && self.tab == Tab::Stack { self.stack_cursor_member() } else { None };
-        tab.or_else(|| s.member(&self.selected_pr()?.id))
+        if self.screen == Screen::Detail && self.tab == Tab::Stack {
+            return self.stack_cursor_member();
+        }
+        s.member(&self.selected_pr()?.id)
     }
 
     /// `Whole stack`'s compare: (cache key, base, head). The base is the lowest open member's
@@ -3882,11 +3884,11 @@ impl App {
             Command::StackNext => stacks::neighbour(s, &id, true).is_none().then(|| "top of the stack".into()),
             Command::StackLink => stacks::link_plan(s).err().or_else(|| no_write.then(|| "no write access".into())),
             Command::StackMerge => {
-                let m = self.stack_target()?;
+                let Some(m) = self.stack_target() else { return Some("pick a PR in the stack".into()) };
                 stacks::merge_plan(s, &m.id).err().or_else(|| no_write.then(|| "no write access".into()))
             }
             Command::StackUpdate => {
-                let m = self.stack_target()?;
+                let Some(m) = self.stack_target() else { return Some("pick a PR in the stack".into()) };
                 if !m.open() {
                     Some(format!("#{} is {}", m.number, m.state.to_lowercase()))
                 } else if m.head_oid.is_empty() {
@@ -5649,6 +5651,12 @@ mod stack_tests {
         }
         assert_eq!(app.stack_cursor(), 0);
         assert!(app.stack_cursor_member().is_none());
+        // Whole stack is no member: `b` doesn't fall back to the open PR.
+        let p = app.selected_pr().unwrap().clone();
+        app.handle(Msg::Detail { id: p.id.clone(), res: Ok((detail(&p, None), None)) });
+        key(&mut app, KeyCode::Char('b'));
+        assert!(app.modal.is_none());
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("Can't update the branch: pick a PR in the stack"));
     }
 
     #[test]

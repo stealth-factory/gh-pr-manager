@@ -395,6 +395,10 @@ pub fn merge_plan<'a>(s: &'a Stack, id: &str) -> Result<Vec<&'a Member>, String>
     if !s.native() {
         return Err("not a GitHub stack: link it first (L)".into());
     }
+    // GitHub merges the whole open downstack, so the plan must see every entry (a fresh detail).
+    if s.members.len() < s.size {
+        return Err("the stack's members are still loading".into());
+    }
     let i = s.index_of(id).ok_or("not in this stack")?;
     let plan: Vec<&Member> = s.members[..=i].iter().filter(|m| !m.merged()).collect();
     if let Some(m) = plan.iter().find(|m| m.state == "CLOSED") {
@@ -651,6 +655,9 @@ mod tests {
         assert_eq!(merge_plan(s, "o/x#1").map(|_| ()), Err("nothing left to merge".into()));
         let implicit = &build(&ours(), &[], &main_trunk)[0];
         assert!(merge_plan(implicit, &implicit.members[1].id).unwrap_err().contains("link it first"));
+        // Without a detail the list knows two of three members: no plan until all are in.
+        let partial = &build(&prs, &[], &main_trunk)[0];
+        assert_eq!(merge_plan(partial, "o/x#3").map(|_| ()), Err("the stack's members are still loading".into()));
     }
 
     #[test]

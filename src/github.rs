@@ -464,7 +464,8 @@ impl UpdateMethod {
 }
 
 /// Update a branch by rebase, falling back to a merge of the base when GitHub refuses the
-/// rebase (`canBeRebased` is false on many chained PRs). `update` runs one attempt.
+/// rebase (`canBeRebased` is false on many chained PRs). Any other failure (network, rate
+/// limit, a moved head) is reported as is, never retried as a merge. `update` runs one attempt.
 pub async fn rebase_or_merge<F, Fut>(update: F) -> Result<String>
 where
     F: Fn(UpdateMethod) -> Fut,
@@ -472,6 +473,7 @@ where
 {
     match update(UpdateMethod::Rebase).await {
         Ok(()) => Ok("Branch rebased onto its base".into()),
+        Err(rebase) if !format!("{rebase:#}").to_lowercase().contains("rebase") => Err(rebase.context("couldn't rebase the branch")),
         Err(rebase) => match update(UpdateMethod::Merge).await {
             Ok(()) => Ok(format!("Rebase refused ({}); merged the base in instead", first_line(&format!("{rebase:#}")))),
             Err(merge) => Err(anyhow!("couldn't update the branch: rebase: {}; merge: {}", first_line(&format!("{rebase:#}")), first_line(&format!("{merge:#}")))),
@@ -1551,7 +1553,17 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), vec![UpdateMethod::Rebase, UpdateMethod::Merge]);
         assert_eq!(msg, "Rebase refused (Rebase not possible: merge conflict); merged the base in instead");
         assert_eq!(rebase_or_merge(|_| async { Ok(()) }).await.unwrap(), "Branch rebased onto its base");
-        let e = rebase_or_merge(|_| async { Err(anyhow!("head moved")) }).await.unwrap_err().to_string();
-        assert_eq!(e, "couldn't update the branch: rebase: head moved; merge: head moved");
+        // Only a refused rebase falls back; anything else is reported without a merge attempt.
+        let calls = std::sync::Mutex::new(Vec::new());
+        let e = rebase_or_merge(|m| {
+            calls.lock().unwrap().push(m);
+            async { Err(anyhow!("head moved")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), "couldn't rebase the branch: head moved");
+        assert_eq!(*calls.lock().unwrap(), vec![UpdateMethod::Rebase]);
+        let e = rebase_or_merge(|m| async move { Err(anyhow!(if m == UpdateMethod::Rebase { "Rebase not possible" } else { "conflict" })) }).await.unwrap_err();
+        assert_eq!(e.to_string(), "couldn't update the branch: rebase: Rebase not possible; merge: conflict");
     }
 }
