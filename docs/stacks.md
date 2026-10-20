@@ -48,8 +48,8 @@ fetched since the list started loading override it, newest last, so a stack chan
 
 **Implicit** (`stacks::chains`): among loaded `PrSummary`s of one repo, `parent(p)` = the PR whose `headRefName == p.baseRefName`,
 preferring OPEN over MERGED over CLOSED, newest number on ties; a PR whose base is the repo's default branch (or whose parent is not
-loaded) is a root; a chain is a root plus its descendants in base order; roots with no children are not stacks. Fork heads never match
-(the base ref is always in the base repo). Merged lower PRs: a loaded MERGED parent stays in the chain as a dim `merged` entry until
+loaded) is a root; a chain is a root plus its descendants in base order; roots with no children are not stacks. Fork PRs never chain,
+as parent or child (the base ref is always in the base repo, and `POST /stacks` needs every head there too). Merged lower PRs: a loaded MERGED parent stays in the chain as a dim `merged` entry until
 GitHub retargets the child (then the child becomes a root). Cycles are cut at the first repeat. Members outside the loaded list: for
 the *open* PR only, `repository { parent: pullRequests(headRefName:$base, states:[OPEN], first:1) children: pullRequests(baseRefName:$head,
 states:[OPEN], first:5) }` (cost 1, 0.7 s), walked to depth 10 and cached per (repo, branch) for 60 s. Native wins when both apply; an

@@ -506,7 +506,8 @@ fn parse_merge_job(status: reqwest::StatusCode, body: &Value) -> Result<MergeJob
         (true, Some(st)) => {
             let details = body.get("details");
             let field = |k: &str| details.and_then(|d| d.get(k)).or_else(|| body.get(k)).and_then(Value::as_str).map(String::from);
-            Ok(MergeJob { status: st.to_string(), uuid: field("uuid"), message: field("message") })
+            // A failed job documents its reason under `error`; older replies used `message`.
+            Ok(MergeJob { status: st.to_string(), uuid: field("uuid"), message: field("error").or_else(|| field("message")) })
         }
         _ => bail!("{}", rest_error(status, body)),
     }
@@ -1518,6 +1519,9 @@ mod tests {
         let failed = json!({ "status": "failed", "details": { "message": "Required status check \"ci\" is failing" } });
         let job = parse_merge_job(S::OK, &failed).unwrap();
         assert_eq!(crate::stacks::merge_step(&job, std::time::Duration::ZERO), crate::stacks::MergeStep::Failed("Required status check \"ci\" is failing".into()));
+        // The documented shape: `details.error`.
+        let failed = json!({ "status": "failed", "details": { "uuid": "u-1", "error": "Merge conflict" } });
+        assert_eq!(parse_merge_job(S::OK, &failed).unwrap().message.as_deref(), Some("Merge conflict"));
         let draft = json!({ "message": "Pull request is in draft state", "documentation_url": "x" });
         assert_eq!(parse_merge_job(S::BAD_REQUEST, &draft).unwrap_err().to_string(), "HTTP 400: Pull request is in draft state");
     }
