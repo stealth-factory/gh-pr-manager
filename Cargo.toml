@@ -1,15 +1,46 @@
 [package]
 name = "gh-pr-manager"
+# The one version. release-pr.yml bumps this line (and only this line) in
+# the release PR; tag-release.yml tags the merge commit `v<this>`; npm,
+# Homebrew and the .deb all take their version from that tag. Never bump it
+# by hand - see docs/releasing.md.
 version = "0.1.0"
 edition = "2024"
+description = "A mouse-friendly terminal UI for browsing and managing GitHub pull requests"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/stealth-factory/gh-pr-manager"
+homepage = "https://github.com/stealth-factory/gh-pr-manager"
+readme = "README.md"
+keywords = ["github", "pull-requests", "tui", "terminal", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
 html2text = "0.17.3"
+# Decoders for inline images; only the formats PR bodies use. No SVG (bot
+# badges stay text labels) and no AVIF/EXR/TIFF, which `image`'s defaults pull.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ratatui = "0.30"
+# Inline images. Default features off: they include `chafa-dyn`, which links
+# libchafa.so dynamically and would break the static release binaries.
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
 toml = "1.1.8"
 unicode-width = "0.2.2"
+
+# Polls stdin for the terminal's graphics-capability replies with a timeout
+# (images::detect); the same rustix crossterm already links.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["event", "termios"] }
+
+# What ships. One binary, so speed rather than size (opscope picks
+# opt-level "z" because thirteen of its binaries run at once; that reason
+# does not apply here). LTO and one codegen unit for a smaller, faster
+# binary; symbols stripped because nobody debugs a release artefact.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

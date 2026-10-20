@@ -1,0 +1,242 @@
+# Keeps a standing pull request describing the next release.
+#
+# Every merge to main updates it: the version git-cliff computes from the
+# conventional commits since the last tag, the changelog entry for them,
+# and the manifest bump. Merging that PR is the release decision. Nothing
+# is tagged, built or published until you do.
+#
+# This is release-please's shape, built by hand, ported from opscope. git-cliff
+# reads the history directly; the workflow then bumps Cargo.toml and the lock.
+name: release-pr
+
+on:
+  push:
+    branches: [main]
+  # For when you want to see what the next release would be without
+  # waiting for a merge.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One at a time. Two pushes in quick succession would otherwise race to
+# force-push the same branch, and the loser would leave the PR describing
+# a version that skipped a commit.
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # The whole history and every tag: the version is computed from
+          # the commits since the last one.
+          fetch-depth: 0
+          # A user PAT (GH_TOKEN, or RELEASE_TOKEN) is what makes the
+          # release PR an ordinary pull request. Opened with GITHUB_TOKEN
+          # it is github-actions[bot], and GitHub holds ci for a maintainer
+          # click. Nothing downstream depends on the PAT: tag-release.yml
+          # starts the build with an explicit dispatch rather than relying
+          # on a tag push to trigger one.
+          token: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Install git-cliff
+        run: |
+          set -euo pipefail
+          # The published binary, fetched and checksummed here rather than
+          # through an installer action. install-action has no manifest for
+          # this version and falls back to whatever cargo-binstall it can
+          # find, which was old enough not to parse an `edition = "2024"`
+          # manifest - so the install failed on a detail of a tool that was
+          # only ever meant to deliver a tool. Four lines of curl cannot
+          # drift like that, and the checksum says exactly what ran.
+          ver=2.13.1
+          sha=9a1263f24e59a2f508c7b3d3283c9dea94a8bf697f96dbc18cc783cac6284546
+          url="https://github.com/orhun/git-cliff/releases/download/v${ver}"
+          url="${url}/git-cliff-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" -o /tmp/cliff.tar.gz
+          echo "${sha}  /tmp/cliff.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cliff.tar.gz -C /tmp
+          sudo install "/tmp/git-cliff-${ver}/git-cliff" /usr/local/bin/
+          git-cliff --version
+
+      - name: What the next version would be
+        id: next
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          # Is there anything since the last tag that changes what a user
+          # gets? git-cliff bumps the patch for any commit at all, which
+          # would offer a release for a README edit - a version whose
+          # binaries are byte-for-byte the last one's. That is noise in a
+          # project that ships binaries, and it is noise in the pooled
+          # model specifically: every doc tweak would raise a release PR
+          # somebody has to form an opinion about.
+          #
+          # So only feat, fix, perf and revert start a release, plus any
+          # `type!:` breaking marker. Everything else still reaches the
+          # changelog - it rides along with the next real change rather
+          # than being dropped.
+          last=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          range="${last:+${last}..}HEAD"
+          releasable=$(git log "$range" --format=%s \
+            | grep -cE '^(feat|fix|perf|revert)(\(.+\))?!?:|^[a-z]+(\(.+\))?!:' \
+            || true)
+
+          # --bumped-version gives the tag name; strip the v for the manifest.
+          next=$(git cliff --bumped-version 2>/dev/null | tr -d 'v' || true)
+          if [ -z "$next" ] || [ "$next" = "$current" ] || [ "$releasable" -eq 0 ]; then
+            # Nothing releasable since the last tag - only docs and chores,
+            # or nothing at all. No release PR, and any existing one is
+            # left alone rather than being rewritten to say the same thing.
+            echo "nothing to release: still $current"
+            echo "  ${releasable} releasable commits in ${range}"
+            echo "release=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "${releasable} releasable commits in ${range}"
+          echo "$current -> $next"
+          echo "release=yes" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Write the changelog and bump the manifest
+        if: steps.next.outputs.release == 'yes'
+        env:
+          NEXT: ${{ steps.next.outputs.next }}
+          CURRENT: ${{ steps.next.outputs.current }}
+        run: |
+          set -euo pipefail
+          # --unreleased --prepend, not a regenerate. CHANGELOG.md has a
+          # hand-written header and a hand-written 0.1.0 section covering
+          # the history from before any of this existed, and regenerating
+          # the whole file would replace both. Prepending is also idempotent: this
+          # workflow rebuilds its branch from main on every push, so it
+          # starts from the same file and produces the same result.
+          git cliff --unreleased --tag "v${NEXT}" --prepend CHANGELOG.md
+          # Prepending leaves the new heading flush against the paragraph
+          # above it and a doubled blank line below. Both render, and both
+          # look like a mistake in a file that is read as raw markdown at
+          # least as often as it is rendered. One blank line before every
+          # version heading, never more than one anywhere - in that order,
+          # because the insert is what can create a third newline.
+          perl -0pi -e 's/\n(## \[)/\n\n$1/g; s/\n{3,}/\n\n/g' CHANGELOG.md
+          # Only the first version key, which is the package's. A global
+          # replace could also rewrite a dependency pinned at the same
+          # number. npm/package.json is not bumped: the npm packages are
+          # generated at publish time and stamped with the tag.
+          sed -i "0,/^version = \"$CURRENT\"$/s//version = \"$NEXT\"/" Cargo.toml
+          grep -q "^version = \"$NEXT\"$" Cargo.toml || {
+            echo "the manifest did not take the bump" >&2; exit 1; }
+          # The lock carries the crate's own version, and a lock
+          # disagreeing with its manifest makes the next build rewrite it
+          # as a stray diff.
+          cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+          # And prove the bumped tree is coherent before anyone is asked to
+          # merge it. --locked fails if the lock and the manifests disagree,
+          # which is the one way this step can go wrong and the one thing
+          # nothing downstream would catch in time if the PAT is unset and
+          # the PR is opened by GITHUB_TOKEN (GitHub then holds ci for
+          # approval). Without this, a bad bump would surface after the
+          # merge had already been tagged, leaving a tag with no release
+          # attached to it.
+          cargo metadata --locked --format-version 1 > /dev/null
+          echo "manifests and lock agree at ${NEXT}"
+
+      - name: Open or update the release PR
+        if: steps.next.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN || github.token }}
+          NEXT: ${{ steps.next.outputs.next }}
+        run: |
+          set -euo pipefail
+          branch="release"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add CHANGELOG.md Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "nothing changed since the last run"
+            exit 0
+          fi
+          # printf rather than a heredoc: the indentation that keeps a
+          # heredoc inside this YAML block would land in the message, and an
+          # unindented body ends the block scalar.
+          printf '%s\n' \
+            "release: v${NEXT}" \
+            "" \
+            "The manifest moves ahead of the tag so the tag can point at a" \
+            "commit whose version already matches it. release.yml checks" \
+            "they agree and refuses to build otherwise, which is only a" \
+            "meaningful check when nothing in the pipeline edits the" \
+            "manifest on the way past." \
+            "" \
+            "Prepared by the release-pr workflow. Merging this is the" \
+            "release." \
+            | git commit -q -F -
+          # Force, because this branch is the bot's alone and is rewritten
+          # from main every time. Nobody should be committing to it.
+          git push -f origin "$branch"
+
+          body=$(printf '%s\n' \
+            "Merging this cuts **v${NEXT}**." \
+            "" \
+            "It tags the merge commit and starts \`release.yml\` there: five" \
+            "platforms built and tested, checked for anything dynamically" \
+            "linked beyond the system runtime, tarballed with checksums," \
+            "published to npm (which moves \`latest\`, so" \
+            "\`npx gh-pr-manager@latest\` becomes this version), then attached" \
+            "to a GitHub Release, the Homebrew tap and the APT repository." \
+            "Clean runners then install that exact version from npm." \
+            "" \
+            "This PR rewrites itself on every merge to main. Do not commit" \
+            "to it - the branch is force-pushed - and edit the changelog on" \
+            "main instead if something reads badly." \
+            "" \
+            "---")
+          notes=$(awk '/^## \[/{n++} n==1' CHANGELOG.md | head -60)
+          # $( ) strips every trailing newline, so no number of empty
+          # printf arguments can put a blank line between the two halves -
+          # the first attempt at this shipped `---## [0.1.1]`. The
+          # separator has to be joined back in explicitly.
+          full=$(printf '%s\n\n%s\n' "$body" "$notes")
+          # An explicit search for an OPEN pull request, by number. Asking
+          # `gh pr view "$branch"` instead would work exactly once: with no
+          # open PR on the branch it falls back to the most recently merged
+          # one, so the cycle after a release would find the merged PR, take
+          # the edit path, and rewrite that closed PR's title and body -
+          # leaving no new release PR and no error to say so. The next
+          # release would simply never be offered.
+          #
+          # `// empty` matters too: on no match `.[0].number` is jq's null,
+          # which prints the four characters `null` - a non-empty string
+          # that would send this straight down the edit path it is here to
+          # avoid.
+          open=$(gh pr list --head "$branch" --base main --state open \
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          # REST, not `gh pr edit` / `gh pr create`. Those two go through
+          # GraphQL that asks for the org's login, name and slug, which a
+          # classic PAT with `repo` does not have (`read:org`). The token
+          # that opens this PR as a user is that PAT; git push already
+          # succeeded with it, then `gh pr edit` died, leaving the branch
+          # moved and the PR title stale. /pulls does not ask for the org.
+          repo="${GITHUB_REPOSITORY}"
+          title="release: v${NEXT}"
+          if [ -n "$open" ]; then
+            echo "updating #${open}"
+            jq -n --arg title "$title" --arg body "$full" \
+              '{title:$title, body:$body}' \
+              | gh api -X PATCH "repos/${repo}/pulls/${open}" --input - \
+              --jq .html_url
+          else
+            echo "opening a new release PR"
+            jq -n --arg title "$title" --arg body "$full" --arg head "$branch" \
+              '{title:$title, body:$body, head:$head, base:"main"}' \
+              | gh api -X POST "repos/${repo}/pulls" --input - \
+              --jq .html_url
+          fi

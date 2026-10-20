@@ -10,10 +10,19 @@ pub struct Config {
     pub bots: Vec<String>,
     /// Extra scopes appended to the built-in ones.
     pub scopes: Vec<ScopeConfig>,
-    /// Auto-refresh interval in seconds; 0 disables.
+    /// PR list auto-refresh interval in seconds; 0 disables.
     pub refresh_secs: u64,
+    /// Background refresh interval for the open PR's details; 0 disables.
+    pub detail_refresh_secs: u64,
     /// Name of the scope to select on startup.
     pub default_scope: Option<String>,
+    /// `owner/name` repository filter to apply on startup.
+    pub default_repo: Option<String>,
+    /// Inline images: "auto", "kitty", "sixel", "iterm2", "halfblocks" or "off".
+    /// `GH_PR_MANAGER_IMAGES` overrides it.
+    pub images: String,
+    /// Most terminal rows one inline image may take.
+    pub image_max_rows: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,8 +39,12 @@ impl Default for Config {
                 .map(String::from)
                 .to_vec(),
             scopes: Vec::new(),
-            refresh_secs: 120,
+            refresh_secs: 60,
+            detail_refresh_secs: 20,
             default_scope: None,
+            default_repo: None,
+            images: "auto".into(),
+            image_max_rows: 20,
         }
     }
 }

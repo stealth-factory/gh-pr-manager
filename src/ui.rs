@@ -3,23 +3,59 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
 };
+use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{Action, App, DetailRow, ComposeKind, Focus, Hits, Modal, Screen, ToastKind, scope_matches};
-use crate::github::{PrDetail, PrSummary, login_of};
+use crate::actions_log::{Kind, ParsedLog, ansi_spans};
+use crate::app::{Action, App, DetailRow, LogView, RepoItem, Tab, TreeNode, repo_items, ComposeKind, Focus, Hits, Modal, Screen, ToastKind, scope_matches};
+use crate::state::Density;
+use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, WorkflowRunInfo, login_of};
+use crate::images::{self, ImagePlacement, ImageStore, Look};
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+thread_local! {
+    /// Density for the frame being drawn, read by the row builders' spacing helpers.
+    static DENSITY: std::cell::Cell<Density> = const { std::cell::Cell::new(Density::Cozy) };
+}
+
+fn density() -> Density {
+    DENSITY.with(|d| d.get())
+}
+
+/// Blank spacer rows between blocks: none when compact, two when comfortable.
+fn gap(rows: &mut Vec<DetailRow>) {
+    let n = match density() {
+        Density::Comfortable => 2,
+        Density::Cozy => 1,
+        Density::Compact => 0,
+    };
+    for _ in 0..n {
+        rows.push((Line::raw(""), Vec::new()));
+    }
+}
+
+/// Left padding of detail text.
+fn text_pad() -> u16 {
+    match density() {
+        Density::Comfortable => 2,
+        Density::Cozy => 1,
+        Density::Compact => 0,
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
+    DENSITY.with(|d| d.set(app.state.density));
     let [header, body, status, footer] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
 
@@ -35,13 +71,50 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
     draw_footer(f, app, footer);
 
+    if app.modal.is_some() {
+        dim(f);
+    }
     match &app.modal {
         Some(Modal::Scopes { .. }) => draw_scopes(f, app),
+        Some(Modal::Repos { .. }) => draw_repos(f, app),
         Some(Modal::Menu { .. }) => draw_menu(f, app),
         Some(Modal::Confirm { .. }) => draw_confirm(f, app),
         Some(Modal::Composer(_)) => draw_composer(f, app),
         Some(Modal::Help) => draw_help(f, app),
+        Some(Modal::Image { .. }) => draw_image_modal(f, app),
         None => {}
+    }
+    sanitize(f.buffer_mut());
+}
+
+/// Fade everything drawn so far, so a modal on top stands out.
+fn dim(f: &mut Frame) {
+    for cell in f.buffer_mut().content.iter_mut() {
+        cell.fg = Color::Indexed(240);
+        if cell.bg != Color::Reset {
+            cell.bg = Color::Indexed(235);
+        }
+        cell.modifier = Modifier::empty();
+    }
+}
+
+/// Make every cell's width unambiguous. Emoji presentation selectors (U+FE0F) and ZWJ
+/// sequences make some terminals draw a glyph narrower than ratatui assumed, and the cell
+/// ratatui then skips keeps stale content on screen. Image cells are left alone: Sixel and
+/// iTerm2 put a whole escape sequence in one cell, Kitty a U+10EEEE placeholder.
+fn sanitize(buf: &mut Buffer) {
+    for cell in buf.content.iter_mut() {
+        let sym = cell.symbol();
+        if sym.starts_with('\u{1b}') || sym.contains('\u{10EEEE}') {
+            continue;
+        }
+        let odd = |c: char| c == '\u{FE0F}' || c == '\u{FE0E}' || c == '\u{200D}' || c.is_control();
+        if !sym.chars().any(odd) {
+            continue;
+        }
+        let first = sym.chars().find(|c| !odd(*c)).unwrap_or(' ');
+        let first = if first.width().unwrap_or(0) == 0 { ' ' } else { first };
+        cell.set_char(first);
     }
 }
 
@@ -167,7 +240,7 @@ fn now_secs() -> i64 {
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SSZ` into unix seconds.
-fn parse_ts(ts: &str) -> Option<i64> {
+pub(crate) fn parse_ts(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() < 19 {
         return None;
@@ -189,7 +262,7 @@ pub fn ago(ts: &str) -> String {
     let Some(t) = parse_ts(ts) else { return ts.to_string() };
     let s = (now_secs() - t).max(0);
     match s {
-        0..60 => "now".into(),
+        0..60 => "<1m".into(),
         60..3600 => format!("{}m", s / 60),
         3600..86400 => format!("{}h", s / 3600),
         86400..2_592_000 => format!("{}d", s / 86400),
@@ -244,8 +317,9 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
     let scope = app.scopes[app.scope].name.clone();
     let mut x = area.x;
-    let mut spans = vec![Span::styled(" ⎇ PR Manager ", Style::new().fg(Color::Black).bg(ACCENT).bold()), Span::raw(" ")];
-    x += 15;
+    let title = " ⎇ GH PR Manager ";
+    let mut spans = vec![Span::styled(title, Style::new().fg(Color::Black).bg(ACCENT).bold()), Span::raw(" ")];
+    x += title.width() as u16 + 1;
     let scope_label = format!(" ▾ {scope} ");
     let w = scope_label.width() as u16;
     app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::OpenScopes));
@@ -256,6 +330,19 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let w = state_label.width() as u16;
     app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::CycleState));
     spans.push(Span::styled(state_label, Style::new().fg(Color::Yellow).add_modifier(Modifier::UNDERLINED)));
+    spans.push(Span::raw(" "));
+    x += w + 1;
+    let repo_label = match &app.repo {
+        Some(r) => format!(" ◫ {} ", truncate(r, 28)),
+        None => " ◫ All repos ▾ ".to_string(),
+    };
+    let w = repo_label.width() as u16;
+    app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::OpenRepos));
+    spans.push(Span::styled(repo_label, Style::new().fg(Color::Blue).bold().add_modifier(Modifier::UNDERLINED)));
+    if app.repo.is_some() {
+        app.hits.buttons.push((Rect::new(x + w, area.y, 3, 1), Action::SetRepo(None)));
+        spans.push(Span::styled(" ✕ ", Style::new().fg(Color::Black).bg(Color::Blue)));
+    }
     spans.push(Span::raw("  "));
 
     let shown = app.visible().len();
@@ -273,6 +360,9 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
     let mut right = Vec::new();
+    let density = format!(" ≡ {} ", app.state.density.label());
+    right.push(Span::styled(density.clone(), Style::new().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)));
+    right.push(Span::raw(" "));
     if let Some(r) = &app.rate {
         let color = if r.remaining < r.limit / 10 { Color::Red } else { DIM };
         right.push(Span::styled(format!("API {}/{} ", r.remaining, r.limit), Style::new().fg(color)));
@@ -286,6 +376,7 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     if rw < area.width / 2 {
         let r = Rect::new(area.right() - rw, area.y, rw, 1);
         app.hits.buttons.push((Rect::new(area.right() - 3, area.y, 3, 1), Action::Help));
+        app.hits.buttons.push((Rect::new(r.x, area.y, density.width() as u16, 1), Action::CycleDensity));
         f.render_widget(Paragraph::new(Line::from(right)), r);
     }
 }
@@ -298,6 +389,23 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
             ToastKind::Error => ("✗", Color::Red),
         };
         Line::from(vec![Span::styled(format!(" {icon} "), Style::new().fg(color).bold()), Span::styled(msg.clone(), Style::new().fg(color))])
+    } else if let Some(s) = app.log_view.search.as_ref().filter(|_| app.screen == Screen::Detail && app.tab == Tab::Actions) {
+        let mut spans = vec![Span::styled(" ^F ", Style::new().fg(ACCENT).bold()), Span::raw(s.query.clone())];
+        if s.input {
+            spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+        }
+        let count = match s.hits.len() {
+            0 if s.query.is_empty() => String::new(),
+            0 => "   no matches".into(),
+            n => {
+                let cur = app.log_view.cursor.and_then(|c| s.hits.binary_search(&c).ok()).map(|i| format!("{}/", i + 1)).unwrap_or_default();
+                format!("   {cur}{n} matches")
+            }
+        };
+        spans.push(Span::styled(count, Style::new().fg(Color::Yellow)));
+        let hint = if s.input { "   Enter jump · Esc clear" } else { "   n / N next / previous · Ctrl+F edit · Esc clear" };
+        spans.push(Span::styled(hint, Style::new().fg(DIM)));
+        Line::from(spans)
     } else if app.filter_input || !app.filter.is_empty() {
         let mut spans = vec![Span::styled(" / ", Style::new().fg(ACCENT).bold()), Span::raw(app.filter.clone())];
         if app.filter_input {
@@ -309,6 +417,17 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(spans)
     } else {
         Line::from(Span::styled(format!(" {}", app.search_query()), Style::new().fg(DIM)))
+    };
+    // The image protocol in use, on the right; clicking it shows or hides images.
+    let chip = format!(" img: {} ", app.images.protocol_label());
+    let cw = chip.width() as u16;
+    let area = if cw + 20 < area.width {
+        let r = Rect::new(area.right() - cw, area.y, cw, 1);
+        f.render_widget(Paragraph::new(Span::styled(chip, Style::new().fg(DIM))), r);
+        app.hits.buttons.push((r, Action::ToggleImages));
+        Rect { width: area.width - cw, ..area }
+    } else {
+        area
     };
     f.render_widget(Paragraph::new(line), area);
 }
@@ -322,10 +441,12 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("@", "Mention", Action::InsertAt),
             ("Esc", "Close (keeps draft)", Action::ModalCancel),
         ],
+        (Some(Modal::Image { .. }), _) => vec![("o", "Browser", Action::ModalPick(0)), ("y", "Copy URL", Action::ModalPick(1)), ("Esc", "Close", Action::ModalCancel)],
         (Some(_), _) => vec![("Enter", "Select", Action::ModalPick(usize::MAX)), ("Esc", "Close", Action::ModalCancel)],
         (None, Screen::List) => vec![
             ("↵", "Open", Action::OpenSelected),
             ("s", "Scope", Action::OpenScopes),
+            ("S", "Repo", Action::OpenRepos),
             ("f", "State", Action::CycleState),
             ("/", "Filter", Action::StartFilter),
             ("c", "Comment", Action::Comment),
@@ -335,15 +456,31 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("?", "Help", Action::Help),
             ("q", "Quit", Action::Quit),
         ],
+        (None, Screen::Detail) if app.tab == Tab::Actions => vec![
+            ("Esc", "Back", Action::ActionsBack),
+            ("Tab", "Switch pane", Action::ToggleFocus),
+            ("[ ]", "Tabs", Action::NextTab),
+            ("↵", "Fold / show", Action::TreeToggle),
+            ("O", "Run in browser", Action::TreeOpenBrowser),
+            ("^F", "Search log", Action::LogSearch),
+            ("E", "Next error", Action::LogNextError),
+            ("z", "Fold", Action::LogFold),
+            ("t", "Times", Action::LogTimestamps),
+            ("H", "History", Action::ToggleHistory),
+            ("r", "Refresh", Action::Refresh),
+            ("?", "Help", Action::Help),
+        ],
         (None, Screen::Detail) => vec![
             ("Esc", "Back", Action::Back),
             ("Tab", "Switch pane", Action::ToggleFocus),
+            ("[ ]", "Tabs", Action::NextTab),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("a", "Approve", Action::Approve),
             ("x", "Close", Action::CloseOrReopen),
             ("␣", "All actions", Action::Menu),
             ("o", "Browser", Action::Browser),
+            ("I", "Images", Action::ToggleImages),
             ("r", "Refresh", Action::Refresh),
             ("?", "Help", Action::Help),
         ],
@@ -356,7 +493,11 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------- list screen ----------
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::new().borders(Borders::TOP).border_style(Style::new().fg(DIM));
+    let d = app.state.density;
+    let block = Block::new()
+        .borders(if d.rules() { Borders::TOP } else { Borders::NONE })
+        .border_style(Style::new().fg(DIM))
+        .padding(Padding::horizontal(d.side_padding()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -368,6 +509,11 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             vec![Line::styled(format!("{} Loading pull requests…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT))]
         } else if !app.filter.is_empty() {
             vec![Line::raw(format!("No PRs match “{}”", app.filter)), Line::styled("Esc clears the filter", Style::new().fg(DIM))]
+        } else if let Some(r) = &app.repo {
+            vec![
+                Line::raw(format!("No pull requests for {} in {r}.", app.scopes[app.scope].name)),
+                Line::styled("S picks another repository · s → Everyone shows every PR in it · click ✕ to clear", Style::new().fg(DIM)),
+            ]
         } else {
             vec![
                 Line::raw("No pull requests in this scope."),
@@ -380,6 +526,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let density = app.state.density;
     let rows: Vec<Row> = vis
         .iter()
         .map(|&i| {
@@ -392,12 +539,13 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(login_of(&p.author).to_string()),
                 Cell::from(ci_icon(p.ci_state())),
                 Cell::from(review_span(p.review_decision.as_deref())),
-                Cell::from(Span::styled(
-                    if p.comments.total_count > 0 { format!("💬{}", p.comments.total_count) } else { String::new() },
-                    Style::new().fg(DIM),
-                )),
+                Cell::from(
+                    Line::styled(if p.comments.total_count > 0 { p.comments.total_count.to_string() } else { String::new() }, Style::new().fg(Color::Gray))
+                        .right_aligned(),
+                ),
                 Cell::from(Span::styled(ago(&p.updated_at), Style::new().fg(DIM))),
             ])
+            .bottom_margin(density.table_row_h() as u16 - 1)
         })
         .collect();
     let widths = [
@@ -408,15 +556,25 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(14),
         Constraint::Length(2),
         Constraint::Length(10),
-        Constraint::Length(5),
         Constraint::Length(4),
+        Constraint::Length(7),
     ];
-    let header = Row::new(["", "Repository", "#", "Title", "Author", "CI", "Review", "", "Upd"])
+    let header = Row::new(vec![
+        Cell::from(""),
+        Cell::from("Repository"),
+        Cell::from("#"),
+        Cell::from("Title"),
+        Cell::from("Author"),
+        Cell::from("CI"),
+        Cell::from("Review"),
+        Cell::from(Line::from("Cmts").right_aligned()),
+        Cell::from("Updated"),
+    ])
         .style(Style::new().fg(Color::Gray).bold())
         .bottom_margin(0);
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(1)
+        .column_spacing(density.column_spacing())
         .row_highlight_style(Style::new().bg(Color::Indexed(238)).bold())
         .highlight_symbol("▌");
     app.table_state.select(Some(app.sel));
@@ -456,7 +614,11 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             ]);
             let meta = format!("    {} · {} · {}", p.repository.name_with_owner, login_of(&p.author), ago(&p.updated_at));
             let l2 = Line::styled(truncate(&meta, w), Style::new().fg(DIM));
-            ListItem::new(vec![l1, l2])
+            match app.state.density {
+                Density::Comfortable => ListItem::new(vec![l1, l2, Line::raw("")]),
+                Density::Cozy => ListItem::new(vec![l1, l2]),
+                Density::Compact => ListItem::new(vec![l1]),
+            }
         })
         .collect();
     let list = List::new(items)
@@ -478,7 +640,8 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let block = pane_block(title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let [bar, sep, content] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let sep_h = if app.state.density.rules() { 1 } else { 0 };
+    let [bar, sep, rest] = Layout::vertical([Constraint::Length(1), Constraint::Length(sep_h), Constraint::Min(1)]).areas(inner);
 
     // Clickable action bar.
     let fetched_at = app.details.get(&pr.id).map(|(d, at)| (d.state == "CLOSED", *at));
@@ -489,59 +652,953 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         &mut app.hits,
         bar,
         &[
-            ("💬", "Comment", Action::Comment),
-            ("⇄", "Merge ▾", Action::MergeMenu),
-            ("✓", "Approve", Action::Approve),
-            ("✕", close_label, Action::CloseOrReopen),
-            ("↗", "Browser", Action::Browser),
-            ("⋯", "More", Action::Menu),
+            ("c", "Comment", Action::Comment),
+            ("m", "Merge ▾", Action::MergeMenu),
+            ("a", "Approve", Action::Approve),
+            ("x", close_label, Action::CloseOrReopen),
+            ("o", "Browser", Action::Browser),
+            ("␣", "More", Action::Menu),
         ],
         btn,
     );
     f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).style(Style::new().fg(DIM)), sep);
 
-    let text_w = content.width.saturating_sub(2) as usize;
-    let mut rows: Vec<DetailRow> = Vec::new();
+    let text_w = rest.width.saturating_sub(text_pad() + 1) as usize;
+
+    // PR info header + description (cached per PR, width and fetch).
+    let mut info: Vec<DetailRow> = Vec::new();
     match fetched_at {
         Some((_, at)) => {
-            let fresh = app.detail_cache.as_ref().is_some_and(|(id, cw, cat, _)| *id == pr.id && *cw == text_w && *cat == at);
+            let ckey = format!("{}:{:?}", pr.id, density());
+            let fresh = app.detail_cache.as_ref().is_some_and(|(id, cw, cat, _)| *id == ckey && *cw == text_w && *cat == at);
             if !fresh {
                 let mut built = Vec::new();
-                detail_lines(&app.details[&pr.id].0, text_w, &mut built);
-                app.detail_cache = Some((pr.id.clone(), text_w, at, built));
+                info_lines(&app.details[&pr.id].0, text_w, &mut built);
+                app.detail_cache = Some((ckey, text_w, at, built));
             }
-            rows = app.detail_cache.as_ref().map(|c| c.3.clone()).unwrap_or_default();
+            info = app.detail_cache.as_ref().map(|c| c.3.clone()).unwrap_or_default();
         }
         None => {
-            summary_lines(&pr, text_w, &mut rows);
-            rows.push((Line::raw(""), Vec::new()));
+            summary_lines(&pr, text_w, &mut info);
+            info.push((Line::raw(""), Vec::new()));
             if let Some(e) = app.detail_errors.get(&pr.id) {
-                rows.push((Line::styled(format!("Failed to load details: {e}"), Style::new().fg(Color::Red)), Vec::new()));
-                rows.push((Line::styled("Press r to retry", Style::new().fg(DIM)), Vec::new()));
+                info.push((Line::styled(format!("Failed to load details: {e}"), Style::new().fg(Color::Red)), Vec::new()));
+                info.push((Line::styled("Press r to retry", Style::new().fg(DIM)), Vec::new()));
             } else {
-                rows.push((Line::styled(format!("{} Loading details…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new()));
+                info.push((Line::styled(format!("{} Loading details…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new()));
             }
         }
     }
+    let collapsed = app.info_collapsed();
+    if collapsed {
+        // Keep just the title block: title, badges and the base ← head line. Found by its
+        // arrow rather than the blank line after it, which Compact density leaves out.
+        let end = info
+            .iter()
+            .position(|(l, _)| l.spans.iter().any(|s| s.content == " ← "))
+            .map(|i| i + 1)
+            .or_else(|| info.iter().position(|(l, _)| l.width() == 0))
+            .unwrap_or(info.len());
+        info.truncate(end);
+    }
+    let cap = if collapsed { info.len() } else { (rest.height as usize * 45 / 100).max(5) };
+    let info_h = info.len().min(cap).min(rest.height.saturating_sub(6) as usize) as u16;
+    let margin = app.state.density.tab_margin();
+    let [info_area, _, tabs_area, _, content] = Layout::vertical([
+        Constraint::Length(info_h),
+        Constraint::Length(margin),
+        Constraint::Length(1),
+        Constraint::Length(margin),
+        Constraint::Min(1),
+    ])
+    .areas(rest);
 
-    let height = content.height as usize;
-    let max_scroll = rows.len().saturating_sub(height);
-    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    let (max, links) = render_rows(f, info_area, &info, &mut app.info_scroll);
+    app.hits.info = Some(info_area);
+    app.hits.info_max_scroll = max;
+    app.hits.info_links = links;
+    app.hits.detail_text_x = info_area.x + text_pad();
+
+    draw_tab_bar(f, app, tabs_area);
+
+    // Changes: file list on the left, the selected file's diff on the right.
+    if app.tab == Tab::Changes && app.details.contains_key(&pr.id) && app.files.contains_key(&pr.id) {
+        return draw_changes(f, app, &pr.id, content);
+    }
+    // Actions: runs and jobs on the left, the selected one on the right.
+    if app.tab == Tab::Actions && app.details.contains_key(&pr.id) {
+        return draw_actions(f, app, &pr.id, content);
+    }
+
+    // Active tab content. Inline images are capped at 2/5 of the screen's height, so the
+    // cap is part of the cache key like the width.
+    let max_rows = app.cfg.image_max_rows.min((f.area().height * 2 / 5).max(6));
+    app.images.max_rows = max_rows;
+    let detail = app.details.get(&pr.id).map(|(d, at)| (d, *at));
+    let (rows, placements) = match detail {
+        None => (vec![(Line::styled(format!("{} Loading…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), Vec::new())], Vec::new()),
+        Some((d, at)) => {
+            let stamp = if app.tab == Tab::Changes { app.files.get(&pr.id).map(|(_, t, _)| *t) } else { Some(at) };
+            let key = format!("{}:{text_w}:{max_rows}:{:?}:{:?}", pr.id, app.tab, density());
+            match stamp {
+                Some(stamp) => {
+                    if app.tab_cache.get(&key).is_none_or(|(s, _)| *s != stamp) {
+                        let mut rows = Vec::new();
+                        let mut img = Imgs::new(&app.images);
+                        match app.tab {
+                            Tab::Description => description_lines(d, text_w, &mut rows, &mut img),
+                            Tab::Conversation => conversation_lines(d, text_w, &mut rows, &mut img),
+                            Tab::Changes => {}
+                            Tab::Commits => commits_lines(d, text_w, &mut rows),
+                            Tab::Checks => checks_lines(d, text_w, &mut rows),
+                            Tab::Actions => {}
+                            Tab::Reviews => reviews_lines(d, text_w, &mut rows, &mut img),
+                        }
+                        app.tab_cache.insert(key.clone(), (stamp, (rows, img.out)));
+                    }
+                    app.tab_cache[&key].1.clone()
+                }
+                // Changes not loaded yet.
+                None => {
+                    let line = match app.files_errors.get(&pr.id) {
+                        Some(e) => Line::styled(format!("Failed to load changes: {e} — press r to retry"), Style::new().fg(Color::Red)),
+                        None => Line::styled(format!("{} Loading changes…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)),
+                    };
+                    (vec![(line, Vec::new())], Vec::new())
+                }
+            }
+        }
+    };
+    // An image above the viewport that just loaded pushes the rest down; follow it so the
+    // text being read stays put.
+    let view = format!("{}:{:?}", pr.id, app.tab);
+    if app.last_placements.0 == view {
+        app.detail_scroll = images::anchor(&app.last_placements.1, &placements, app.detail_scroll);
+    }
+    let (max, links) = render_rows(f, content, &rows, &mut app.detail_scroll);
+    render_images(f, content, &placements, app.detail_scroll, &mut app.images, app.modal.is_some());
+    app.images.want(&placements, app.detail_scroll, content.height as usize);
+    app.images.pump(&app.client, &app.tx);
+    app.last_placements = (view, placements);
     app.hits.detail = Some(content);
-    app.hits.detail_max_scroll = max_scroll;
-    app.hits.detail_height = height;
-    app.hits.detail_links = rows.iter().map(|(_, l)| l.clone()).collect();
-    let visible: Vec<Line> = rows.into_iter().skip(app.detail_scroll).take(height).map(|(l, _)| l).collect();
-    let text_area = Rect::new(content.x + 1, content.y, content.width.saturating_sub(2), content.height);
-    app.hits.detail_text_x = text_area.x;
-    f.render_widget(Paragraph::new(visible), text_area);
+    app.hits.detail_max_scroll = max;
+    app.hits.detail_height = content.height as usize;
+    app.hits.detail_links = links;
+}
+
+fn draw_changes(f: &mut Frame, app: &mut App, id: &str, area: Rect) {
+    let files = &app.files[id].0;
+    if files.is_empty() {
+        f.render_widget(Paragraph::new(Line::styled(" No file changes.", Style::new().fg(DIM))), area);
+        return;
+    }
+    app.file_sel = app.file_sel.min(files.len() - 1);
+    let list_w = (area.width * 32 / 100).clamp(24.min(area.width), 56);
+    let [list_area, gap, diff_area] = Layout::horizontal([Constraint::Length(list_w), Constraint::Length(1), Constraint::Min(10)]).areas(area);
+    f.render_widget(Paragraph::new(vec![Line::styled("│", Style::new().fg(DIM)); gap.height as usize]), gap);
+
+    // File list with a summary header.
+    let adds: u64 = files.iter().map(|f| f.additions).sum();
+    let dels: u64 = files.iter().map(|f| f.deletions).sum();
+    let header = Line::from(vec![
+        Span::styled(format!(" {} files ", files.len()), Style::new().bold()),
+        Span::styled(format!("+{adds}"), Style::new().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("−{dels}"), Style::new().fg(Color::Red)),
+    ]);
+    f.render_widget(Paragraph::new(header), Rect::new(list_area.x, list_area.y, list_area.width, 1));
+    let rows_area = Rect::new(list_area.x, list_area.y + 1, list_area.width, list_area.height.saturating_sub(1));
+    let h = rows_area.height as usize;
+    // Keep the selected file in view.
+    if app.file_sel < app.file_list_scroll {
+        app.file_list_scroll = app.file_sel;
+    } else if h > 0 && app.file_sel >= app.file_list_scroll + h {
+        app.file_list_scroll = app.file_sel + 1 - h;
+    }
+    app.file_list_scroll = app.file_list_scroll.min(files.len().saturating_sub(h));
+    let w = rows_area.width as usize;
+    let lines: Vec<Line> = files
+        .iter()
+        .enumerate()
+        .skip(app.file_list_scroll)
+        .take(h)
+        .map(|(i, file)| {
+            let (letter, color) = file_status(&file.status);
+            let counts = format!("+{} −{}", file.additions, file.deletions);
+            let path_w = w.saturating_sub(counts.width() + 5);
+            let (dir, name) = match file.filename.rfind('/') {
+                Some(i) => (&file.filename[..=i], &file.filename[i + 1..]),
+                None => ("", file.filename.as_str()),
+            };
+            // Prefer the file name; trim the directory from the left when space is short.
+            let name = truncate(name, path_w);
+            let dir_room = path_w.saturating_sub(name.width());
+            let dir = if dir.width() <= dir_room {
+                dir.to_string()
+            } else if dir_room > 1 {
+                let tail: String = dir.chars().rev().take(dir_room - 1).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("…{tail}")
+            } else {
+                String::new()
+            };
+            let pad = w.saturating_sub(dir.width() + name.width() + counts.width() + 4);
+            let selected = i == app.file_sel;
+            let line = Line::from(vec![
+                Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT)),
+                Span::styled(format!("{letter} "), Style::new().fg(color).bold()),
+                Span::styled(dir, Style::new().fg(DIM)),
+                Span::styled(name, if selected { Style::new().bold() } else { Style::new() }),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(format!("+{}", file.additions), Style::new().fg(Color::Green)),
+                Span::raw(" "),
+                Span::styled(format!("−{}", file.deletions), Style::new().fg(Color::Red)),
+            ]);
+            if selected { line.style(Style::new().bg(Color::Indexed(238))) } else { line }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), rows_area);
+    app.hits.file_list = Some((rows_area, app.file_list_scroll));
+
+    // Diff of the selected file (cached per file and width).
+    let text_w = diff_area.width.saturating_sub(text_pad() + 1) as usize;
+    let stamp = app.files[id].1;
+    let key = format!("{id}:{text_w}:file:{}:{:?}", app.file_sel, density());
+    if app.tab_cache.get(&key).is_none_or(|(s, _)| *s != stamp) {
+        let mut rows = Vec::new();
+        file_diff_lines(&app.files[id].0[app.file_sel], text_w, &mut rows);
+        app.tab_cache.insert(key.clone(), (stamp, (rows, Vec::new())));
+    }
+    // The first row is the file's name bar: pin it above the scrolling patch.
+    let rows = app.tab_cache[&key].1.0.clone();
+    let [bar_area, patch_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(diff_area);
+    if let Some((bar, _)) = rows.first() {
+        f.render_widget(Paragraph::new(bar.clone()), Rect::new(bar_area.x + 1, bar_area.y, bar_area.width.saturating_sub(2), 1));
+    }
+    let (max, links) = render_rows(f, patch_area, rows.get(1..).unwrap_or_default(), &mut app.detail_scroll);
+    app.hits.detail = Some(patch_area);
+    app.hits.detail_max_scroll = max;
+    app.hits.detail_height = patch_area.height as usize;
+    app.hits.detail_links = links;
+}
+
+// ---------- Actions tab ----------
+
+/// Uppercased REST outcome (a completed run's conclusion, else its status), as `ci_icon` reads it.
+pub(crate) fn rest_outcome(status: &str, conclusion: Option<&str>) -> String {
+    if status == "completed" { conclusion.unwrap_or("neutral").to_uppercase() } else { status.to_uppercase() }
+}
+
+/// Sort rank of an outcome: failing, unfinished, passed, everything else.
+pub(crate) fn outcome_rank(o: &str) -> u8 {
+    match o {
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => 0,
+        "PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING" | "REQUESTED" => 1,
+        "SUCCESS" => 2,
+        _ => 3,
+    }
+}
+
+/// `4m39s`, `1h02m`.
+pub(crate) fn fmt_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Seconds from `start` to `end`, or to now while it's still running.
+fn elapsed(start: Option<&str>, end: Option<&str>) -> Option<i64> {
+    let s = parse_ts(start?)?;
+    Some(end.and_then(parse_ts).unwrap_or_else(now_secs) - s)
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn run_outcome(r: &WorkflowRunInfo) -> String {
+    rest_outcome(r.status(), r.conclusion.as_deref())
+}
+
+fn job_outcome(j: &Job) -> String {
+    rest_outcome(&j.status, j.conclusion.as_deref())
+}
+
+fn draw_actions(f: &mut Frame, app: &mut App, id: &str, area: Rect) {
+    let Some((nwo, sha)) = app.details.get(id).map(|(d, _)| (d.repository.name_with_owner.clone(), d.head_ref_oid.clone())) else { return };
+    // Nothing to put in two columns yet: one message across the pane.
+    let message: Vec<Line<'static>> = match app.current_runs().map(|e| e.runs.is_empty()) {
+        None => match app.runs_errors.get(id) {
+            Some(e) => vec![
+                Line::styled(format!("Couldn't load workflow runs: {e}"), Style::new().fg(Color::Red)),
+                Line::styled("press r to retry", Style::new().fg(DIM)),
+            ],
+            None => vec![Line::styled(format!("{} Loading workflow runs…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT))],
+        },
+        Some(true) if app.no_workflows.contains(&nwo) => vec![Line::styled("This repository doesn't use GitHub Actions", Style::new().fg(DIM).italic())],
+        Some(true) => vec![
+            Line::raw(format!("No workflow runs for {}", short_sha(&sha))),
+            Line::styled("H shows runs from earlier pushes", Style::new().fg(DIM)),
+        ],
+        Some(false) => Vec::new(),
+    };
+    if !message.is_empty() {
+        let rows: Vec<DetailRow> = message.into_iter().map(|l| (l, Vec::new())).collect();
+        let (max, links) = render_rows(f, area, &rows, &mut app.detail_scroll);
+        app.hits.detail = Some(area);
+        app.hits.detail_max_scroll = max;
+        app.hits.detail_height = area.height as usize;
+        app.hits.detail_links = links;
+        return;
+    }
+
+    let list_w = (area.width * 32 / 100).clamp(24.min(area.width), 56);
+    let [list_area, gap, pane_area] = Layout::horizontal([Constraint::Length(list_w), Constraint::Length(1), Constraint::Min(10)]).areas(area);
+    f.render_widget(Paragraph::new(vec![Line::styled("│", Style::new().fg(DIM)); gap.height as usize]), gap);
+    draw_run_tree(f, app, list_area);
+
+    // Right pane: the selected run or job, then its log (if shown) in the same scroll.
+    let text_w = pane_area.width.saturating_sub(text_pad() + 1) as usize;
+    let mut rows = Vec::new();
+    let mut log_job = None;
+    match app.selected_node() {
+        Some(TreeNode::Run(i)) => {
+            if let Some(e) = app.current_runs() {
+                let run = &e.runs[i];
+                let jobs = app.jobs.get(&run.id).map(|(j, _)| j.as_slice());
+                run_header_lines(run, jobs, text_w, &mut rows);
+                jobs_summary_lines(app, run, jobs, text_w, &mut rows);
+            }
+        }
+        Some(TreeNode::Job(..)) => {
+            if let Some(job) = app.selected_job().cloned() {
+                log_job = job_lines(app, &job, text_w, &mut rows);
+            }
+        }
+        _ => {}
+    }
+    render_actions_pane(f, app, pane_area, &rows, log_job);
+}
+
+/// The runs/jobs tree with a summary header; records `hits.actions_tree`.
+fn draw_run_tree(f: &mut Frame, app: &mut App, area: Rect) {
+    let tree = app.tree();
+    let Some(e) = app.current_runs() else { return };
+    let (mut fail, mut live, mut pass) = (0, 0, 0);
+    for r in e.runs.iter().filter(|r| r.head_sha == e.sha) {
+        match outcome_rank(&run_outcome(r)) {
+            0 => fail += 1,
+            1 => live += 1,
+            2 => pass += 1,
+            _ => {}
+        }
+    }
+    let n = e.runs.iter().filter(|r| r.head_sha == e.sha).count();
+    let mut header = vec![Span::styled(format!(" {n} run{} ", if n == 1 { "" } else { "s" }), Style::new().bold())];
+    for (count, outcome) in [(fail, "FAILURE"), (live, "IN_PROGRESS"), (pass, "SUCCESS")] {
+        if count > 0 {
+            header.push(Span::styled(format!("· {count} "), Style::new().fg(Color::Gray)));
+            header.push(ci_icon(Some(outcome)));
+            header.push(Span::raw(" "));
+        }
+    }
+    if e.history {
+        header.push(Span::styled("· history", Style::new().fg(DIM)));
+    }
+    f.render_widget(Paragraph::new(Line::from(header)), Rect::new(area.x, area.y, area.width, 1));
+
+    let rows_area = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+    let w = rows_area.width as usize;
+    let comfy = density() == Density::Comfortable;
+    let mut rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    for (i, node) in tree.iter().enumerate() {
+        let selected = i == app.actions_sel;
+        match node {
+            TreeNode::Push(sha) => {
+                if comfy && !rows.is_empty() {
+                    rows.push((Line::raw(""), None));
+                }
+                let label = format!(" ── earlier push {} ", short_sha(sha));
+                let fill = w.saturating_sub(label.width());
+                rows.push((Line::styled(format!("{label}{}", "─".repeat(fill)), Style::new().fg(DIM)), None));
+            }
+            TreeNode::Run(r) => {
+                let run = &e.runs[*r];
+                if comfy && i > 0 && !matches!(tree[i - 1], TreeNode::Push(_)) {
+                    rows.push((Line::raw(""), None));
+                }
+                let fold = if app.actions_expanded.contains(&run.id) { "▾ " } else { "▸ " };
+                let (right, color) = if run.status() == "completed" {
+                    (format!("#{} {}", run.run_number, elapsed(run.run_started_at.as_deref(), Some(&run.updated_at)).map(fmt_duration).unwrap_or_default()), DIM)
+                } else {
+                    let status = if run.status() == "in_progress" { "running" } else { run.status() };
+                    (format!("#{} {status}", run.run_number), Color::Yellow)
+                };
+                let lead = vec![Span::styled(fold, Style::new().fg(DIM)), ci_icon(Some(&run_outcome(run))), Span::raw(" ")];
+                rows.push((tree_row(selected, lead, run.name(), Style::new().bold(), right, color, w), Some(i)));
+            }
+            TreeNode::Job(run_id, j) => {
+                let Some(job) = app.jobs.get(run_id).and_then(|(jobs, _)| jobs.get(*j)) else { continue };
+                let dur = elapsed(job.started_at.as_deref(), job.completed_at.as_deref());
+                let (right, color) = match job.status.as_str() {
+                    "completed" => (dur.map(fmt_duration).unwrap_or_default(), DIM),
+                    "in_progress" => (dur.map(fmt_duration).unwrap_or_default(), Color::Yellow),
+                    s => (s.to_string(), Color::Yellow),
+                };
+                let lead = vec![Span::raw("    "), ci_icon(Some(&job_outcome(job))), Span::raw(" ")];
+                rows.push((tree_row(selected, lead, &job.name, Style::new(), right, color, w), Some(i)));
+            }
+        }
+    }
+    let h = rows_area.height as usize;
+    // Keep the cursor in view unless the wheel moved the tree away from it.
+    if app.actions_tree_follow
+        && let Some(cur) = rows.iter().position(|(_, n)| *n == Some(app.actions_sel))
+    {
+        if cur < app.actions_tree_scroll {
+            app.actions_tree_scroll = cur;
+        } else if h > 0 && cur >= app.actions_tree_scroll + h {
+            app.actions_tree_scroll = cur + 1 - h;
+        }
+    }
+    app.actions_tree_scroll = app.actions_tree_scroll.min(rows.len().saturating_sub(h));
+    let lines: Vec<Line> = rows.iter().skip(app.actions_tree_scroll).take(h).map(|(l, _)| l.clone()).collect();
+    f.render_widget(Paragraph::new(lines), rows_area);
+    app.hits.actions_tree = Some((rows_area, app.actions_tree_scroll));
+    app.hits.actions_tree_rows = rows.into_iter().map(|(_, n)| n).collect();
+}
+
+/// One tree row: cursor bar, lead spans, a name truncated to fit, and a right-aligned note.
+fn tree_row(selected: bool, lead: Vec<Span<'static>>, name: &str, name_style: Style, right: String, right_color: Color, w: usize) -> Line<'static> {
+    let lead_w = 1 + lead.iter().map(|s| s.width()).sum::<usize>();
+    let name = truncate(name, w.saturating_sub(lead_w + right.width() + 2));
+    let pad = w.saturating_sub(lead_w + name.width() + right.width() + 1);
+    let mut spans = vec![Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT))];
+    spans.extend(lead);
+    spans.push(Span::styled(name, if selected { name_style.bold() } else { name_style }));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(right, Style::new().fg(right_color)));
+    let line = Line::from(spans);
+    if selected { line.style(Style::new().bg(Color::Indexed(238))) } else { line }
+}
+
+/// A run's title row (click opens it) and summary.
+fn run_header_lines(run: &WorkflowRunInfo, jobs: Option<&[Job]>, w: usize, rows: &mut Vec<DetailRow>) {
+    let link = Some(run.html_url.clone());
+    let mut meta = vec![format!("#{}", run.run_number)];
+    if run.run_attempt > 1 {
+        meta.push(format!("attempt {}", run.run_attempt));
+    }
+    meta.push(run.event.clone());
+    meta.push(short_sha(&run.head_sha));
+    if let Some(d) = elapsed(run.run_started_at.as_deref(), (run.status() == "completed").then_some(run.updated_at.as_str())) {
+        meta.push(fmt_duration(d));
+    }
+    if let Some(a) = run.triggering_actor.as_ref().or(run.actor.as_ref()) {
+        meta.push(a.login.clone());
+    }
+    push_wrapped(
+        rows,
+        Line::from(vec![
+            ci_icon(Some(&run_outcome(run))),
+            Span::raw(" "),
+            Span::styled(run.name().to_string(), Style::new().bold().underlined()),
+            Span::styled(format!("  {}", meta.join(" · ")), Style::new().fg(Color::Gray)),
+        ]),
+        w,
+        "  ",
+        link,
+    );
+    let summary = match jobs {
+        None => "loading jobs…".to_string(),
+        Some(jobs) => {
+            let failed = jobs.iter().filter(|j| outcome_rank(&job_outcome(j)) == 0).count();
+            let done = jobs.iter().filter(|j| j.status == "completed").count();
+            if failed > 0 {
+                format!("failed {failed} of {} jobs", jobs.len())
+            } else if done < jobs.len() {
+                format!("{done} of {} jobs done", jobs.len())
+            } else {
+                format!("{} job{} done", jobs.len(), if jobs.len() == 1 { "" } else { "s" })
+            }
+        }
+    };
+    rows.push((
+        Line::from(vec![
+            Span::styled(format!("{summary} · opened {} ago", ago(&run.created_at)), Style::new().fg(Color::Gray)),
+            Span::styled("   O opens it in the browser", Style::new().fg(DIM)),
+        ]),
+        Vec::new(),
+    ));
+    if !run.display_title.is_empty() {
+        rows.push((Line::styled(truncate(&run.display_title, w), Style::new().fg(DIM)), Vec::new()));
+    }
+}
+
+/// The run's jobs, each clickable to show it, with the step a failed one stopped at.
+fn jobs_summary_lines(app: &App, run: &WorkflowRunInfo, jobs: Option<&[Job]>, w: usize, rows: &mut Vec<DetailRow>) {
+    section(rows, "Jobs", w);
+    let Some(jobs) = jobs else {
+        let line = match app.jobs_errors.get(&run.id) {
+            Some(e) => Line::styled(format!("Couldn't load jobs: {e} — press r to retry"), Style::new().fg(Color::Red)),
+            None => Line::styled(format!("{} Loading jobs…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)),
+        };
+        rows.push((line, Vec::new()));
+        return;
+    };
+    if jobs.is_empty() {
+        rows.push((Line::styled("No jobs ran in this attempt.", Style::new().fg(DIM).italic()), Vec::new()));
+    }
+    let name_w = jobs.iter().map(|j| j.name.width()).max().unwrap_or(0).min(w / 2);
+    for job in jobs {
+        let dur = elapsed(job.started_at.as_deref(), job.completed_at.as_deref()).map(fmt_duration).unwrap_or_else(|| job.status.replace('_', " "));
+        let mut spans = vec![
+            Span::raw(" "),
+            ci_icon(Some(&job_outcome(job))),
+            Span::raw(" "),
+            Span::styled(format!("{:<name_w$}", truncate(&job.name, name_w)), Style::new().underlined()),
+            Span::styled(format!("  {dur:>6}"), Style::new().fg(DIM)),
+        ];
+        if let Some(s) = job.steps.iter().find(|s| outcome_rank(&rest_outcome(&s.status, s.conclusion.as_deref())) == 0) {
+            let used = 4 + name_w + 8;
+            spans.push(Span::styled(truncate(&format!("   failed at step {} “{}”", s.number, s.name), w.saturating_sub(used)), Style::new().fg(Color::Red)));
+        } else if let Some(s) = job.steps.iter().find(|s| s.status == "in_progress") {
+            let used = 4 + name_w + 8;
+            spans.push(Span::styled(truncate(&format!("   running step {} “{}”", s.number, s.name), w.saturating_sub(used)), Style::new().fg(Color::Yellow)));
+        }
+        rows.push((Line::from(spans), full_row_link(&Some(format!("#job:{}", job.id)))));
+    }
+    gap(rows);
+    rows.push((Line::styled("Enter folds a run · Enter or click on a job shows its log", Style::new().fg(DIM)), Vec::new()));
+}
+
+/// A job's header, steps and annotations, then the log section. Returns the job id when
+/// its log is loaded and should follow these rows.
+fn job_lines(app: &App, job: &Job, w: usize, rows: &mut Vec<DetailRow>) -> Option<u64> {
+    let log = app.logs.get(&job.id).map(|(l, _)| l);
+    let mut meta = Vec::new();
+    if !job.labels.is_empty() {
+        meta.push(job.labels.join(", "));
+    }
+    if let Some(d) = elapsed(job.started_at.as_deref(), job.completed_at.as_deref()) {
+        meta.push(fmt_duration(d));
+    }
+    if job.run_attempt > 1 {
+        meta.push(format!("attempt {}", job.run_attempt));
+    }
+    push_wrapped(
+        rows,
+        Line::from(vec![
+            ci_icon(Some(&job_outcome(job))),
+            Span::raw(" "),
+            Span::styled(job.name.clone(), Style::new().bold().underlined()),
+            Span::styled(format!("  {}", meta.join(" · ")), Style::new().fg(Color::Gray)),
+            Span::styled("   O browser", Style::new().fg(DIM)),
+        ]),
+        w,
+        "  ",
+        job.html_url.clone(),
+    );
+    steps_lines(job, log, w, rows);
+    if let Some(anns) = app.annotations.get(&job.id).filter(|a| !a.is_empty()) {
+        annotation_lines(job, anns, log, w, rows);
+    }
+
+    let wanted = app.log_wanted.contains(&job.id);
+    let state = |rows: &mut Vec<DetailRow>, line: Line<'static>, link: Option<String>| {
+        section(rows, "Log", w);
+        rows.push((line, full_row_link(&link)));
+    };
+    if let (true, Some(log)) = (wanted, log) {
+        let errors = log.errors.len();
+        let title = format!("Log · {} lines · {errors} error{}", log.shown_len(), if errors == 1 { "" } else { "s" });
+        gap(rows);
+        let label = format!("── {title} ");
+        let hint = " ^F search · E error · z fold · t times ";
+        let hint = if label.width() + hint.width() + 2 <= w { hint } else { "" };
+        let fill = w.saturating_sub(label.width() + hint.width());
+        rows.push((
+            Line::from(vec![Span::styled(label, Style::new().fg(ACCENT).bold()), Span::styled("─".repeat(fill), Style::new().fg(DIM)), Span::styled(hint, Style::new().fg(DIM))]),
+            Vec::new(),
+        ));
+        if log.dropped_lines > 0 {
+            rows.push((
+                Line::styled(format!("… {} earlier lines dropped — O opens the full log", log.dropped_lines), Style::new().fg(DIM).italic()),
+                full_row_link(&job.html_url),
+            ));
+        }
+        if log.lines.is_empty() {
+            rows.push((Line::styled("The log is empty.", Style::new().fg(DIM).italic()), Vec::new()));
+        }
+        return Some(job.id);
+    }
+    if !wanted {
+        state(rows, Line::styled("Enter (or click the job) shows its log", Style::new().fg(DIM)), Some(format!("#job:{}", job.id)));
+    } else if job.status != "completed" {
+        state(rows, Line::styled(format!("Log appears when the job finishes (polling every {} s)", crate::app::POLL_SECS), Style::new().fg(Color::Yellow)), None);
+    } else if let Some(e) = app.log_errors.get(&job.id) {
+        state(rows, Line::styled(format!("Couldn't load the log: {e} — press r to retry"), Style::new().fg(Color::Red)), None);
+    } else if app.logs_pending.contains_key(&job.id) && !app.logs_loading.contains(&job.id) {
+        state(rows, Line::styled("The log isn't available yet; trying again shortly", Style::new().fg(Color::Yellow)), None);
+    } else {
+        state(rows, Line::styled(format!("{} Fetching log…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)), None);
+    }
+    None
+}
+
+/// Steps with durations; clicking one jumps to its part of the log (or loads the log).
+fn steps_lines(job: &Job, log: Option<&ParsedLog>, w: usize, rows: &mut Vec<DetailRow>) {
+    section(rows, "Steps", w);
+    if job.steps.is_empty() {
+        rows.push((Line::styled("No steps reported yet.", Style::new().fg(DIM).italic()), Vec::new()));
+    }
+    let num_w = job.steps.iter().map(|s| s.number.to_string().len()).max().unwrap_or(1);
+    for (i, s) in job.steps.iter().enumerate() {
+        let outcome = rest_outcome(&s.status, s.conclusion.as_deref());
+        let right = match (s.conclusion.as_deref(), elapsed(s.started_at.as_deref(), s.completed_at.as_deref())) {
+            (Some("skipped"), _) => "skipped".to_string(),
+            (_, Some(d)) if s.status != "queued" && s.status != "pending" => fmt_duration(d),
+            _ => s.status.replace('_', " "),
+        };
+        let name = truncate(&s.name, w.saturating_sub(num_w + right.width() + 7));
+        let pad = w.saturating_sub(num_w + name.width() + right.width() + 5);
+        let failed = outcome_rank(&outcome) == 0;
+        let link = match log.and_then(|l| l.step_first.get(i).copied().flatten()) {
+            Some(line) => Some(format!("#line:{line}")),
+            None if log.is_none() && job.status == "completed" => Some(format!("#job:{}", job.id)),
+            None => None,
+        };
+        rows.push((
+            Line::from(vec![
+                Span::raw(" "),
+                ci_icon(Some(&outcome)),
+                Span::styled(format!(" {:>num_w$} ", s.number), Style::new().fg(DIM)),
+                Span::styled(name, if failed { Style::new().fg(Color::Red).bold() } else { Style::new() }),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(right, Style::new().fg(if s.status == "in_progress" { Color::Yellow } else { DIM })),
+            ]),
+            full_row_link(&link),
+        ));
+    }
+}
+
+/// The log line an annotation points at: the error or warning row carrying its message.
+fn annotation_line(log: &ParsedLog, a: &Annotation) -> Option<usize> {
+    let msg = a.message.lines().next().unwrap_or("").trim();
+    let targets = if a.annotation_level == "warning" { &log.warnings } else { &log.errors };
+    targets.iter().copied().find(|&i| !msg.is_empty() && log.lines[i].plain.contains(msg)).or_else(|| targets.first().copied())
+}
+
+fn annotation_lines(job: &Job, anns: &[Annotation], log: Option<&ParsedLog>, w: usize, rows: &mut Vec<DetailRow>) {
+    section(rows, &format!("Annotations ({})", anns.len()), w);
+    for a in anns {
+        let (outcome, color) = match a.annotation_level.as_str() {
+            "failure" => ("FAILURE", Color::Red),
+            "warning" => ("PENDING", Color::Yellow),
+            _ => ("NEUTRAL", ACCENT),
+        };
+        let icon = if a.annotation_level == "warning" { Span::styled("!", Style::new().fg(Color::Yellow)) } else { ci_icon(Some(outcome)) };
+        let loc = match a.start_line {
+            Some(l) if l > 0 => format!("{}:{l}", a.path),
+            _ => a.path.clone(),
+        };
+        let msg = match &a.title {
+            Some(t) if !t.is_empty() && !a.message.starts_with(t.as_str()) => format!("{t}: {}", a.message),
+            _ => a.message.clone(),
+        };
+        let link = match log {
+            Some(l) => annotation_line(l, a).map(|i| format!("#line:{i}")),
+            None if job.status == "completed" => Some(format!("#job:{}", job.id)),
+            None => None,
+        };
+        let msg = truncate(msg.lines().next().unwrap_or(""), w.saturating_sub(loc.width() + 6));
+        rows.push((
+            Line::from(vec![
+                Span::raw(" "),
+                icon,
+                Span::raw(" "),
+                Span::styled(loc, Style::new().fg(Color::Magenta)),
+                Span::raw("  "),
+                Span::styled(msg, Style::new().fg(color)),
+            ]),
+            full_row_link(&link),
+        ));
+    }
+}
+
+/// `HH:MM:SS` (UTC) of unix seconds.
+fn clock(t: i64) -> String {
+    let s = t.rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// Cut styled spans to `max` columns, ending with `…` when something was cut.
+fn clip_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.width()).sum();
+    if total <= max {
+        return spans;
+    }
+    let mut out = Vec::new();
+    let mut w = 0;
+    for s in spans {
+        let sw = s.width();
+        if w + sw < max {
+            w += sw;
+            out.push(s);
+            continue;
+        }
+        let mut text = String::new();
+        for c in s.content.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw + 1 > max {
+                break;
+            }
+            text.push(c);
+            w += cw;
+        }
+        out.push(Span::styled(text, s.style));
+        break;
+    }
+    out.push(Span::styled("…", Style::new().fg(DIM)));
+    out
+}
+
+/// One log line as a row: fold headers get ▸/▾, a line count and the step they start.
+fn log_row(log: &ParsedLog, i: usize, view: &LogView, steps: &[Step], w: usize) -> DetailRow {
+    let line = &log.lines[i];
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if view.timestamps {
+        let ts = line.ts.map(clock).unwrap_or_else(|| " ".repeat(8));
+        spans.push(Span::styled(format!("{ts}  "), Style::new().fg(DIM)));
+        used += 10;
+    }
+    let mut links = Vec::new();
+    if let (Kind::Group, Some(g)) = (line.kind, line.group) {
+        let group = &log.groups[g];
+        let folded = view.folds.contains(&g);
+        let n = log.lines[group.start + 1..=group.end].iter().filter(|l| l.kind != Kind::EndGroup).count();
+        // Name the step on the group that starts it.
+        let starts_step = line.step.filter(|_| g == 0 || log.lines[log.groups[g - 1].start].step != line.step);
+        let mut suffix = match starts_step.and_then(|s| steps.get(s)) {
+            Some(s) => {
+                let d = elapsed(s.started_at.as_deref(), s.completed_at.as_deref()).map(fmt_duration).unwrap_or_default();
+                format!("{} · {d}", truncate(&s.name, 32))
+            }
+            None => String::new(),
+        };
+        if folded && n > 0 {
+            suffix = format!("{suffix}  ({n} line{})", if n == 1 { "" } else { "s" }).trim_start().to_string();
+        }
+        let icon_color = if group.has_error { Color::Red } else { ACCENT };
+        spans.push(Span::styled(if folded { "▸ " } else { "▾ " }, Style::new().fg(icon_color).bold()));
+        let title = truncate(&group.title, w.saturating_sub(used + suffix.width() + 4));
+        let pad = w.saturating_sub(used + 2 + title.width() + suffix.width() + 1);
+        spans.push(Span::styled(title, Style::new().bold()));
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(suffix, Style::new().fg(DIM)));
+        links.push((0, u16::MAX, format!("#fold:{g}")));
+    } else {
+        if line.group.is_some() {
+            spans.push(Span::raw("  "));
+            used += 2;
+        }
+        let (base, label) = match line.kind {
+            Kind::Error => (Style::new().fg(Color::Red), "Error: "),
+            Kind::Warning => (Style::new().fg(Color::Yellow), "Warning: "),
+            Kind::Notice => (Style::new().fg(Color::Cyan), "Notice: "),
+            Kind::Debug => (Style::new().fg(DIM), ""),
+            Kind::Command | Kind::Section => (Style::new().bold(), ""),
+            _ => (Style::new(), ""),
+        };
+        let mut content = Vec::new();
+        if !label.is_empty() {
+            content.push(Span::styled(label, base.bold()));
+        }
+        content.extend(ansi_spans(&line.text, base));
+        spans.extend(clip_spans(content, w.saturating_sub(used)));
+    }
+    let hit = view.search.as_ref().is_some_and(|s| s.hits.binary_search(&i).is_ok());
+    let row = Line::from(spans);
+    let row = if view.cursor == Some(i) {
+        row.style(Style::new().bg(Color::Indexed(238)))
+    } else if hit {
+        row.style(Style::new().bg(Color::Indexed(58)))
+    } else {
+        row
+    };
+    (row, links)
+}
+
+/// Render `pre` rows followed by the shown log's visible lines as one scrolling region.
+/// Only the rows on screen are built, so a 200k-line log costs O(height) per frame.
+fn render_actions_pane(f: &mut Frame, app: &mut App, area: Rect, pre: &[DetailRow], log_job: Option<u64>) {
+    let height = area.height as usize;
+    if let Some(job) = log_job {
+        app.sync_log_view(job);
+    }
+    let log_len = if log_job.is_some() { app.log_view.visible.len() } else { 0 };
+    let total = pre.len() + log_len;
+    if let Some(line) = app.log_view.scroll_to.take()
+        && log_job.is_some()
+    {
+        let p = app.log_view.visible.partition_point(|&v| v < line);
+        app.detail_scroll = (pre.len() + p).saturating_sub(height / 3);
+    }
+    let max_scroll = total.saturating_sub(height);
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    let scroll = app.detail_scroll;
+    let pad = text_pad();
+    let text_area = Rect::new(area.x + pad, area.y, area.width.saturating_sub(pad + 1), area.height);
+    let w = text_area.width as usize;
+    let steps: Vec<Step> = app.selected_job().map(|j| j.steps.clone()).unwrap_or_default();
+    let log = log_job.and_then(|j| app.logs.get(&j)).map(|(l, _)| l);
+    let mut lines = Vec::new();
+    let mut links = Vec::new();
+    app.hits.log_top_line = None;
+    for row in scroll..(scroll + height).min(total) {
+        if let Some((l, k)) = pre.get(row) {
+            lines.push(l.clone());
+            links.push(k.clone());
+        } else if let Some(log) = log {
+            let i = app.log_view.visible[row - pre.len()];
+            app.hits.log_top_line.get_or_insert(i);
+            let (l, k) = log_row(log, i, &app.log_view, &steps, w);
+            lines.push(l);
+            links.push(k);
+        }
+    }
+    f.render_widget(Paragraph::new(lines), text_area);
     if max_scroll > 0 {
-        let mut sb = ScrollbarState::new(max_scroll).position(app.detail_scroll);
+        let mut sb = ScrollbarState::new(max_scroll).position(scroll);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None).thumb_style(Style::new().fg(ACCENT)),
-            content,
+            area,
             &mut sb,
         );
+    }
+    app.hits.detail = Some(area);
+    app.hits.detail_max_scroll = max_scroll;
+    app.hits.detail_height = height;
+    app.hits.detail_links = links;
+    app.hits.detail_links_from = scroll;
+}
+
+/// Render a scrollable region of rows with a scrollbar; returns (max scroll, per-row links).
+fn render_rows(f: &mut Frame, area: Rect, rows: &[DetailRow], scroll: &mut usize) -> (usize, Vec<Vec<(u16, u16, String)>>) {
+    let height = area.height as usize;
+    let max_scroll = rows.len().saturating_sub(height);
+    *scroll = (*scroll).min(max_scroll);
+    let visible: Vec<Line> = rows.iter().skip(*scroll).take(height).map(|(l, _)| l.clone()).collect();
+    let pad = text_pad();
+    let text_area = Rect::new(area.x + pad, area.y, area.width.saturating_sub(pad + 1), area.height);
+    f.render_widget(Paragraph::new(visible), text_area);
+    if max_scroll > 0 {
+        let mut sb = ScrollbarState::new(max_scroll).position(*scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None).thumb_style(Style::new().fg(ACCENT)),
+            area,
+            &mut sb,
+        );
+    }
+    (max_scroll, rows.iter().map(|(_, l)| l.clone()).collect())
+}
+
+/// Draw the ready images over the rows reserved for them in a `render_rows` region. Partly
+/// scrolled-out images are cropped to the rows on screen. An image still being encoded for
+/// this size, or any image while a modal is open (its cells can't be dimmed), is a `▒` box.
+fn render_images(f: &mut Frame, area: Rect, placements: &[ImagePlacement], scroll: usize, store: &mut ImageStore, modal_open: bool) {
+    let pad = text_pad();
+    let text_area = Rect::new(area.x + pad, area.y, area.width.saturating_sub(pad + 1), area.height);
+    let height = text_area.height as usize;
+    for p in placements {
+        if p.row + p.rows as usize <= scroll || p.row >= scroll + height || !matches!(store.look(&p.key), Look::Ready(_)) {
+            continue;
+        }
+        let y = p.row as isize - scroll as isize;
+        let proto = if modal_open { None } else { store.proto(&p.key, Size::new(p.cols, p.rows)) };
+        match proto {
+            Some(proto) => f.render_widget(SlicedImage::new(proto, SignedPosition { x: p.x as i16, y: y as i16 }), text_area),
+            None => image_box(f.buffer_mut(), text_area, Rect::new(p.x, 0, p.cols, p.rows), y, &p.alt),
+        }
+    }
+}
+
+/// A dim `▒` box with the alt text in the middle, standing in for an image. `r` is relative to
+/// `area` with its top at row `y` (negative when scrolled partly out).
+fn image_box(buf: &mut Buffer, area: Rect, r: Rect, y: isize, alt: &str) {
+    let w = r.width.min(area.width.saturating_sub(r.x));
+    let label = truncate(alt, (w as usize).saturating_sub(2));
+    let mid = r.height as isize / 2;
+    for row in 0..r.height as isize {
+        let sy = y + row;
+        if sy < 0 || sy >= area.height as isize {
+            continue;
+        }
+        let line = if row == mid {
+            let left = (w as usize).saturating_sub(label.width()) / 2;
+            let right = (w as usize).saturating_sub(left + label.width());
+            Line::from(vec![Span::styled("▒".repeat(left), Style::new().fg(DIM)), Span::styled(label.clone(), Style::new().fg(Color::Gray)), Span::styled("▒".repeat(right), Style::new().fg(DIM))])
+        } else {
+            Line::styled("▒".repeat(w as usize), Style::new().fg(DIM))
+        };
+        buf.set_line(area.x + r.x, area.y + sy as u16, &line, w);
+    }
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
+    let d = app.selected_detail();
+    let count = |t: Tab| -> String {
+        let Some(d) = d else { return String::new() };
+        match t {
+            Tab::Description => String::new(),
+            Tab::Conversation => format!(" {}", d.comments.iter().count()),
+            Tab::Changes => format!(" {}", d.changed_files),
+            Tab::Commits => format!(" {}", d.commits.total_count),
+            Tab::Checks => d.rollup().map(|r| format!(" {}", r.contexts.iter().count())).unwrap_or_default(),
+            Tab::Actions => app.current_runs().map(|e| format!(" {}", e.runs.iter().filter(|r| r.head_sha == e.sha).count())).unwrap_or_default(),
+            Tab::Reviews => format!(" {}", d.reviews.iter().filter(|r| r.state != "COMMENTED" || !clean_body(&r.body).trim().is_empty()).count() + d.review_threads.iter().count()),
+        }
+    };
+    let ci = d.and_then(|d| d.rollup()).map(|r| r.state.clone());
+    // The worst outcome among the runs, for the Actions tab's icon.
+    let worst = app.current_runs().and_then(|e| {
+        let outcomes = e.runs.iter().filter(|r| r.head_sha == e.sha).map(|r| rest_outcome(r.status(), r.conclusion.as_deref()));
+        outcomes.min_by_key(|o| outcome_rank(o))
+    });
+    let counts: Vec<String> = Tab::ALL.into_iter().map(count).collect();
+    let mut x = area.x;
+    let mut spans = Vec::new();
+    for (i, t) in Tab::ALL.into_iter().enumerate() {
+        let active = t == app.tab;
+        let mut label = format!(" {} {}{} ", i + 1, t.label(), counts[i]);
+        if t == Tab::Checks && ci.is_some() {
+            label.push_str(&ci_icon(ci.as_deref()).content);
+            label.push(' ');
+        }
+        if t == Tab::Actions && worst.is_some() {
+            label.push_str(&ci_icon(worst.as_deref()).content);
+            label.push(' ');
+        }
+        let w = label.width() as u16;
+        if x + w > area.right() {
+            break;
+        }
+        let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
+        spans.push(Span::styled(label, style));
+        app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::SetTab(t)));
+        x += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let toggle = if app.info_collapsed() { " ▾ info " } else { " ▴ info " };
+    let tw = toggle.width() as u16;
+    if x + tw < area.right() {
+        let r = Rect::new(area.right() - tw, area.y, tw, 1);
+        f.render_widget(Paragraph::new(toggle).style(Style::new().fg(DIM)), r);
+        app.hits.buttons.push((r, Action::ToggleInfo));
     }
 }
 
@@ -552,7 +1609,7 @@ fn push_wrapped(rows: &mut Vec<DetailRow>, line: Line<'static>, width: usize, in
 }
 
 fn section(rows: &mut Vec<DetailRow>, title: &str, width: usize) {
-    rows.push((Line::raw(""), Vec::new()));
+    gap(rows);
     let label = format!("── {title} ");
     let fill = width.saturating_sub(label.width());
     rows.push((Line::from(vec![Span::styled(label, Style::new().fg(ACCENT).bold()), Span::styled("─".repeat(fill), Style::new().fg(DIM))]), Vec::new()));
@@ -570,7 +1627,8 @@ fn summary_lines(p: &PrSummary, w: usize, rows: &mut Vec<DetailRow>) {
     ));
 }
 
-fn detail_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
+/// PR info header, shown above the tabs.
+fn info_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
     let gray = Style::new().fg(Color::Gray);
     push_wrapped(rows, Line::styled(d.title.clone(), Style::new().bold()), w, "", None);
     let mut l = vec![state_badge(&d.state, d.is_draft), Span::raw(" ")];
@@ -593,7 +1651,7 @@ fn detail_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
         "",
         None,
     );
-    rows.push((Line::raw(""), Vec::new()));
+    gap(rows);
 
     let field = |name: &str| Span::styled(format!("{name:<11}"), Style::new().fg(DIM));
     let labels: Vec<_> = d.labels.iter().collect();
@@ -615,8 +1673,12 @@ fn detail_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
         push_wrapped(rows, Line::from(vec![field("Awaiting"), Span::styled(reviewers.join(", "), Style::new().fg(Color::Yellow))]), w, "           ", None);
     }
     rows.push((Line::from(vec![field("Review"), review_span(d.review_decision.as_deref())]), Vec::new()));
+    let ci = match d.rollup() {
+        Some(r) => vec![field("Checks"), ci_icon(Some(&r.state)), Span::styled(format!(" {}", r.state.to_lowercase()), gray)],
+        None => vec![field("Checks"), Span::styled("none", gray)],
+    };
+    rows.push((Line::from(ci), Vec::new()));
 
-    // Mergeability.
     let (merge_icon, merge_text, merge_color) = merge_status(d);
     rows.push((Line::from(vec![field("Merge"), Span::styled(format!("{merge_icon} {merge_text}"), Style::new().fg(merge_color))]), Vec::new()));
     let methods: Vec<&str> = [
@@ -627,69 +1689,66 @@ fn detail_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
     .into_iter()
     .filter_map(|(ok, n)| ok.then_some(n))
     .collect();
-    rows.push((Line::from(vec![field("Methods"), Span::styled(methods.join(" · "), gray)]), Vec::new()));
+    let mut m = vec![field("Methods"), Span::styled(methods.join(" · "), gray)];
     if let Some(p) = &d.repository.viewer_permission {
-        rows.push((Line::from(vec![field("Access"), Span::styled(p.to_lowercase(), gray)]), Vec::new()));
+        m.push(Span::styled(format!("   (you: {})", p.to_lowercase()), Style::new().fg(DIM)));
     }
+    rows.push((Line::from(m), Vec::new()));
+}
 
-    // Checks.
-    if let Some(rollup) = d.rollup() {
-        let mut checks: Vec<_> = rollup.contexts.iter().collect();
-        let rank = |o: &str| match o {
-            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => 0,
-            "PENDING" | "EXPECTED" => 1,
-            "SUCCESS" => 2,
-            _ => 3,
-        };
-        checks.sort_by_key(|c| (rank(&c.outcome()), c.label()));
-        let (mut pass, mut fail, mut pend) = (0, 0, 0);
-        for c in &checks {
-            match rank(&c.outcome()) {
-                0 => fail += 1,
-                1 => pend += 1,
-                2 => pass += 1,
-                _ => {}
-            }
-        }
-        section(rows, "Checks", w);
-        rows.push((
-            Line::from(vec![
-                ci_icon(Some(&rollup.state)),
-                Span::raw(" "),
-                Span::styled(format!("{pass} passed"), Style::new().fg(Color::Green)),
-                Span::raw(" · "),
-                Span::styled(format!("{fail} failed"), Style::new().fg(if fail > 0 { Color::Red } else { DIM })),
-                Span::raw(" · "),
-                Span::styled(format!("{pend} pending"), Style::new().fg(if pend > 0 { Color::Yellow } else { DIM })),
-                Span::styled("   (click a check to open it)", Style::new().fg(DIM)),
-            ]),
-            Vec::new(),
-        ));
-        for c in checks {
-            let link = c.url().map(String::from);
-            let label = truncate(&c.label(), w.saturating_sub(4));
-            let style = if link.is_some() { Style::new().add_modifier(Modifier::UNDERLINED) } else { Style::new() };
-            rows.push((Line::from(vec![Span::raw("  "), ci_icon(Some(&c.outcome())), Span::raw(" "), Span::styled(label, style)]), full_row_link(&link)));
-        }
-    }
-
-    section(rows, "Description", w);
+fn description_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
     if clean_body(&d.body).trim().is_empty() {
         rows.push((Line::styled("No description provided.", Style::new().fg(DIM).italic()), Vec::new()));
     } else {
-        body_lines(&d.body, &d.body_html, w, "", rows);
+        body_lines(&d.body, &d.body_html, w, "", rows, img);
+        end_marker(rows);
     }
+}
 
-    // Timeline: comments, reviews and inline review comments, oldest first.
+fn review_state_span(state: &str) -> Span<'static> {
+    match state {
+        "APPROVED" => Span::styled("✓ approved", Style::new().fg(Color::Green).bold()),
+        "CHANGES_REQUESTED" => Span::styled("± requested changes", Style::new().fg(Color::Red).bold()),
+        "DISMISSED" => Span::styled("reviewed (dismissed)", Style::new().fg(DIM)),
+        "PENDING" => Span::styled("pending review", Style::new().fg(DIM)),
+        _ => Span::styled("commented", Style::new().fg(Color::Gray)),
+    }
+}
+
+/// One timeline entry: a header line and its rendered body.
+#[allow(clippy::too_many_arguments)]
+fn entry(rows: &mut Vec<DetailRow>, w: usize, author: &str, what: Span<'static>, ts: &str, body: &str, html: &str, img: &mut Imgs) {
+    gap(rows);
+    push_wrapped(
+        rows,
+        Line::from(vec![
+            Span::styled("▍", Style::new().fg(ACCENT)),
+            Span::styled(author.to_string(), Style::new().fg(Color::Blue).bold()),
+            Span::raw(" "),
+            what,
+            Span::styled(format!(" · {} ago", ago(ts)), Style::new().fg(DIM)),
+        ]),
+        w,
+        "▍ ",
+        None,
+    );
+    if !clean_body(body).trim().is_empty() {
+        body_lines(body, html, w, "▍ ", rows, img);
+    }
+}
+
+fn end_marker(rows: &mut Vec<DetailRow>) {
+    gap(rows);
+    rows.push((Line::styled("— end —", Style::new().fg(DIM)).centered(), Vec::new()));
+}
+
+/// Comments plus review verdicts, oldest first (inline review comments live in Reviews).
+fn conversation_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
     enum Item<'a> {
         Comment(&'a crate::github::Comment),
         Review(&'a crate::github::Review),
-        Inline(&'a crate::github::ReviewThread, &'a crate::github::Comment),
     }
-    let mut items: Vec<(&str, Item)> = Vec::new();
-    for c in d.comments.iter() {
-        items.push((&c.created_at, Item::Comment(c)));
-    }
+    let mut items: Vec<(&str, Item)> = d.comments.iter().map(|c| (c.created_at.as_str(), Item::Comment(c))).collect();
     for r in d.reviews.iter() {
         // Empty "COMMENTED" reviews are just containers for inline comments.
         if r.state == "COMMENTED" && clean_body(&r.body).trim().is_empty() {
@@ -697,60 +1756,245 @@ fn detail_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
         }
         items.push((r.submitted_at.as_deref().unwrap_or(""), Item::Review(r)));
     }
-    for t in d.review_threads.iter() {
-        for c in t.comments.iter() {
-            items.push((&c.created_at, Item::Inline(t, c)));
-        }
-    }
     items.sort_by(|a, b| a.0.cmp(b.0));
-    section(rows, &format!("Activity ({})", items.len()), w);
     if items.is_empty() {
         rows.push((Line::styled("No comments yet. Press c to add one.", Style::new().fg(DIM).italic()), Vec::new()));
+        return;
     }
     for (ts, item) in items {
-        rows.push((Line::raw(""), Vec::new()));
-        let (author, what, body, html): (&str, Span<'static>, &str, &str) = match item {
-            Item::Comment(c) => (login_of(&c.author), Span::styled("commented", gray), &c.body, &c.body_html),
-            Item::Review(r) => {
-                let s = match r.state.as_str() {
-                    "APPROVED" => Span::styled("✓ approved", Style::new().fg(Color::Green).bold()),
-                    "CHANGES_REQUESTED" => Span::styled("± requested changes", Style::new().fg(Color::Red).bold()),
-                    "DISMISSED" => Span::styled("reviewed (dismissed)", Style::new().fg(DIM)),
-                    _ => Span::styled("reviewed", gray),
-                };
-                (login_of(&r.author), s, &r.body, &r.body_html)
-            }
-            Item::Inline(t, c) => {
-                let loc = match t.line {
-                    Some(l) => format!("on {}:{l}", t.path),
-                    None => format!("on {}", t.path),
-                };
-                let mut s = loc;
-                if t.is_resolved {
-                    s.push_str(" ✓ resolved");
-                }
-                (login_of(&c.author), Span::styled(s, Style::new().fg(Color::Yellow)), &c.body, &c.body_html)
-            }
-        };
-        push_wrapped(
-            rows,
-            Line::from(vec![
-                Span::styled("▍", Style::new().fg(ACCENT)),
-                Span::styled(author.to_string(), Style::new().fg(Color::Blue).bold()),
-                Span::raw(" "),
-                what,
-                Span::styled(format!(" · {} ago", ago(ts)), Style::new().fg(DIM)),
-            ]),
-            w,
-            "▍ ",
-            None,
-        );
-        if !clean_body(body).trim().is_empty() {
-            body_lines(body, html, w, "▍ ", rows);
+        match item {
+            Item::Comment(c) => entry(rows, w, login_of(&c.author), Span::styled("commented", Style::new().fg(Color::Gray)), ts, &c.body, &c.body_html, img),
+            Item::Review(r) => entry(rows, w, login_of(&r.author), review_state_span(&r.state), ts, &r.body, &r.body_html, img),
         }
     }
-    rows.push((Line::raw(""), Vec::new()));
-    rows.push((Line::styled("— end —", Style::new().fg(DIM)).centered(), Vec::new()));
+    end_marker(rows);
+}
+
+fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
+    // Latest verdict per reviewer: a later COMMENTED doesn't override an approval.
+    let mut latest: Vec<(String, String)> = Vec::new();
+    for r in d.reviews.iter() {
+        let who = login_of(&r.author).to_string();
+        match latest.iter_mut().find(|(a, _)| *a == who) {
+            Some(e) if r.state != "COMMENTED" => e.1 = r.state.clone(),
+            Some(_) => {}
+            None => latest.push((who, r.state.clone())),
+        }
+    }
+    let pending: Vec<_> = d.review_requests.iter().filter_map(|r| r.requested_reviewer.as_ref()).map(|r| r.display()).collect();
+    rows.push((Line::from(vec![Span::styled("Reviewers", Style::new().bold()), Span::raw("  "), review_span(d.review_decision.as_deref())]), Vec::new()));
+    if latest.is_empty() && pending.is_empty() {
+        rows.push((Line::styled("  No reviews yet.", Style::new().fg(DIM).italic()), Vec::new()));
+    }
+    for (who, state) in &latest {
+        rows.push((Line::from(vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), review_state_span(state)]), Vec::new()));
+    }
+    for who in &pending {
+        rows.push((Line::from(vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), Span::styled("◔ awaiting review", Style::new().fg(Color::Yellow))]), Vec::new()));
+    }
+
+    let with_body: Vec<_> = d.reviews.iter().filter(|r| !clean_body(&r.body).trim().is_empty()).collect();
+    if !with_body.is_empty() {
+        section(rows, &format!("Review summaries ({})", with_body.len()), w);
+        for r in with_body {
+            entry(rows, w, login_of(&r.author), review_state_span(&r.state), r.submitted_at.as_deref().unwrap_or(""), &r.body, &r.body_html, img);
+        }
+    }
+
+    let threads: Vec<_> = d.review_threads.iter().collect();
+    let open = threads.iter().filter(|t| !t.is_resolved).count();
+    section(rows, &format!("Inline threads ({} · {open} unresolved)", threads.len()), w);
+    if threads.is_empty() {
+        rows.push((Line::styled("No inline review comments.", Style::new().fg(DIM).italic()), Vec::new()));
+    }
+    // Unresolved threads first, then by file.
+    let mut threads = threads;
+    threads.sort_by(|a, b| (a.is_resolved, &a.path, a.line).cmp(&(b.is_resolved, &b.path, b.line)));
+    for t in threads {
+        gap(rows);
+        let loc = match t.line {
+            Some(l) => format!("{}:{l}", t.path),
+            None => t.path.clone(),
+        };
+        let (mark, color) = if t.is_resolved { ("✓ resolved", Color::Green) } else { ("● open", Color::Yellow) };
+        push_wrapped(
+            rows,
+            Line::from(vec![Span::styled(format!("{mark}  "), Style::new().fg(color)), Span::styled(loc, Style::new().fg(Color::Magenta).bold())]),
+            w,
+            "   ",
+            None,
+        );
+        for c in t.comments.iter() {
+            entry(rows, w, login_of(&c.author), Span::raw(""), &c.created_at, &c.body, &c.body_html, img);
+        }
+    }
+    end_marker(rows);
+}
+
+fn commits_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
+    let shown = d.commits.nodes.iter().flatten().count();
+    let mut head = vec![Span::styled(format!("{} commits", d.commits.total_count), Style::new().bold())];
+    if d.commits.total_count > shown {
+        head.push(Span::styled(format!("  (showing the latest {shown})"), Style::new().fg(DIM)));
+    }
+    head.push(Span::styled("   click a commit to open it", Style::new().fg(DIM)));
+    rows.push((Line::from(head), Vec::new()));
+    gap(rows);
+    for c in d.commits.nodes.iter().flatten().rev().map(|n| &n.commit) {
+        let link = Some(c.url.clone());
+        let headline = truncate(&c.message_headline, w.saturating_sub(12));
+        rows.push((
+            Line::from(vec![
+                ci_icon(c.status_check_rollup.as_ref().map(|r| r.state.as_str())),
+                Span::raw(" "),
+                Span::styled(c.abbreviated_oid.clone(), Style::new().fg(Color::Yellow)),
+                Span::raw(" "),
+                Span::styled(headline, Style::new().bold()),
+            ]),
+            full_row_link(&link),
+        ));
+        let meta = format!("{} · {} ago", c.author(), ago(&c.committed_date));
+        if density() == Density::Compact {
+            // One line per commit: append the author and age to the headline row.
+            if let Some((line, _)) = rows.last_mut() {
+                line.spans.push(Span::styled(format!("  {meta}"), Style::new().fg(DIM)));
+            }
+        } else {
+            rows.push((Line::styled(format!("          {meta}"), Style::new().fg(DIM)), full_row_link(&link)));
+            if density() == Density::Comfortable {
+                rows.push((Line::raw(""), Vec::new()));
+            }
+        }
+    }
+}
+
+fn checks_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>) {
+    let Some(rollup) = d.rollup() else {
+        rows.push((Line::styled("No checks reported for the head commit.", Style::new().fg(DIM).italic()), Vec::new()));
+        return;
+    };
+    let mut checks: Vec<_> = rollup.contexts.iter().collect();
+    let rank = |o: &str| match o {
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => 0,
+        "PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" => 1,
+        "SUCCESS" => 2,
+        _ => 3,
+    };
+    checks.sort_by_key(|c| (rank(&c.outcome()), c.label()));
+    let (mut pass, mut fail, mut pend, mut other) = (0, 0, 0, 0);
+    for c in &checks {
+        match rank(&c.outcome()) {
+            0 => fail += 1,
+            1 => pend += 1,
+            2 => pass += 1,
+            _ => other += 1,
+        }
+    }
+    rows.push((
+        Line::from(vec![
+            ci_icon(Some(&rollup.state)),
+            Span::raw(" "),
+            Span::styled(format!("{pass} passed"), Style::new().fg(Color::Green)),
+            Span::raw(" · "),
+            Span::styled(format!("{fail} failed"), Style::new().fg(if fail > 0 { Color::Red } else { DIM })),
+            Span::raw(" · "),
+            Span::styled(format!("{pend} pending"), Style::new().fg(if pend > 0 { Color::Yellow } else { DIM })),
+            Span::raw(" · "),
+            Span::styled(format!("{other} skipped/neutral"), Style::new().fg(DIM)),
+        ]),
+        Vec::new(),
+    ));
+    rows.push((Line::styled("click a check to open its logs", Style::new().fg(DIM)), Vec::new()));
+    gap(rows);
+    for c in checks {
+        let link = c.url().map(String::from);
+        let outcome = c.outcome();
+        let label = truncate(&c.label(), w.saturating_sub(18));
+        let style = if link.is_some() { Style::new().add_modifier(Modifier::UNDERLINED) } else { Style::new() };
+        rows.push((
+            Line::from(vec![
+                Span::raw("  "),
+                ci_icon(Some(&outcome)),
+                Span::raw(" "),
+                Span::styled(label, style),
+                Span::styled(format!("  {}", outcome.to_lowercase()), Style::new().fg(DIM)),
+            ]),
+            full_row_link(&link),
+        ));
+    }
+}
+
+fn file_status(s: &str) -> (&'static str, Color) {
+    match s {
+        "added" => ("A", Color::Green),
+        "removed" => ("D", Color::Red),
+        "renamed" => ("R", Color::Blue),
+        "copied" => ("C", Color::Blue),
+        _ => ("M", Color::Yellow),
+    }
+}
+
+/// One file's header bar and patch with old/new line numbers.
+fn file_diff_lines(file: &FileDiff, w: usize, rows: &mut Vec<DetailRow>) {
+    let (letter, color) = file_status(&file.status);
+    let name = match &file.previous_filename {
+        Some(prev) => format!("{prev} → {}", file.filename),
+        None => file.filename.clone(),
+    };
+    let counts = format!("+{} −{} ", file.additions, file.deletions);
+    let name = truncate(&name, w.saturating_sub(counts.width() + 4));
+    let pad = w.saturating_sub(name.width() + counts.width() + 3);
+    let bar = Style::new().bg(Color::Indexed(237));
+    rows.push((
+        Line::from(vec![
+            Span::styled(format!(" {letter} "), bar.fg(color).bold()),
+            Span::styled(name, bar.fg(Color::White).bold()),
+            Span::styled(" ".repeat(pad), bar),
+            Span::styled(counts, bar.fg(Color::Gray)),
+        ]),
+        Vec::new(),
+    ));
+    let Some(patch) = &file.patch else {
+        rows.push((Line::styled("   Binary file, or the diff is too large to show here — open the PR in the browser.", Style::new().fg(DIM).italic()), Vec::new()));
+        return;
+    };
+    let num_w = 5;
+    let code_w = w.saturating_sub(num_w * 2 + 3);
+    let (mut old, mut new) = (0u64, 0u64);
+    for raw in patch.lines() {
+        let line = raw.replace('\t', "    ");
+        if let Some(rest) = line.strip_prefix("@@") {
+            // @@ -a,b +c,d @@ context
+            let mut parts = rest.split_whitespace();
+            let parse = |p: Option<&str>| p.and_then(|s| s.get(1..)?.split(',').next()?.parse::<u64>().ok()).unwrap_or(1);
+            old = parse(parts.next());
+            new = parse(parts.next());
+            gap(rows);
+            rows.push((Line::styled(truncate(&line, w), Style::new().fg(ACCENT).add_modifier(Modifier::DIM)), Vec::new()));
+            continue;
+        }
+        let (sign, code) = line.split_at(line.chars().next().map_or(0, char::len_utf8));
+        let (o, n, style) = match sign {
+            "+" => (String::new(), num(new, &mut new), Style::new().fg(Color::Green)),
+            "-" => (num(old, &mut old), String::new(), Style::new().fg(Color::Red)),
+            "\\" => (String::new(), String::new(), Style::new().fg(DIM)),
+            _ => (num(old, &mut old), num(new, &mut new), Style::new()),
+        };
+        rows.push((
+            Line::from(vec![
+                Span::styled(format!("{o:>num_w$} {n:>num_w$} │"), Style::new().fg(DIM)),
+                Span::styled(format!("{sign}{}", truncate(code, code_w)), style),
+            ]),
+            Vec::new(),
+        ));
+    }
+    end_marker(rows);
+}
+
+/// Format a line number and advance the counter.
+fn num(cur: u64, counter: &mut u64) -> String {
+    *counter = cur + 1;
+    cur.to_string()
 }
 
 fn merge_status(d: &PrDetail) -> (&'static str, String, Color) {
@@ -779,16 +2023,85 @@ fn full_row_link(link: &Option<String>) -> Vec<(u16, u16, String)> {
     link.iter().map(|u| (0, u16::MAX, u.clone())).collect()
 }
 
+/// Inline images for the row builders: what the store knows, and the placements found.
+struct Imgs<'a> {
+    store: &'a ImageStore,
+    out: Vec<ImagePlacement>,
+}
+
+impl<'a> Imgs<'a> {
+    fn new(store: &'a ImageStore) -> Self {
+        Self { store, out: Vec::new() }
+    }
+}
+
 /// Render a body from GitHub's rendered HTML, falling back to the raw markdown.
-fn body_lines(markdown: &str, html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>) {
-    if html.trim().is_empty() || !html_lines(html, w, indent, rows) {
+fn body_lines(markdown: &str, html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>, img: &mut Imgs) {
+    if html.trim().is_empty() || !html_lines(html, w, indent, rows, img) {
         markdown_lines(&clean_body(markdown), w, indent, rows);
     }
 }
 
-/// Render HTML to styled rows with clickable link ranges. Returns false if it couldn't be parsed.
-fn html_lines(html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>) -> bool {
+/// The `src` and alt text of an html2text line that holds one image and nothing else (the
+/// GitHub paragraph with a lone screenshot, often wrapped in a link to itself).
+fn lone_image(tl: &html2text::render::TaggedLine<Vec<html2text::render::RichAnnotation>>) -> Option<(String, String)> {
     use html2text::render::RichAnnotation as A;
+    let mut found: Option<(String, String)> = None;
+    for ts in tl.tagged_strings() {
+        let src = ts.tag.iter().find_map(|a| if let A::Image(src) = a { Some(src) } else { None });
+        match (src, &mut found) {
+            (Some(src), None) => found = Some((src.clone(), ts.s.trim().to_string())),
+            (Some(src), Some((f, alt))) if f == src => alt.push_str(ts.s.trim()),
+            _ if ts.s.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    found
+}
+
+/// The rows for an image alone on its line, or `None` to keep the `▣ alt` label: images are
+/// off, it's a badge (`width`/`height` under 64 px, or SVG), or it was skipped or failed.
+fn image_rows(src: &str, alt: &str, attrs: &images::ImgAttrs, indent: &str, width: usize, base: usize, img: &mut Imgs) -> Option<Vec<DetailRow>> {
+    let small = |v: Option<u32>| v.is_some_and(|v| v < images::MIN_PX);
+    let svg = images::looks_svg(src) || attrs.canonical.as_deref().is_some_and(images::looks_svg);
+    let (key, url, _) = images::canonical(src);
+    if !img.store.inline_ok() || small(attrs.width) || small(attrs.height) || svg || url.is_none() {
+        return None;
+    }
+    let bar = || Span::styled(indent.to_string(), Style::new().fg(ACCENT));
+    let link = vec![(0, u16::MAX, format!("#image:{key}"))];
+    let x = indent.width() as u16;
+    let alt = if alt.is_empty() { "image".to_string() } else { alt.to_string() };
+    let mut placement = ImagePlacement { key: key.clone(), row: base, rows: 1, cols: width as u16, x, alt: alt.clone() };
+    match img.store.look(&key) {
+        Look::Ready(dims) => {
+            let size = images::fit(dims, img.store.font(), width as u16, img.store.max_rows);
+            if size.height == 0 {
+                return None;
+            }
+            (placement.rows, placement.cols) = (size.height, size.width);
+            img.out.push(placement);
+            Some((0..size.height).map(|_| (Line::from(bar()), link.clone())).collect())
+        }
+        Look::Pending => {
+            img.out.push(placement);
+            let label = vec![bar(), Span::styled(format!("▣ {alt}"), Style::new().fg(Color::Magenta)), Span::styled(" (loading…)", Style::new().fg(DIM))];
+            Some(vec![(Line::from(label), link)])
+        }
+        Look::Failed(e) => {
+            let note = format!(" (failed: {})", truncate(&e, 60));
+            let label = vec![bar(), Span::styled(format!("▣ {alt}"), Style::new().fg(Color::Magenta)), Span::styled(note, Style::new().fg(DIM))];
+            Some(vec![(Line::from(label), vec![(0, u16::MAX, key)])])
+        }
+        Look::Skipped(_) => None,
+    }
+}
+
+/// Render HTML to styled rows with clickable link ranges. Returns false if it couldn't be parsed.
+fn html_lines(html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>, img: &mut Imgs) -> bool {
+    use html2text::render::RichAnnotation as A;
+    // html2text drops the attributes that tell a screenshot from a badge.
+    let attrs = images::img_attrs(html);
     // Images with no alt text would otherwise render as nothing; <sup>/<sub> render as ^{…}.
     let html = html.replace("alt=\"\"", "alt=\"image\"");
     let html = ["<sup>", "</sup>", "<sub>", "</sub>"].iter().fold(html, |h, t| h.replace(t, ""));
@@ -796,7 +2109,23 @@ fn html_lines(html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>) -> 
     let width = w.saturating_sub(indent_w).max(10);
     let Ok(lines) = html2text::config::rich().lines_from_read(html.as_bytes(), width) else { return false };
     let mut out: Vec<DetailRow> = Vec::new();
+    // Blank text, and not an image row (those are blank too, but carry a link).
+    let blank = |(l, links): &DetailRow| !links.iter().any(|(_, _, u)| u.starts_with("#image:")) && l.to_string().trim_start_matches(indent).trim().is_empty();
+    // The image the previous line was, so its alt text wrapping onto the next line is dropped.
+    let mut last_image: Option<String> = None;
     for tl in lines {
+        if let Some((src, alt)) = lone_image(&tl) {
+            if last_image.as_ref() == Some(&src) {
+                continue;
+            }
+            let a = attrs.get(&src).cloned().unwrap_or_default();
+            if let Some(image) = image_rows(&src, &alt, &a, indent, width, rows.len() + out.len(), img) {
+                out.extend(image);
+                last_image = Some(src);
+                continue;
+            }
+        }
+        last_image = None;
         let mut spans = vec![Span::styled(indent.to_string(), Style::new().fg(ACCENT))];
         let mut links = Vec::new();
         let mut x = indent_w;
@@ -840,13 +2169,13 @@ fn html_lines(html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>) -> 
             x += sw;
         }
         // Collapse runs of blank lines.
-        let blank = text.trim().is_empty();
-        if blank && out.last().is_none_or(|(l, _)| l.to_string().trim_start_matches(indent).trim().is_empty()) {
+        let row = (Line::from(spans), links);
+        if blank(&row) && out.last().is_none_or(blank) {
             continue;
         }
-        out.push((Line::from(spans), links));
+        out.push(row);
     }
-    while out.last().is_some_and(|(l, _)| l.to_string().trim_start_matches(indent).trim().is_empty()) {
+    while out.last().is_some_and(blank) {
         out.pop();
     }
     rows.extend(out);
@@ -960,8 +2289,8 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
 
 fn draw_scopes(f: &mut Frame, app: &mut App) {
     let Some(Modal::Scopes { filter, sel }) = &app.modal else { return };
-    let matches = scope_matches(&app.scopes, filter);
-    let area = centered(f.area(), 64, matches.len() as u16 + 7);
+    let matches = scope_matches(&app.scopes, filter, app.repo.is_some());
+    let area = centered(f.area(), 64, (matches.len() as u16 + 7).min(f.area().height * 2 / 3));
     f.render_widget(Clear, area);
     let block = modal_block("Choose scope");
     let inner = block.inner(area);
@@ -998,6 +2327,96 @@ fn draw_scopes(f: &mut Frame, app: &mut App) {
     }
     f.render_widget(Paragraph::new(lines), list);
     f.render_widget(Paragraph::new(Line::styled(" ↑↓ move · Enter / click select · Esc close", Style::new().fg(DIM))), hint);
+}
+
+fn draw_repos(f: &mut Frame, app: &mut App) {
+    let Some(Modal::Repos { filter, sel }) = &app.modal else { return };
+    let (filter, sel) = (filter.clone(), *sel);
+    let items = repo_items(app, &filter);
+    let area = centered(f.area(), 76, (items.len() as u16 + 7).min(f.area().height * 2 / 3));
+    f.render_widget(Clear, area);
+    let block = modal_block("Choose repository");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hits.modal = Some(area);
+    let [input, sep, list, hint] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let input_line = if filter.is_empty() {
+        Line::from(vec![Span::styled(" › ", Style::new().fg(ACCENT)), Span::styled("type to search repositories (owner/name)…", Style::new().fg(DIM))])
+    } else {
+        Line::from(vec![Span::styled(" › ", Style::new().fg(ACCENT)), Span::raw(filter.clone()), Span::styled("▏", Style::new().fg(ACCENT))])
+    };
+    f.render_widget(Paragraph::new(input_line), input);
+    f.render_widget(Paragraph::new("─".repeat(sep.width as usize)).style(Style::new().fg(DIM)), sep);
+
+    // Map the selectable index to a visual row, then scroll to keep it visible.
+    let mut sel_row = 0;
+    let mut k = 0;
+    for (row, it) in items.iter().enumerate() {
+        if it.value().is_some() {
+            if k == sel {
+                sel_row = row;
+            }
+            k += 1;
+        }
+    }
+    let h = list.height as usize;
+    let offset = if sel_row >= h { sel_row + 1 - h } else { 0 };
+    let w = list.width as usize;
+    let more = app.total > app.prs.len();
+    let count_text = |c: usize| if more { format!("{c}+ PRs") } else { format!("{c} PRs") };
+    let mut lines = Vec::new();
+    let mut k = items.iter().take(offset).filter(|i| i.value().is_some()).count();
+    for (row, it) in items.iter().enumerate().skip(offset).take(h) {
+        let y = list.y + (row - offset) as u16;
+        let selectable = it.value().is_some();
+        let selected = selectable && k == sel;
+        let active = it.value().is_some_and(|v| match (&v, &app.repo) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        });
+        let lead = vec![
+            Span::styled(if selected { "▌" } else { " " }, Style::new().fg(ACCENT)),
+            Span::styled(if active { "✓ " } else { "  " }, Style::new().fg(Color::Green)),
+        ];
+        let (mut spans, right): (Vec<Span>, String) = match it {
+            RepoItem::All { count } => (vec![Span::styled("All repositories", Style::new().bold())], if *count > 0 { count_text(*count) } else { String::new() }),
+            RepoItem::ThisPr(r, c) => (
+                vec![Span::styled("This PR's repo  ", Style::new().fg(Color::Yellow)), Span::styled(r.clone(), Style::new().bold())],
+                c.map(count_text).unwrap_or_default(),
+            ),
+            RepoItem::Header(t) => (vec![Span::styled(t.clone(), Style::new().fg(ACCENT).bold())], String::new()),
+            RepoItem::Repo { nwo, count, private, pushed } => {
+                let (owner, name) = nwo.split_once('/').unwrap_or(("", nwo));
+                let mut v = vec![Span::styled(format!("{owner}/"), Style::new().fg(DIM)), Span::styled(name.to_string(), Style::new().bold())];
+                if *private {
+                    v.push(Span::styled("  private", Style::new().fg(DIM)));
+                }
+                let right = match (count, pushed) {
+                    (Some(c), _) => count_text(*c),
+                    (None, Some(p)) => format!("pushed {} ago", ago(p)),
+                    _ => String::new(),
+                };
+                (v, right)
+            }
+            RepoItem::UseTyped(t) => (vec![Span::raw("Use "), Span::styled(format!("“{t}”"), Style::new().bold())], String::new()),
+            RepoItem::Note(n) => (vec![Span::styled(n.clone(), Style::new().fg(DIM).italic())], String::new()),
+        };
+        let used: usize = 3 + spans.iter().map(|s| s.width()).sum::<usize>();
+        let pad = w.saturating_sub(used + right.width() + 1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(right, Style::new().fg(DIM)));
+        let mut all = if matches!(it, RepoItem::Header(_) | RepoItem::Note(_)) { vec![Span::raw(" ")] } else { lead };
+        all.extend(spans);
+        let line = Line::from(all);
+        lines.push(if selected { line.style(Style::new().bg(Color::Indexed(238))) } else { line });
+        if selectable {
+            app.hits.modal_items.push((Rect::new(list.x, y, list.width, 1), k));
+            k += 1;
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    f.render_widget(Paragraph::new(Line::styled(" ↑↓ move · Enter / click select · e on a PR toggles its repo · Esc close", Style::new().fg(DIM))), hint);
 }
 
 fn draw_menu(f: &mut Frame, app: &mut App) {
@@ -1142,15 +2561,55 @@ fn draw_composer(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// One image fitted to (almost) the whole screen. Drawn after `dim()`, so its cells stay intact.
+fn draw_image_modal(f: &mut Frame, app: &mut App) {
+    let Some(Modal::Image { key, alt }) = &app.modal else { return };
+    let (key, alt) = (key.clone(), alt.clone());
+    let fa = f.area();
+    let area = centered(fa, fa.width.saturating_sub(4), fa.height.saturating_sub(4));
+    f.render_widget(Clear, area);
+    let block = modal_block(&truncate(&alt, (area.width as usize).saturating_sub(6)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hits.modal = Some(area);
+    let [pic, hint] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let message = |f: &mut Frame, text: String, color: Color| {
+        let r = Rect::new(pic.x, pic.y + pic.height / 2, pic.width, 1);
+        f.render_widget(Paragraph::new(Line::styled(text, Style::new().fg(color))).centered(), r);
+    };
+    let store = &mut app.images;
+    match store.look(&key) {
+        Look::Ready(dims) => {
+            let size = images::fit(dims, store.font(), pic.width, pic.height);
+            let (x, y) = ((pic.width - size.width) / 2, (pic.height - size.height) / 2);
+            match store.proto(&key, size) {
+                Some(proto) => f.render_widget(SlicedImage::new(proto, SignedPosition { x: x as i16, y: y as i16 }), pic),
+                None => image_box(f.buffer_mut(), pic, Rect::new(x, 0, size.width, size.height), y as isize, "rendering…"),
+            }
+        }
+        Look::Pending => {
+            store.want_now(&key, (pic.width, pic.height));
+            message(f, format!("{} Loading image…", SPINNER[app.tick % SPINNER.len()]), ACCENT);
+        }
+        Look::Failed(e) => message(f, format!("Couldn't load the image: {e} — o opens it in the browser"), Color::Red),
+        Look::Skipped(why) => message(f, format!("Not shown inline: {} — o opens it in the browser", why.label()), DIM),
+    }
+    store.pump(&app.client, &app.tx);
+    f.render_widget(Paragraph::new(Line::styled(" o / Enter open in browser · y copy URL · Esc close", Style::new().fg(DIM))), hint);
+}
+
 fn draw_help(f: &mut Frame, app: &mut App) {
     let rows: &[(&str, &str)] = &[
         ("", "Everywhere"),
         ("s / click scope", "Choose the scope (account, org, review queue…)"),
+        ("S / click repo chip", "Filter to one repository (type to search)"),
+        ("e", "Toggle the filter to the selected PR's repository"),
         ("f / click state", "Cycle Open → Closed → Merged → All"),
         ("r  F5", "Refresh now (auto-refreshes in the background)"),
         ("/", "Filter the loaded list by title, repo, author or #"),
         ("o", "Open the selected PR in your browser"),
         ("y", "Copy `gh pr checkout` command to clipboard"),
+        ("D / click ≡", "Display density: Comfortable → Cozy → Compact"),
         ("?", "This help · Ctrl+C quits"),
         ("", "List"),
         ("↑↓ j k  PgUp PgDn  g G", "Move selection"),
@@ -1159,17 +2618,33 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("Tab  h l  ← →  click", "Switch focus between list and details"),
         ("j k / wheel", "Scroll details (or move in the list when it has focus)"),
         ("J K", "Next / previous PR while reading details"),
+        ("1-7  [ ]  click tab", "Description · Conversation · Changes · Commits · Checks · Actions · Reviews"),
+        ("n p  ↑ ↓  click", "Pick a file in Changes (j k scroll its diff)"),
+        ("i", "Collapse / expand the PR info header"),
+        ("I / click img:", "Show / hide inline images (click one to enlarge, o opens it)"),
         ("c", "Comment (type @ for mention autocomplete)"),
         ("m", "Merge menu (methods allowed by the repo)"),
         ("a  /  R", "Approve  /  Request changes"),
         ("x", "Close or reopen the PR"),
         ("Space  .", "All actions"),
         ("Esc  q", "Back to the full list"),
+        ("", "Actions tab"),
+        ("n p  ↑ ↓  click", "Move in the runs/jobs tree (j k scroll the log)"),
+        ("Enter / click", "Fold a run's jobs · show a job's log"),
+        ("O", "Open the selected run or job in your browser"),
+        ("H", "Also show runs from earlier pushes"),
+        ("E  W", "Next error / warning in the log"),
+        ("z  Z  click ▸", "Fold the group at the cursor / all groups"),
+        ("t", "Show / hide log timestamps"),
+        ("Ctrl+F  n N", "Search the log · next / previous match"),
+        ("Esc", "Clear search, then back from a job to its run"),
         ("", "Mouse"),
         ("click", "Select rows, buttons, menu items, check links"),
         ("click outside", "Dismiss a popup"),
+        ("", "Images (config.toml)"),
+        ("images = …", "auto · kitty · sixel · iterm2 · halfblocks · off  (GH_PR_MANAGER_IMAGES)"),
     ];
-    let area = centered(f.area(), 76, rows.len() as u16 + 4);
+    let area = centered(f.area(), 88, rows.len() as u16 + 4);
     f.render_widget(Clear, area);
     let block = modal_block("Help");
     let inner = block.inner(area);
@@ -1203,6 +2678,103 @@ mod tests {
     #[test]
     fn strips_html_comments() {
         assert_eq!(clean_body("a<!-- x -->b\r\n\n\n\nc"), "ab\n\nc");
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(59), "59s");
+        assert_eq!(fmt_duration(61), "1m01s");
+        assert_eq!(fmt_duration(3661), "1h01m");
+    }
+
+    #[test]
+    fn maps_rest_outcomes() {
+        assert_eq!(rest_outcome("completed", Some("action_required")), "ACTION_REQUIRED");
+        assert_eq!(rest_outcome("in_progress", None), "IN_PROGRESS");
+    }
+
+    const SHOT: &str = "https://private-user-images.githubusercontent.com/1/2-0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0.png?jwt=x";
+    const KEY: &str = "https://github.com/user-attachments/assets/0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0";
+
+    fn store() -> ImageStore {
+        ImageStore::new(Some(ratatui_image::picker::Picker::halfblocks()), true, String::new())
+    }
+
+    fn build(html: &str, store: &ImageStore) -> (Vec<DetailRow>, Vec<ImagePlacement>) {
+        let mut rows = vec![(Line::raw("above"), Vec::new())];
+        let mut img = Imgs::new(store);
+        assert!(html_lines(html, 80, "", &mut rows, &mut img));
+        (rows, img.out)
+    }
+
+    fn lone(src: &str) -> String {
+        format!(r#"<p>Before</p><p><a href="{src}"><img src="{src}" alt="Screenshot" style="max-width: 100%;"></a></p><p>After</p>"#)
+    }
+
+    #[test]
+    fn lone_image_gets_a_placeholder_then_rows() {
+        let mut store = store();
+        let (rows, placements) = build(&lone(SHOT), &store);
+        assert_eq!(placements.len(), 1, "{rows:?}");
+        let p = &placements[0];
+        assert_eq!((p.key.as_str(), p.rows, p.alt.as_str()), (KEY, 1, "Screenshot"));
+        assert!(rows[p.row].0.to_string().contains("▣ Screenshot (loading…)"));
+        assert_eq!(rows[p.row].1, vec![(0, u16::MAX, format!("#image:{KEY}"))]);
+
+        // Once the size is known the image reserves its rows: 400×200 px at 10×20 px cells.
+        let image = std::sync::Arc::new(image::DynamicImage::new_rgba8(400, 200));
+        store.apply(images::ImageMsg::Loaded { key: KEY.into(), res: Ok(images::Decoded { dims: (400, 200), image, first: None }) });
+        let (rows, placements) = build(&lone(SHOT), &store);
+        let p = &placements[0];
+        assert_eq!((p.rows, p.cols), (10, 40));
+        for r in &rows[p.row..p.row + 10] {
+            assert!(r.0.to_string().trim().is_empty());
+            assert_eq!(r.1, vec![(0, u16::MAX, format!("#image:{KEY}"))]);
+        }
+        assert!(rows[p.row + 10..].iter().any(|r| r.0.to_string().contains("After")));
+    }
+
+    #[test]
+    fn failed_image_keeps_one_row() {
+        let mut store = store();
+        store.apply(images::ImageMsg::Loaded { key: KEY.into(), res: Err(images::Fail::Failed("HTTP 404".into())) });
+        let (rows, placements) = build(&lone(SHOT), &store);
+        assert!(placements.is_empty());
+        let row = rows.iter().find(|r| r.0.to_string().contains("Screenshot")).unwrap();
+        assert!(row.0.to_string().contains("(failed: HTTP 404)"));
+        assert_eq!(row.1, vec![(0, u16::MAX, KEY.to_string())]);
+    }
+
+    #[test]
+    fn badges_and_inline_images_stay_labels() {
+        let store = store();
+        for html in [
+            format!(r#"<p><img src="{SHOT}" alt="badge" width="16"></p>"#),
+            format!(r#"<p><a href="https://vercel.com"><img src="{SHOT}" alt="Preview"></a> Ready to deploy</p>"#),
+            format!(r#"<table><tr><td><img src="{SHOT}" alt="before"></td><td>after</td></tr></table>"#),
+            r#"<p><img src="https://camo.githubusercontent.com/a/b" data-canonical-src="https://x.io/badge.svg" alt="ok"></p>"#.to_string(),
+        ] {
+            let (rows, placements) = build(&html, &store);
+            assert!(placements.is_empty(), "{html}");
+            assert!(rows.iter().any(|r| r.0.to_string().contains('▣')), "{html}: {rows:?}");
+        }
+        // Images toggled off: the lone screenshot is a label as well.
+        let mut off = store;
+        off.enabled = false;
+        assert!(build(&lone(SHOT), &off).1.is_empty());
+    }
+
+    #[test]
+    fn sanitize_skips_image_cells() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf[(0, 0)].set_symbol("\u{1b}Pq#0;2;0;0;0\u{1b}\\");
+        buf[(1, 0)].set_symbol("\u{10EEEE}\u{0305}");
+        buf[(2, 0)].set_symbol("❤\u{FE0F}");
+        sanitize(&mut buf);
+        assert!(buf[(0, 0)].symbol().starts_with('\u{1b}'));
+        assert_eq!(buf[(1, 0)].symbol(), "\u{10EEEE}\u{0305}");
+        assert_eq!(buf[(2, 0)].symbol(), "❤");
     }
 
     #[test]

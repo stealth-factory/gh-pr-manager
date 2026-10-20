@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+// gh-pr-manager - a terminal UI for GitHub pull requests
+// Copyright (C) 2026 William Li
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+'use strict';
+
+const { spawn } = require('child_process');
+const { constants } = require('os');
+const platform = require('../platform');
+
+// The native binary, from the platform package npm installed beside us.
+// Exec-ing it is what keeps `--version` answering with the same version,
+// commit and date as the GitHub release: it is the same binary.
+let start;
+try {
+  start = platform.resolveStart();
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
+
+const child = spawn(start, process.argv.slice(2), { stdio: 'inherit' });
+
+function forward(signal) {
+  if (!child.killed) child.kill(signal);
+}
+
+// The TUI owns the terminal and handles Ctrl+C itself; the shim only
+// passes signals on so it never exits underneath a running child.
+process.on('SIGINT', () => forward('SIGINT'));
+process.on('SIGTERM', () => forward('SIGTERM'));
+
+child.on('error', (err) => {
+  console.error(err.message);
+  process.exit(1);
+});
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    // Re-raising the signal while this process still handles it re-enters
+    // the handler and can exit 0. 128+n is what a shell reports.
+    const n = constants.signals[signal];
+    process.exit(typeof n === 'number' ? 128 + n : 1);
+    return;
+  }
+  process.exit(code ?? 1);
+});

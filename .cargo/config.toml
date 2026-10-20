@@ -1,0 +1,7 @@
+# Windows release binaries link the C runtime statically, so
+# gh-pr-manager.exe starts on a machine without the Visual C++
+# Redistributable installed. release.yml checks that it imports nothing
+# outside C:\Windows; without this it would import vcruntime140.dll.
+# (Linux and macOS link only the system C runtime already.)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

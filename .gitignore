@@ -1,1 +1,14 @@
 /target
+.DS_Store
+
+# What a release build leaves behind, if one is run by hand.
+dist/
+npm-dist/
+debian-dist/
+homebrew-artifacts/
+homebrew/gh-pr-manager.rb
+gh-pr-manager-*.tar.gz
+gh-pr-manager-*.tar.gz.sha256
+gh-pr-manager_*_amd64.deb
+gh-pr-manager_*_amd64.deb.sha256
+CHANGELOG-release.md
