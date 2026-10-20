@@ -360,8 +360,8 @@ pub enum PendingOp {
     UpdateBranch { oid: String },
     /// Link these PRs (bottom first) into a GitHub stack.
     LinkStack { nwo: String, numbers: Vec<u64> },
-    /// merge-async PR `up_to` (and its open downstack), polled to the end.
-    MergeStack { nwo: String, up_to: u64, method: MergeMethod, sha: String, label: String },
+    /// merge-async PR `up_to` and its open `downstack` (by id), polled to the end.
+    MergeStack { nwo: String, up_to: u64, method: MergeMethod, sha: String, label: String, downstack: Vec<String> },
 }
 
 pub enum Modal {
@@ -755,6 +755,8 @@ pub struct App {
     pub digest: Option<Digest>,
     /// PRs you just changed yourself, and when; their next changes aren't news.
     own_pending: HashMap<String, Instant>,
+    /// The other PRs a running action changes too (merge-async takes the downstack), by target.
+    own_also: HashMap<String, Vec<String>>,
     /// The list being replaced by the load in progress: its query, PRs, and whether it was complete.
     prev_list: Option<(String, Vec<PrSummary>, bool)>,
     /// The query of the load in flight, and of the list on screen once it fully landed.
@@ -900,6 +902,7 @@ impl App {
             unread_keep: HashSet::new(),
             digest: None,
             own_pending: HashMap::new(),
+            own_also: HashMap::new(),
             prev_list: None,
             loading_query: String::new(),
             list_query: String::new(),
@@ -1957,11 +1960,15 @@ impl App {
                         }
                         self.toast(m, ToastKind::Success);
                         self.own_pending.insert(id.clone(), Instant::now());
+                        for other in self.own_also.remove(&id).unwrap_or_default() {
+                            self.own_pending.insert(other, Instant::now());
+                        }
                         self.details.remove(&id);
                         self.load_detail(&id);
                         self.load_list();
                     }
                     Err(e) => {
+                        self.own_also.remove(&id);
                         if let Some(Modal::Composer(c)) = &mut self.modal {
                             c.submitting = false;
                         }
@@ -3268,6 +3275,9 @@ impl App {
         if !self.busy.insert(pr_id.clone()) {
             return self.toast("An action is already running for this PR", ToastKind::Info);
         }
+        if let PendingOp::MergeStack { downstack, .. } = &op {
+            self.own_also.insert(pr_id.clone(), downstack.clone());
+        }
         let (client, tx, id) = (self.client.clone(), self.tx.clone(), pr_id);
         self.toast("Working…", ToastKind::Info);
         tokio::spawn(async move {
@@ -3284,7 +3294,7 @@ impl App {
                     .await
                 }
                 PendingOp::LinkStack { nwo, numbers } => client.create_stack(&nwo, &numbers).await.map(|n| format!("Linked into GitHub stack {n}")),
-                PendingOp::MergeStack { nwo, up_to, method, sha, label } => run_merge_async(&client, &nwo, up_to, &sha, method, &label).await,
+                PendingOp::MergeStack { nwo, up_to, method, sha, label, .. } => run_merge_async(&client, &nwo, up_to, &sha, method, &label).await,
             };
             let _ = tx.send(Msg::Done { id, res });
         });
@@ -3987,7 +3997,8 @@ impl App {
             "Merge {label} (up to #{}) into {}\n{how} · all or nothing\n\nGitHub merges the open PRs below it too (merge-async);\nit stops if #{}'s head moved.",
             top.number, s.trunk, top.number
         );
-        let op = PendingOp::MergeStack { nwo: s.repo.clone(), up_to: top.number, method, sha: top.head_oid.clone(), label };
+        let downstack = plan.iter().filter(|m| m.id != top.id).map(|m| m.id.clone()).collect();
+        let op = PendingOp::MergeStack { nwo: s.repo.clone(), up_to: top.number, method, sha: top.head_oid.clone(), label, downstack };
         self.modal = Some(Modal::Confirm { pr_id: top.id.clone(), title: title.into(), message, op });
     }
 
@@ -5760,8 +5771,9 @@ mod stack_tests {
         assert!(matches!(&app.modal, Some(Modal::Menu { entries, .. }) if entries.len() == 2));
         key(&mut app, KeyCode::Char('s'));
         match &app.modal {
-            Some(Modal::Confirm { pr_id, message, op: PendingOp::MergeStack { up_to, method, sha, .. }, .. }) => {
+            Some(Modal::Confirm { pr_id, message, op: PendingOp::MergeStack { up_to, method, sha, downstack, .. }, .. }) => {
                 assert_eq!((pr_id.as_str(), *up_to, *method, sha.as_str()), ("acme/app#3", 3, MergeMethod::Squash, "oid3"));
+                assert_eq!(downstack, &vec!["acme/app#1".to_string(), "acme/app#2".to_string()]);
                 assert!(message.starts_with("Merge #1, #2, #3 (up to #3) into main\nsquash · all or nothing"), "{message}");
             }
             _ => panic!("no merge-stack confirm"),
@@ -5776,9 +5788,14 @@ mod stack_tests {
         key(&mut app, KeyCode::Char('L'));
         assert!(app.modal.is_none());
         assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("already linked (stack 31)")));
-        // Done refetches like any mutation.
+        // Done refetches like any mutation, and the merged downstack is your own change too.
+        key(&mut app, KeyCode::Char('M'));
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('y'));
         app.handle(Msg::Done { id: "acme/app#3".into(), res: Ok("Merged #1, #2, #3".into()) });
-        assert!(app.own_pending.contains_key("acme/app#3"));
+        for id in ["acme/app#1", "acme/app#2", "acme/app#3"] {
+            assert!(app.own_pending.contains_key(id), "{id}");
+        }
         assert!(app.detail_loading.contains("acme/app#3"));
     }
 
