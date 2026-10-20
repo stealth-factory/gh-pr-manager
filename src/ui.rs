@@ -1388,7 +1388,8 @@ fn draw_stack(f: &mut Frame, app: &mut App, id: &str, area: Rect) {
                 Some(p) => vec![Span::styled("parent ", Style::new().fg(DIM)), Span::styled(format!("#{} ", p.number), Style::new().underlined()), Span::styled(m.base.clone(), Style::new().fg(Color::Magenta))],
                 None => vec![Span::styled("base ", Style::new().fg(DIM)), Span::styled(m.base.clone(), Style::new().fg(Color::Magenta))],
             };
-            let links_known = app.links.contains_key(&s.key());
+            // Only a successful compare of this member says it's up to date.
+            let links_known = app.links.get(&s.key()).is_some_and(|(l, _)| l.iter().any(|l| l.child == m.head));
             match app.needs_rebase_of(&m.id) {
                 Some(n) => rel.push(Span::styled(format!(" · ! needs rebase: {n} commit{} behind", if n == 1 { "" } else { "s" }), Style::new().fg(Color::Yellow).bold())),
                 None if links_known && m.open() => rel.push(Span::styled(" · up to date with its base", Style::new().fg(Color::Green))),
@@ -1538,8 +1539,10 @@ fn draw_stack_list(f: &mut Frame, app: &mut App, s: &Stack, open_id: &str, area:
     }
     rows.push((Line::styled(format!("   {}", truncate(&s.trunk, w.saturating_sub(4))), Style::new().fg(Color::Magenta)), None));
     let h = rows_area.height as usize;
-    // Keep the cursor in view.
-    if let Some(cur) = rows.iter().rposition(|(_, e)| *e == Some(cursor)) {
+    // Keep the cursor in view unless the wheel moved the list away from it.
+    if app.stack_list_follow
+        && let Some(cur) = rows.iter().rposition(|(_, e)| *e == Some(cursor))
+    {
         let first = rows.iter().position(|(_, e)| *e == Some(cursor)).unwrap_or(cur);
         if first < app.stack_list_scroll {
             app.stack_list_scroll = first;

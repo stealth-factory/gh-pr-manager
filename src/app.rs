@@ -741,6 +741,8 @@ pub struct App {
     pub rate: Option<RateLimit>,
     pub tick: usize,
     last_refresh: Instant,
+    /// When the list on screen started loading; only details fetched since override its stacks.
+    list_at: Option<Instant>,
     last_click: Option<(Instant, usize)>,
     pub hits: Hits,
     pub quit: bool,
@@ -791,6 +793,7 @@ pub struct App {
     pub stack_open: bool,
     pub stack_file_sel: usize,
     pub stack_list_scroll: usize,
+    pub stack_list_follow: bool,
     /// Members being fetched to be opened.
     splicing: HashSet<String>,
 }
@@ -888,6 +891,7 @@ impl App {
             rate: None,
             tick: 0,
             last_refresh: Instant::now(),
+            list_at: None,
             last_click: None,
             hits: Hits::default(),
             quit: false,
@@ -920,6 +924,7 @@ impl App {
             stack_open: false,
             stack_file_sel: 0,
             stack_list_scroll: 0,
+            stack_list_follow: true,
             splicing: HashSet::new(),
         }
     }
@@ -1234,6 +1239,8 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        // A failed `Whole stack` compare is cached until the next refresh retries it.
+        self.stack_files_errors.clear();
         self.load_list();
         if self.screen == Screen::Detail
             && let Some(id) = self.selected_pr().map(|p| p.id.clone())
@@ -1695,6 +1702,7 @@ impl App {
                             self.search.spliced.retain(|id| keep.iter().any(|p| p.id == *id));
                             self.prs = keep;
                             self.prs.extend(page.prs);
+                            self.list_at = Some(self.last_refresh);
                         } else {
                             let seen: HashSet<String> = self.prs.iter().map(|p| p.id.clone()).collect();
                             self.prs.extend(page.prs.into_iter().filter(|p| !seen.contains(&p.id)));
@@ -2371,6 +2379,7 @@ impl App {
         {
             let n = self.hits.stack_list_rows.len();
             self.stack_list_scroll = (offset as isize + delta).clamp(0, n.saturating_sub(r.height as usize) as isize) as usize;
+            self.stack_list_follow = false;
         } else if self.hits.info.is_some_and(|r| r.contains(pos)) {
             self.focus = Focus::Detail;
             self.scroll_info(delta);
@@ -2960,6 +2969,7 @@ impl App {
                 self.stack_sel = Some(i);
                 self.stack_open = false;
                 self.stack_file_sel = 0;
+                self.stack_list_follow = true;
                 self.ensure_stack_data();
             }
             Action::StackOpen => {
@@ -3671,7 +3681,12 @@ impl App {
 
     /// Recompute stacks and membership from the loaded PRs and details (selection not kept).
     fn rebuild_stacks(&mut self) {
-        let details: Vec<&PrDetail> = self.details.values().map(|(d, _)| d).filter(|d| d.stack.is_some()).collect();
+        // A detail older than the list may describe a stack since changed or dissolved; of the
+        // rest, the newest is applied last so it wins.
+        let mut details: Vec<&(PrDetail, Instant)> =
+            self.details.values().filter(|(d, at)| d.stack.is_some() && self.list_at.is_none_or(|l| *at >= l)).collect();
+        details.sort_by_key(|(_, at)| *at);
+        let details: Vec<&PrDetail> = details.into_iter().map(|(d, _)| d).collect();
         let db = &self.default_branches;
         // Unknown default branch: `main` / `master` count as trunks (so a `main → release` PR
         // never becomes everyone's parent).
@@ -3699,6 +3714,7 @@ impl App {
         self.stack_open = false;
         self.stack_file_sel = 0;
         self.stack_list_scroll = 0;
+        self.stack_list_follow = true;
     }
 
     /// The stack the selected PR belongs to.
@@ -3778,7 +3794,9 @@ impl App {
             }
             None => {
                 let Some((key, base, head)) = Self::whole_stack_key(&s) else { return };
-                if self.stack_files.contains_key(&key) || self.stack_files_errors.contains_key(&key) || !self.stack_files_loading.insert(key.clone()) {
+                // The trunk can move under the same top head, so a result expires like a member's files.
+                let fresh = self.stack_files.get(&key).is_some_and(|(_, at)| at.elapsed() <= Duration::from_secs(60));
+                if fresh || self.stack_files_errors.contains_key(&key) || !self.stack_files_loading.insert(key.clone()) {
                     return;
                 }
                 let (client, tx, nwo) = (self.client.clone(), self.tx.clone(), s.repo.clone());
@@ -4101,6 +4119,8 @@ impl App {
                         self.sel += 1;
                     }
                     self.search.spliced.insert(id.clone());
+                    // It may complete an implicit chain.
+                    self.rebuild_stacks_keep();
                 }
                 self.open_from_search(text, id);
             }
@@ -4575,15 +4595,26 @@ impl App {
 async fn run_merge_async(client: &Client, nwo: &str, n: u64, sha: &str, method: MergeMethod, label: &str) -> Result<String> {
     let start = Instant::now();
     let mut job = client.merge_async(nwo, n, sha, method).await?;
+    // Once accepted the merge runs on GitHub's side, so a failed status request is retried.
+    let mut last_err: Option<anyhow::Error> = None;
     loop {
         match stacks::merge_step(&job, start.elapsed()) {
             stacks::MergeStep::Merged => return Ok(format!("Merged {label}")),
             stacks::MergeStep::Enqueued => return Ok(format!("{label}: added to the merge queue")),
             stacks::MergeStep::Failed(m) => anyhow::bail!("Merge failed: {m}"),
-            stacks::MergeStep::TimedOut => anyhow::bail!("The merge is still pending after {} s; check the PR on GitHub", stacks::MERGE_CAP.as_secs()),
+            stacks::MergeStep::TimedOut => match last_err {
+                Some(e) => return Err(e.context(format!("The merge's status is unknown after {} s; check the PR on GitHub", stacks::MERGE_CAP.as_secs()))),
+                None => anyhow::bail!("The merge is still pending after {} s; check the PR on GitHub", stacks::MERGE_CAP.as_secs()),
+            },
             stacks::MergeStep::Poll(uuid) => {
                 tokio::time::sleep(stacks::MERGE_POLL).await;
-                job = client.merge_async_status(nwo, n, &uuid).await?;
+                match client.merge_async_status(nwo, n, &uuid).await {
+                    Ok(j) => {
+                        job = j;
+                        last_err = None;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
             }
         }
     }
@@ -5598,6 +5629,33 @@ mod stack_tests {
         }
         assert_eq!(app.stack_cursor(), 0);
         assert!(app.stack_cursor_member().is_none());
+    }
+
+    #[test]
+    fn the_newest_detail_wins_and_a_reload_voids_older_ones() {
+        let mut app = test_app();
+        let mut list = chain();
+        // #3 and #4 are a native stack whose bottom (#7) isn't loaded.
+        for (i, pos) in [(0usize, 3usize), (2, 2)] {
+            list[i].stack = Some(StackRef { id: "PRS_1".into(), number: 12, size: 3, base_ref_name: "main".into() });
+            list[i].stack_entry = Some(StackEntryRef { position: pos });
+        }
+        load(&mut app, list.clone());
+        let entry = |n: u64, pos: usize, state: &str| json!({ "position": pos, "pullRequest": { "id": format!("acme/app#{n}"), "number": n, "title": format!("pr {n}"),
+            "state": state, "headRefName": format!("h{n}"), "baseRefName": "main", "headRefOid": format!("oid{n}") } });
+        let stack = |s7: &str| json!({ "id": "PRS_1", "number": 12, "size": 3, "baseRefName": "main", "entries": { "nodes": [entry(7, 1, s7), entry(3, 2, "OPEN"), entry(4, 3, "OPEN")] } });
+        let now = Instant::now();
+        // #4's detail saw #7 merge after #3's was fetched; either HashMap order gives the same answer.
+        app.details.insert(list[2].id.clone(), (detail(&list[2], Some(stack("OPEN"))), now));
+        app.details.insert(list[0].id.clone(), (detail(&list[0], Some(stack("MERGED"))), now + Duration::from_secs(1)));
+        app.rebuild_stacks();
+        let state7 = |app: &App| app.stacks[0].members.iter().find(|m| m.number == 7).map(|m| m.state.clone());
+        assert_eq!(state7(&app).as_deref(), Some("MERGED"));
+        // A list loaded since both describes the stack from its own rows until a detail is refetched.
+        app.last_refresh = now + Duration::from_secs(2);
+        load(&mut app, list);
+        assert_eq!(state7(&app), None);
+        assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
     }
 
     #[tokio::test]
