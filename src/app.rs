@@ -176,20 +176,6 @@ impl Tab {
         }
     }
 
-    /// For a tab bar too narrow for every full name.
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Tab::Description => "Desc",
-            Tab::Conversation => "Conv",
-            Tab::Changes => "Diff",
-            Tab::Commits => "Log",
-            Tab::Checks => "Checks",
-            Tab::Actions => "Runs",
-            Tab::Reviews => "Revs",
-            Tab::Stack => "Stack",
-        }
-    }
-
     fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
@@ -6151,9 +6137,9 @@ mod stack_tests {
             let text = |y: u16| (0..140).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>();
             let (r, _) = app.hits.table.unwrap();
             let per = d.table_row_h() as u16;
-            assert!(text(r.y).contains("#1 ⧉1/4"), "{d:?}: {}", text(r.y));
-            assert!(text(r.y + per).contains("├#2 ⧉2/4"), "{d:?}: {}", text(r.y + per));
-            assert!(text(r.y + 3 * per).contains("└#4 ⧉4/4"), "{d:?}: {}", text(r.y + 3 * per));
+            assert!(text(r.y).contains("#1 1/4"), "{d:?}: {}", text(r.y));
+            assert!(text(r.y + per).contains("├#2 2/4"), "{d:?}: {}", text(r.y + per));
+            assert!(text(r.y + 3 * per).contains("└#4 4/4"), "{d:?}: {}", text(r.y + 3 * per));
             // Clicks still land on the right PR.
             app.on_click(Position::new(r.x + 40, r.y + 2 * per));
             assert_eq!(app.selected_pr().unwrap().number, 3);

@@ -360,10 +360,10 @@ fn unread_dot(unread: bool) -> Span<'static> {
     if unread { Span::styled("•", Style::new().fg(ACCENT).bold()) } else { Span::raw(" ") }
 }
 
-/// `⧉2/4`: position / size in a stack; GitHub stacks in the accent, implicit chains gray.
+/// `2/4`: position / size in a stack; GitHub stacks in the accent, implicit chains gray.
 fn chip_span(chip: Option<(usize, usize, bool)>) -> Option<Span<'static>> {
     let (pos, size, native) = chip?;
-    Some(Span::styled(format!("⧉{pos}/{size}"), Style::new().fg(if native { ACCENT } else { Color::Gray })))
+    Some(Span::styled(format!("{pos}/{size}"), Style::new().fg(if native { ACCENT } else { Color::Gray })))
 }
 
 /// A native chip from a row's own fields (a GitHub result that isn't loaded).
@@ -1039,7 +1039,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let pinned = app.search.pinned_query();
     let page = inner.height as usize;
     let near = app.table_state.offset().min(app.sel).saturating_sub(page)..app.table_state.offset().max(app.sel) + 2 * page;
-    // The `#` column grows to hold a stack's tree glyph and `⧉ 2/4` chip.
+    // The `#` column grows to hold a stack's tree glyph and `2/4` chip.
     let num_w = vis
         .iter()
         .map(|r| {
@@ -1310,12 +1310,13 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         info.truncate(end);
     }
     let cap = if collapsed { info.len() } else { (rest.height as usize * 45 / 100).max(5) };
-    let info_h = info.len().min(cap).min(rest.height.saturating_sub(6) as usize) as u16;
+    let tabs_h = tab_bar_height(app, rest.width);
+    let info_h = info.len().min(cap).min(rest.height.saturating_sub(5 + tabs_h) as usize) as u16;
     let margin = app.state.density.tab_margin();
     let [info_area, _, tabs_area, _, content] = Layout::vertical([
         Constraint::Length(info_h),
         Constraint::Length(margin),
-        Constraint::Length(1),
+        Constraint::Length(tabs_h),
         Constraint::Length(margin),
         Constraint::Min(1),
     ])
@@ -2588,8 +2589,22 @@ fn image_box(buf: &mut Buffer, area: Rect, r: Rect, y: isize, alt: &str) {
     }
 }
 
-fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
+/// One tab in the bar: its label (number, name, count, status icon) and optional new-items badge.
+struct TabChip {
+    tab: Tab,
+    label: String,
+    /// CI / Actions status, drawn in its own colour (so a running check animates).
+    icon: Option<Span<'static>>,
+    badge: Option<String>,
+}
+
+impl TabChip {
+    fn width(&self) -> u16 {
+        (self.label.width() + self.icon.as_ref().map_or(0, |i| i.width() + 1) + self.badge.as_ref().map_or(0, |b| b.width())) as u16
+    }
+}
+
+fn tab_chips(app: &App) -> Vec<TabChip> {
     let d = app.selected_detail();
     let chip = app.selected_pr().and_then(|p| app.chip(&p.id));
     let count = |t: Tab| -> String {
@@ -2614,65 +2629,87 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let outcomes = e.runs.iter().filter(|r| r.head_sha == e.sha).map(|r| rest_outcome(r.status(), r.conclusion.as_deref()));
         outcomes.min_by_key(|o| outcome_rank(o))
     });
-    let counts: Vec<String> = Tab::ALL.into_iter().map(count).collect();
-    let badges: Vec<Option<String>> = Tab::ALL.into_iter().map(|t| app.tab_badge(t)).collect();
-    // Eight tabs don't fit a narrow pane: shorten the inactive ones' names, then drop them.
-    let label_of = |i: usize, t: Tab, level: u8| -> String {
-        let name = match level {
-            _ if t == app.tab => t.label(),
-            0 => t.label(),
-            1 => t.short_label(),
-            _ => "",
-        };
-        let mut l = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
-        if (t == Tab::Checks && ci.is_some()) || (t == Tab::Actions && worst.is_some()) {
-            l.push_str("✓ ");
+    Tab::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let label = format!(" {} {}{} ", i + 1, t.label(), count(t));
+            let icon = match t {
+                Tab::Checks => ci.as_deref(),
+                Tab::Actions => worst.as_deref(),
+                _ => None,
+            }
+            .map(|state| ci_icon(Some(state)));
+            // ` 2 Conversation 7 +2 `: the badge is its own click target (the first new entry).
+            let badge = app.tab_badge(t).map(|b| format!("{b} "));
+            TabChip { tab: t, label, icon, badge }
+        })
+        .collect()
+}
+
+/// Width reserved at the right of the tab bar's first row for the info toggle.
+const INFO_TOGGLE_W: u16 = 9;
+
+/// Flow the tabs into rows that fit `width`, keeping every name whole; the first row leaves room
+/// for the info toggle.
+fn tab_rows(chips: &[TabChip], width: u16) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0u16;
+    for (i, c) in chips.iter().enumerate() {
+        let room = if rows.len() == 1 { width.saturating_sub(INFO_TOGGLE_W) } else { width };
+        if used + c.width() > room && !rows.last().is_some_and(|r| r.is_empty()) {
+            rows.push(Vec::new());
+            used = 0;
         }
-        l
-    };
-    let room = area.width.saturating_sub(9) as usize;
-    let fits = |level: u8| Tab::ALL.into_iter().enumerate().map(|(i, t)| label_of(i, t, level).width() + badges[i].as_ref().map_or(0, |b| b.width() + 1)).sum::<usize>() <= room;
-    let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
-    let mut x = area.x;
-    let mut spans = Vec::new();
-    for (i, t) in Tab::ALL.into_iter().enumerate() {
-        let active = t == app.tab;
-        let name = match level {
-            _ if active => t.label(),
-            0 => t.label(),
-            1 => t.short_label(),
-            _ => "",
-        };
-        let mut label = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
-        if t == Tab::Checks && ci.is_some() {
-            label.push_str(&ci_icon(ci.as_deref()).content);
-            label.push(' ');
-        }
-        if t == Tab::Actions && worst.is_some() {
-            label.push_str(&ci_icon(worst.as_deref()).content);
-            label.push(' ');
-        }
-        // ` 2 Conversation 7 +2 `: the badge is its own click target (the first new entry).
-        let badge = badges[i].as_ref().map(|b| format!("{b} "));
-        let (w, bw) = (label.width() as u16, badge.as_ref().map_or(0, |b| b.width() as u16));
-        if x + w + bw > area.right() {
+        rows.last_mut().unwrap().push(i);
+        used += c.width();
+    }
+    rows
+}
+
+/// Rows the tab bar needs at this width.
+fn tab_bar_height(app: &App, width: u16) -> u16 {
+    tab_rows(&tab_chips(app), width).len() as u16
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
+    let chips = tab_chips(app);
+    for (row, idxs) in tab_rows(&chips, area.width).into_iter().enumerate() {
+        let y = area.y + row as u16;
+        if y >= area.bottom() {
             break;
         }
-        let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
-        spans.push(Span::styled(label, style));
-        app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::SetTab(t)));
-        x += w;
-        if let Some(b) = badge {
-            let bstyle = if active { style } else { Style::new().fg(ACCENT).bold() };
-            spans.push(Span::styled(b, bstyle));
-            app.hits.buttons.push((Rect::new(x, area.y, bw, 1), Action::OpenNew(t)));
-            x += bw;
+        let mut x = area.x;
+        let mut spans = Vec::new();
+        for i in idxs {
+            let c = &chips[i];
+            let active = c.tab == app.tab;
+            let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
+            let mut w = c.label.width() as u16;
+            spans.push(Span::styled(c.label.clone(), style));
+            if let Some(icon) = &c.icon {
+                // On the active tab the icon keeps the tab's background.
+                let icon_style = if active { icon.style.bg(ACCENT) } else { icon.style };
+                spans.push(Span::styled(icon.content.clone(), icon_style));
+                spans.push(Span::styled(" ", style));
+                w += icon.width() as u16 + 1;
+            }
+            app.hits.buttons.push((Rect::new(x, y, w, 1), Action::SetTab(c.tab)));
+            x += w;
+            if let Some(b) = &c.badge {
+                let bw = b.width() as u16;
+                let bstyle = if active { style } else { Style::new().fg(ACCENT).bold() };
+                spans.push(Span::styled(b.clone(), bstyle));
+                app.hits.buttons.push((Rect::new(x, y, bw, 1), Action::OpenNew(c.tab)));
+                x += bw;
+            }
         }
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(area.x, y, area.width, 1));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
     let toggle = if app.info_collapsed() { " ▾ info " } else { " ▴ info " };
     let tw = toggle.width() as u16;
-    if x + tw < area.right() {
+    if area.width > tw {
         let r = Rect::new(area.right() - tw, area.y, tw, 1);
         f.render_widget(Paragraph::new(toggle).style(Style::new().fg(DIM)), r);
         app.hits.buttons.push((r, Action::ToggleInfo));
@@ -3848,7 +3885,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("t", "Show / hide log timestamps"),
         ("Ctrl+F  n N", "Search the log · next / previous match"),
         ("Esc", "Clear search, then back from a job to its run"),
-        ("", "Stacks (⧉ 2/4 = position / size; accent = GitHub stack, gray = branch chain)"),
+        ("", "Stacks (2/4 = position / size; accent = GitHub stack, gray = branch chain)"),
         ("< >  click #n in the strip", "Previous (toward the base) / next PR in the stack"),
         ("8 · n p ↑ ↓ · Enter · Esc", "Stack tab: pick a member or Whole stack · its files, a file's diff · back"),
         ("b", "Update the PR's branch onto its parent (rebase, else merge; asks first)"),
