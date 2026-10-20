@@ -17,7 +17,7 @@ use crate::github::{
     Annotation, Client, FileDiff, Job, MergeMethod, PrDetail, PrSummary, RateLimit, RepoInfo, RepoPage, ReviewEvent, RunsQuery, SearchPage, Viewer,
     WorkflowRunInfo,
 };
-use crate::state::State;
+use crate::state::{ReposCache, State};
 
 /// Maximum PRs loaded per scope (GitHub search caps at 1000).
 const MAX_PRS: usize = 300;
@@ -465,7 +465,8 @@ impl App {
         // A repo-only scope without a repo would search all of GitHub.
         let scope = if repo.is_none() && scopes[scope].qualifier.is_empty() { 0 } else { scope };
         let state = crate::state::load();
-        let repos = state.repos_cache.as_ref().map(|c| c.repos.clone()).unwrap_or_default();
+        // The cache is applied only after `viewer()` confirms it belongs to this login.
+        let repos = Vec::new();
         let toast = images.note.map(|n| (n, ToastKind::Info, Instant::now()));
         let images = ImageStore::new(images.picker, state.images_enabled, images.off_reason);
         Self {
@@ -1182,8 +1183,8 @@ impl App {
                     self.scope = i;
                     self.load_list();
                 }
-                if self.state.repos_cache.as_ref().is_some_and(|c| c.login != v.login) {
-                    self.repos.clear();
+                if let Some(repos) = cached_repos(self.state.repos_cache.as_ref(), &v.login) {
+                    self.repos = repos;
                 }
                 self.load_repos();
                 self.viewer = Some(v);
@@ -1274,6 +1275,14 @@ impl App {
             },
             Msg::Files { id, sha, res } => {
                 self.files_loading.remove(&id);
+                let head = self.details.get(&id).map(|(d, _)| d.head_ref_oid.clone());
+                // The request captured the head it was started for. A newer head can land
+                // while it is in flight, and `files_loading` stops that newer fetch from
+                // starting. Drop the stale reply and fetch the head now on screen.
+                if !files_match_head(head.as_deref(), &sha) {
+                    self.ensure_files(false);
+                    return;
+                }
                 match res {
                     Ok(files) => {
                         self.files_errors.remove(&id);
@@ -2533,6 +2542,24 @@ mod tests {
         assert_eq!(super::base64(b"ab"), "YWI=");
         assert_eq!(super::base64(b"abc"), "YWJj");
     }
+
+    #[test]
+    fn files_reply_is_kept_only_for_the_loaded_head() {
+        assert!(super::files_match_head(Some("abc"), "abc"));
+        assert!(!super::files_match_head(Some("def"), "abc"));
+        assert!(super::files_match_head(None, "abc"));
+    }
+
+    #[test]
+    fn cached_repos_stay_hidden_until_the_login_matches() {
+        let cache = super::ReposCache {
+            login: "ada".into(),
+            repos: vec![super::RepoInfo { name_with_owner: "ada/private".into(), is_private: true, pushed_at: None }],
+        };
+        assert!(super::cached_repos(Some(&cache), "ada").is_some_and(|r| r.len() == 1));
+        assert!(super::cached_repos(Some(&cache), "grace").is_none());
+        assert!(super::cached_repos(None, "ada").is_none());
+    }
 }
 
 /// A row in the repo picker. Headers and notes are display-only.
@@ -2560,6 +2587,16 @@ fn looks_like_repo(s: &str) -> bool {
     let mut parts = s.split('/');
     let ok = |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)));
     ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+/// A files reply is for the head currently loaded, or the detail is gone and nothing can contradict it.
+fn files_match_head(head: Option<&str>, sha: &str) -> bool {
+    head.is_none_or(|h| h == sha)
+}
+
+/// Repositories from disk, only when they were saved for `login`.
+fn cached_repos(cache: Option<&ReposCache>, login: &str) -> Option<Vec<RepoInfo>> {
+    cache.filter(|c| c.login == login).map(|c| c.repos.clone())
 }
 
 /// Whether cached jobs belong to an earlier attempt than the run's `attempt` (a re-run keeps
