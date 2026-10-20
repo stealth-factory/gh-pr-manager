@@ -1041,7 +1041,11 @@ impl App {
     fn ensure_detail(&mut self) {
         if let Some(pr) = self.selected_pr() {
             let id = pr.id.clone();
-            let stale = self.details.get(&id).is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(30));
+            // `rebuild_stacks` ignores a stacked detail older than the list, so fetch it again.
+            let stale = self
+                .details
+                .get(&id)
+                .is_none_or(|(d, at)| at.elapsed() > Duration::from_secs(30) || (d.stack.is_some() && self.list_at.is_some_and(|l| *at < l)));
             if stale {
                 self.load_detail(&id);
             }
