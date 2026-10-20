@@ -1779,10 +1779,14 @@ impl App {
                                 ch = changes::diff_detail(old, &d, me.as_deref(), &self.cfg.bots);
                             }
                         }
-                        // Keep the list row in sync with the fresher detail.
+                        // Keep the list row in sync with the fresher detail. A new base, head or
+                        // state, or a newly learnt trunk, can redraw implicit chains.
+                        let mut chained = false;
                         let mut reranked = false;
                         if let Some(p) = self.prs.iter_mut().find(|p| p.id == id) {
+                            let before = (p.base_ref_name.clone(), p.head_ref_name.clone(), p.state.clone());
                             p.absorb(&d, me.as_deref());
+                            chained = before != (p.base_ref_name.clone(), p.head_ref_name.clone(), p.state.clone());
                             self.prs_rev += 1;
                             reranked = true;
                         }
@@ -1791,9 +1795,10 @@ impl App {
                         }
                         self.rebuild_unread();
                         if let Some(b) = &d.repository.default_branch_ref {
-                            self.default_branches.insert(d.repository.name_with_owner.to_lowercase(), b.name.clone());
+                            let old = self.default_branches.insert(d.repository.name_with_owner.to_lowercase(), b.name.clone());
+                            chained |= old.as_ref() != Some(&b.name);
                         }
-                        let stacked = d.stack.is_some() || self.membership.contains_key(&id);
+                        let stacked = chained || d.stack.is_some() || self.membership.contains_key(&id);
                         self.details.insert(id.clone(), (d, Instant::now()));
                         if stacked {
                             self.rebuild_stacks_keep();
@@ -6214,6 +6219,18 @@ mod stack_tests {
         load(&mut app, list);
         assert_eq!(state7(&app), None);
         assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn a_retargeted_pr_joins_its_chain_on_its_detail() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        let mut p = app.prs.iter().find(|p| p.number == 9).unwrap().clone();
+        assert!(app.chip(&p.id).is_none());
+        // #9 now sits on #4's branch.
+        p.base_ref_name = "d".into();
+        app.handle(Msg::Detail { id: p.id.clone(), res: Ok((detail(&p, None), None)) });
+        assert_eq!(app.chip(&p.id), Some((5, 5, false)));
     }
 
     #[tokio::test]
