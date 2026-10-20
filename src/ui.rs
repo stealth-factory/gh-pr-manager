@@ -1544,6 +1544,8 @@ fn draw_stack_list(f: &mut Frame, app: &mut App, s: &Stack, open_id: &str, area:
         && let Some(cur) = rows.iter().rposition(|(_, e)| *e == Some(cursor))
     {
         let first = rows.iter().position(|(_, e)| *e == Some(cursor)).unwrap_or(cur);
+        // A member taller than the pane is pinned to its first row rather than flipping ends.
+        let cur = if cur - first >= h { first } else { cur };
         if first < app.stack_list_scroll {
             app.stack_list_scroll = first;
         } else if h > 0 && cur >= app.stack_list_scroll + h {
