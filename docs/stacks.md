@@ -63,24 +63,24 @@ unlinked PR based on a native stack's top is shown under it as `unlinked`.
 
 ## 2. Where stacks show up
 
-**List** (`⧉ 2/4` = position/size; native in accent, implicit in gray; `+` after it when the stack has unread members). With
+**List** (`2/4` = position/size; native in accent, implicit in gray; `+` after it when the stack has unread members). With
 `Group by stack` on (persisted, default on) `visible()` keeps each stack contiguous, bottom first, placed at its newest member's rank,
-and the `#` cell carries tree glyphs; `z` collapses a stack to its bottom row (`⧉ 4 PRs · 2 unread`). Comfortable's second row
+and the `#` cell carries tree glyphs; `z` collapses a stack to its bottom row (`4 PRs · 2 unread`). Comfortable's second row
 already holds change words, so the stack words go after them: `· needs rebase`.
 ```
    Repository                 #          Title                                     Author   CI  Review     Cmts   Updated
- • ● stealth-factory/gh-pr-m… #1 ⧉1/4    feat: detail tabs, actions and images     wiiiimm  ✓   —          3      2d
-   ● stealth-factory/gh-pr-m… ├#2 ⧉2/4   feat: universal search palette            wiiiimm  ✓   ✓ approved 0      1d
- • ● stealth-factory/gh-pr-m… ├#3 ⧉3/4   feat: unread markers and refresh digest   wiiiimm  ✗   —          1 +1   3h
-   ● stealth-factory/gh-pr-m… └#4 ⧉4/4   feat: tab badges, new markers, notifica…  wiiiimm  ●   —          0      1h
+ • ● stealth-factory/gh-pr-m… #1 1/4    feat: detail tabs, actions and images     wiiiimm  ✓   —          3      2d
+   ● stealth-factory/gh-pr-m… ├#2 2/4   feat: universal search palette            wiiiimm  ✓   ✓ approved 0      1d
+ • ● stealth-factory/gh-pr-m… ├#3 3/4   feat: unread markers and refresh digest   wiiiimm  ✗   —          1 +1   3h
+   ● stealth-factory/gh-pr-m… └#4 4/4   feat: tab badges, new markers, notifica…  wiiiimm  ●   —          0      1h
    ● stealth-factory/opscope  #439       fix(core): tmux pixel charts              copilot  ✓   ✓ approved 20     1d
 ```
-Compact: same glyphs and chip (`├#2 ⧉2/4`), no extra rows. Collapsed: ` • ● stealth-factory/gh-pr-m… #1 ⧉ 4 PRs  feat: detail tabs…   · 2 unread`.
+Compact: same glyphs and chip (`├#2 2/4`), no extra rows. Collapsed: ` • ● stealth-factory/gh-pr-m… #1 4 PRs  feat: detail tabs…   · 2 unread`.
 
 **Sidebar**: chip after the number; Cozy/Comfortable's dim second line ends with `· 2/4 of stack 196` or `· needs rebase` (accent) after
-the change labels, repo and author shortened first; Compact shows `#3 ⧉3/4` only.
+the change labels, repo and author shortened first; Compact shows `#3 3/4` only.
 ```
-▌• ● ✗ #3 ⧉3/4 feat: unread markers and refresh digest
+▌• ● ✗ #3 3/4 feat: unread markers and refresh digest
        gh-pr-manager · wiiiimm · 3h · +1 comment · needs rebase
 ```
 
@@ -283,7 +283,7 @@ v1 as built (branch `feat/stacks`), and where it departs from the design above.
 
 **List.**
 - Grouping runs *after* unread-first. The design put it before, but sorting afterwards would split the stacks apart.
-- The `#` column widens to fit `├#2 ⧉2/4`. The sidebar shows the glyph and chip too.
+- The `#` column widens to fit `├#2 2/4`. The sidebar shows the glyph and chip too.
 - The Cozy and Comfortable sidebar line ends with `· 2/4 of stack 196`, `· 2/4 · not linked` or `· needs rebase`. The Comfortable table adds `needs rebase (N behind)` to its words row.
 - The chip itself tells native from implicit by colour only. The words in the sidebar, the strip and the Stack tab carry that difference too.
 - Palette rows show the chip, including GitHub hits that are not loaded (taken from their own `stack` fields).
@@ -329,3 +329,5 @@ v1 as built (branch `feat/stacks`), and where it departs from the design above.
 - the `stack:N` qualifier;
 - merge-queue positions;
 - `bypass_rules`.
+
+- The `⧉` icon before the position chip was removed at the user's request for a cleaner look; the chip is now just `2/4`.

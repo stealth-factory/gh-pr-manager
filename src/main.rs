@@ -8,6 +8,7 @@ mod images;
 mod search;
 mod stacks;
 mod state;
+mod stats;
 mod ui;
 
 use std::time::Duration;

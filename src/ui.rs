@@ -21,6 +21,7 @@ use crate::app::{
 use crate::changes::{Change, NewMarks, Snapshot};
 use crate::search::Command;
 use crate::state::Density;
+use crate::stats::{self, Mode};
 use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, TimelineEvent, WorkflowRunInfo, login_of};
 use crate::stacks::{Member, Stack};
 use crate::images::{self, ImagePlacement, ImageStore, Look};
@@ -34,6 +35,8 @@ const NEW_LINK: &str = "#new";
 /// The zero-width tag on the info header's `base ← head` row(s).
 const ARROW_LINK: &str = "#arrow";
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+/// Placeholder for a running check; replaced by a spinner frame after each draw.
+const CI_RUNNING: &str = "⠿";
 
 thread_local! {
     /// Density for the frame being drawn, read by the row builders' spacing helpers.
@@ -68,8 +71,20 @@ fn text_pad() -> u16 {
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
     DENSITY.with(|d| d.set(app.state.density));
-    let [header, body, status, footer] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
+    // The stats panel sits above the status line; too narrow or too short a terminal hides it
+    // without touching the toggle.
+    let full = f.area();
+    let lay = stats::Layout::fit(full.width, app.cfg.stats.days(), app.state.density);
+    let stats_h = Some(stats::panel_height(app.state.density, lay.mode)).filter(|&h| app.stats_visible() && stats::fits_height(full.height, h)).unwrap_or(0);
+    app.stats.shown = stats_h > 0;
+    let [header, body, stats_area, status, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(stats_h),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(full);
 
     draw_header(f, app, header);
     match app.screen {
@@ -79,6 +94,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_sidebar(f, app, side);
             draw_detail(f, app, main);
         }
+    }
+    if stats_h > 0 {
+        draw_stats(f, app, stats_area, &lay);
     }
     draw_status(f, app, status);
     draw_footer(f, app, footer);
@@ -98,6 +116,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         None => {}
     }
     sanitize(f.buffer_mut());
+    animate(f.buffer_mut(), app.tick);
 }
 
 /// Fade everything drawn so far, so a modal on top stands out.
@@ -115,6 +134,16 @@ fn dim(f: &mut Frame) {
 /// sequences make some terminals draw a glyph narrower than ratatui assumed, and the cell
 /// ratatui then skips keeps stale content on screen. Image cells are left alone: Sixel and
 /// iTerm2 put a whole escape sequence in one cell, Kitty a U+10EEEE placeholder.
+/// Spin the running-check markers. Only yellow cells, so a literal ⠿ in text is left alone.
+fn animate(buf: &mut Buffer, tick: usize) {
+    let frame = SPINNER[tick % SPINNER.len()];
+    for cell in buf.content.iter_mut() {
+        if cell.symbol() == CI_RUNNING && cell.fg == Color::Yellow {
+            cell.set_symbol(frame);
+        }
+    }
+}
+
 fn sanitize(buf: &mut Buffer) {
     for cell in buf.content.iter_mut() {
         let sym = cell.symbol();
@@ -309,7 +338,9 @@ fn ci_icon(state: Option<&str>) -> Span<'static> {
         Some("FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE") => {
             Span::styled("✗", Style::new().fg(Color::Red))
         }
-        Some("PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING") => Span::styled("●", Style::new().fg(Color::Yellow)),
+        // Drawn as a marker that `animate()` swaps for the current spinner frame, so it spins
+        // even inside cached rows.
+        Some("PENDING" | "EXPECTED" | "IN_PROGRESS" | "QUEUED" | "WAITING") => Span::styled(CI_RUNNING, Style::new().fg(Color::Yellow)),
         Some("NEUTRAL" | "SKIPPED" | "STALE") => Span::styled("○", Style::new().fg(DIM)),
         _ => Span::styled("·", Style::new().fg(DIM)),
     }
@@ -329,10 +360,10 @@ fn unread_dot(unread: bool) -> Span<'static> {
     if unread { Span::styled("•", Style::new().fg(ACCENT).bold()) } else { Span::raw(" ") }
 }
 
-/// `⧉2/4`: position / size in a stack; GitHub stacks in the accent, implicit chains gray.
+/// `2/4`: position / size in a stack; GitHub stacks in the accent, implicit chains gray.
 fn chip_span(chip: Option<(usize, usize, bool)>) -> Option<Span<'static>> {
     let (pos, size, native) = chip?;
-    Some(Span::styled(format!("⧉{pos}/{size}"), Style::new().fg(if native { ACCENT } else { Color::Gray })))
+    Some(Span::styled(format!("{pos}/{size}"), Style::new().fg(if native { ACCENT } else { Color::Gray })))
 }
 
 /// A native chip from a row's own fields (a GitHub result that isn't loaded).
@@ -394,8 +425,14 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let search_label = " ⌕ Search ";
     app.hits.buttons.push((Rect::new(x, area.y, search_label.width() as u16, 1), Action::OpenSearch));
     spans.push(Span::styled(search_label, Style::new().fg(Color::Magenta).bold().add_modifier(Modifier::UNDERLINED)));
+    spans.push(Span::raw(" "));
+    x += search_label.width() as u16 + 1;
+    let stats_label = " ▂▅ Stats ";
+    app.hits.buttons.push((Rect::new(x, area.y, stats_label.width() as u16, 1), Action::ToggleStats));
+    let stats_style = if app.stats_visible() { Style::new().fg(Color::Green).bold().add_modifier(Modifier::UNDERLINED) } else { Style::new().fg(DIM) };
+    spans.push(Span::styled(stats_label, stats_style));
     spans.push(Span::raw("  "));
-    x += search_label.width() as u16 + 2;
+    x += stats_label.width() as u16 + 2;
 
     let shown = app.visible_base().len();
     let count = if app.search.pinned.is_some() {
@@ -571,6 +608,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("f", "State", Action::CycleState),
             ("/", "Search", Action::OpenSearch),
             ("u", "Unread", Action::ToggleUnreadOnly),
+            ("T", "Stats", Action::ToggleStats),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("o", "Browser", Action::Browser),
@@ -634,6 +672,330 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     button_row(f, &mut app.hits, area, &items, key);
 }
 
+// ---------- stats panel (docs/stats-panel.md) ----------
+
+const OPENED: Color = ACCENT;
+const MERGED: Color = Color::Green;
+const CLOSED: Color = Color::Gray;
+
+/// Spans laid left to right, remembering where each starts (for click targets).
+struct Run {
+    spans: Vec<Span<'static>>,
+    x: u16,
+}
+
+impl Run {
+    fn new(x: u16) -> Self {
+        Self { spans: Vec::new(), x }
+    }
+
+    /// Append `text`; returns its rect on row `y`.
+    fn push(&mut self, text: impl Into<String>, style: Style, y: u16) -> Rect {
+        let text = text.into();
+        let w = text.width() as u16;
+        let r = Rect::new(self.x, y, w, 1);
+        self.x += w;
+        self.spans.push(Span::styled(text, style));
+        r
+    }
+}
+
+/// What the panel counts, in words: the scope chip's name (and repo) when it follows them.
+fn stats_scope_label(app: &App) -> String {
+    let key = &app.stats.key;
+    if *key == stats::scope_of(&app.search_query()) {
+        let name = &app.scopes[app.scope].name;
+        match &app.repo {
+            // An owner-only scope (an org, All PRs) adds nothing to a repo (`stats::scope_of`).
+            Some(r) if app.scopes[app.scope].qualifier.split_whitespace().any(|t| !t.starts_with("user:") && !t.starts_with("org:")) => format!("{name} · {r}"),
+            Some(r) => r.clone(),
+            None => name.clone(),
+        }
+    } else {
+        key.clone()
+    }
+}
+
+/// `counted 2m ago`, `counting…`, `paused · API budget low`, `count failed: … · counted 12m ago`.
+fn stats_status(app: &App) -> Vec<Span<'static>> {
+    let st = &app.stats;
+    let mut out = Vec::new();
+    let at = st.at.iter().flatten().min().map(|&t| stats::age(now_secs() - t));
+    let inflight = st.inflight.iter().any(|&b| b);
+    if let Some(e) = st.err.iter().find(|e| !e.is_empty()) {
+        let e = e.lines().next().unwrap_or_default();
+        out.push(Span::styled(format!("count failed: {}", truncate(e, 48)), Style::new().fg(Color::Red)));
+        if let Some(at) = &at {
+            out.push(Span::styled(format!(" · counted {at}"), Style::new().fg(DIM)));
+        }
+    } else if st.paused {
+        out.push(Span::styled("paused · API budget low", Style::new().fg(Color::Yellow)));
+        if let Some(at) = &at {
+            out.push(Span::styled(format!(" · counted {at}"), Style::new().fg(DIM)));
+        }
+    } else if let Some(at) = at {
+        out.push(Span::styled(format!("counted {at}"), Style::new().fg(DIM)));
+        if inflight {
+            out.push(Span::styled(format!(" {}", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)));
+        }
+    } else {
+        out.push(Span::styled(format!("counting {}", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(DIM)));
+    }
+    out
+}
+
+/// `Thu 15 Oct (UTC) · 34 opened · 17 merged` for the day cursor.
+fn stats_day_text(app: &App, axis: &[String], opened: &[Option<i64>], merged: &[Option<i64>], i: usize) -> String {
+    let fig = |v: Option<i64>, noun: &str| v.map_or(format!("{noun} counting"), |v| format!("{v} {noun}"));
+    let label = stats::parse_day(&axis[i]).map_or_else(|| axis[i].clone(), stats::day_label);
+    let merged = if stats::merges_countable(&app.stats.key) { fig(merged[i], "merged") } else { "merged not countable".into() };
+    format!("{label} (UTC) · {} · {merged}", fig(opened[i], "opened"))
+}
+
+/// Opened / merged per UTC day and the last 24 h, pinned above the status line.
+fn draw_stats(f: &mut Frame, app: &mut App, area: Rect, lay: &stats::Layout) {
+    app.hits.stats = Some(area);
+    let axis = app.stats_axis();
+    let opened = stats::lookup(&axis, &app.stats.created);
+    let merged = stats::lookup(&axis, &app.stats.merged);
+    let cursor = app.stats.day.filter(|&d| d < axis.len());
+    match lay.mode {
+        Mode::Full => draw_stats_full(f, app, area, lay, &axis, [&opened, &merged], cursor),
+        Mode::Spark => draw_stats_spark(f, app, area, &axis, [&opened, &merged], cursor),
+        Mode::Hidden => {}
+    }
+}
+
+/// One row, the 24 h figures first in full colour, then sparklines in whatever room is left:
+/// ` LAST 24H 14 opened ▲3  8 merged =  0 closed ▼2 │ My PRs 14d  opened ▃▂█▂  merged ▃▃█▂ `.
+fn draw_stats_spark(f: &mut Frame, app: &mut App, area: Rect, axis: &[String], series: [&Vec<Option<i64>>; 2], cursor: Option<usize>) {
+    let y = area.y;
+    let n = axis.len();
+    let countable = stats::merges_countable(&app.stats.key);
+    let mut run = Run::new(area.x);
+    run.push(" LAST 24H ", Style::new().fg(Color::White).bold(), y);
+    match app.stats.window {
+        Some(w) => {
+            let prev = app.stats.prev;
+            let figs = [(Some(w.opened), prev.map(|p| p.opened), "opened", OPENED), (Some(w.merged).filter(|_| countable), prev.map(|p| p.merged), "merged", MERGED), (Some(w.closed), prev.map(|p| p.closed), "closed", CLOSED)];
+            for (v, p, noun, color) in figs {
+                match v {
+                    Some(v) => {
+                        run.push(v.to_string(), Style::new().fg(color).bold(), y);
+                        run.push(format!(" {noun}"), Style::new().fg(color), y);
+                        // The deltas go before any figure would be cut.
+                        if let Some(p) = p.filter(|_| area.width >= 60) {
+                            run.push(format!(" {}", stats::delta(v, p)), Style::new().fg(DIM), y);
+                        }
+                    }
+                    None => {
+                        run.push(format!("{noun} n/a"), Style::new().fg(DIM), y);
+                    }
+                }
+                run.push("  ", Style::new(), y);
+            }
+        }
+        None => {
+            run.push(if app.stats.err[0].is_empty() { "counting  " } else { "not counted  " }, Style::new().fg(DIM), y);
+        }
+    }
+    if app.stats.paused || app.stats.err.iter().any(|e| !e.is_empty()) {
+        run.spans.extend(stats_status(app));
+        run.x = area.right();
+    }
+    // The context: as many sparklines as fit, never squeezing the figures.
+    if run.x < area.right() {
+        run.push("│ ", Style::new().fg(DIM), y);
+        run.push(format!("{n}d "), Style::new().fg(DIM), y);
+        for (c, (word, color)) in [("opened", OPENED), ("merged", MERGED)].into_iter().enumerate() {
+            let vals = series[c];
+            if (c == 1 && !countable) || vals.iter().all(Option::is_none) || run.x + n as u16 + 8 > area.right() {
+                continue;
+            }
+            run.push(format!("{word} "), Style::new().fg(DIM), y);
+            let (_, peak) = stats::totals(vals);
+            for (i, ch) in stats::spark(vals, peak).chars().enumerate() {
+                let mut style = Style::new().fg(if vals[i].is_some() { color } else { DIM });
+                if cursor == Some(i) {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                let r = run.push(ch.to_string(), style, y);
+                app.hits.stats_days.push((r, i));
+            }
+            run.push("  ", Style::new(), y);
+        }
+        if let Some(i) = cursor {
+            run.push(stats_day_text(app, axis, series[0], series[1], i), Style::new().fg(Color::Gray), y);
+            let r = run.push(" ✕ ", Style::new().fg(Color::Black).bg(ACCENT), y);
+            app.hits.buttons.push((r, Action::StatsDay(None)));
+        }
+    }
+    app.hits.buttons.retain(|(r, _)| r.y != y || r.right() <= area.right());
+    app.hits.stats_days.retain(|(r, _)| r.right() <= area.right());
+    f.render_widget(Paragraph::new(Line::from(run.spans)), area);
+}
+
+/// The LAST 24H figures drawn large on the left (the hero), the two 14-day charts beside them
+/// as context when there is room.
+fn draw_stats_full(f: &mut Frame, app: &mut App, area: Rect, lay: &stats::Layout, axis: &[String], series: [&Vec<Option<i64>>; 2], cursor: Option<usize>) {
+    let n = axis.len();
+    let comfy = app.state.density == Density::Comfortable;
+    let rule_y = area.y;
+    let head_y = rule_y + 1 + u16::from(comfy);
+    let bars_y = head_y + 1;
+    let base_y = bars_y + 3;
+    let labels_y = base_y + 1;
+    let countable = stats::merges_countable(&app.stats.key);
+
+    // ─┤ ▂▅ Stats ├─ My PRs · counted 2m ago ─────────────────────────────── T hide ──
+    let mut left = Run::new(area.x);
+    left.push("─┤", Style::new().fg(DIM), rule_y);
+    left.push(" ▂▅ Stats ", Style::new().fg(Color::Green).bold(), rule_y);
+    left.push("├─ ", Style::new().fg(DIM), rule_y);
+    let room = area.width.saturating_sub(60) as usize;
+    left.push(truncate(&stats_scope_label(app), room.max(12)), Style::new().fg(Color::Gray).bold(), rule_y);
+    left.push(" · ", Style::new().fg(DIM), rule_y);
+    for s in stats_status(app) {
+        left.x += s.width() as u16;
+        left.spans.push(s);
+    }
+    left.push(" ", Style::new(), rule_y);
+    let fill = area.right().saturating_sub(left.x + 10);
+    left.push("─".repeat(fill as usize), Style::new().fg(DIM), rule_y);
+    let hide = left.push(" T hide ", Style::new().fg(Color::Gray), rule_y);
+    left.push("──", Style::new().fg(DIM), rule_y);
+    if hide.right() <= area.right() {
+        app.hits.buttons.push((hide, Action::ToggleStats));
+    }
+    f.render_widget(Paragraph::new(Line::from(left.spans)), Rect::new(area.x, rule_y, area.width, 1));
+
+    let buf = f.buffer_mut();
+    let put = |buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style| {
+        if x < area.right() && y < area.bottom() {
+            buf.set_stringn(x, y, text, (area.right() - x) as usize, style);
+        }
+    };
+
+    // LAST 24H: three figures drawn large, each the colour of its bars, with the change
+    // against the 24 h before.
+    let fx = area.x + lay.figures.unwrap_or(stats::MARGIN);
+    let w = app.stats.window;
+    let prev = app.stats.prev;
+    put(buf, fx, head_y, "LAST 24H", Style::new().fg(Color::White).bold());
+    if prev.is_some() {
+        put(buf, fx + 10, head_y, "▲▼ vs the 24h before", Style::new().fg(DIM));
+    }
+    let figs = [
+        (w.map(|w| w.opened), prev.map(|p| p.opened), "opened", OPENED),
+        (w.map(|w| w.merged).filter(|_| countable), prev.map(|p| p.merged), "merged", MERGED),
+        (w.map(|w| w.closed), prev.map(|p| p.closed), "closed", CLOSED),
+    ];
+    for (k, (v, p, label, color)) in figs.into_iter().enumerate() {
+        let x = fx + k as u16 * (stats::FIGURE_DIGITS + stats::FIGURE_GAP);
+        match v {
+            Some(v) if v.to_string().len() <= 3 => {
+                for (r, row) in stats::big_digits(v).iter().enumerate() {
+                    put(buf, x, bars_y + r as u16, row, Style::new().fg(color).bold());
+                }
+            }
+            // Four digits drop to plain text rather than being cut.
+            Some(v) => put(buf, x, bars_y + 1, &v.to_string(), Style::new().fg(color).bold()),
+            None if w.is_some() => put(buf, x, bars_y + 1, "n/a", Style::new().fg(DIM)),
+            None => put(buf, x, bars_y + 1, if app.stats.err[0].is_empty() { "counting" } else { "not counted" }, Style::new().fg(DIM)),
+        }
+        put(buf, x, base_y, label, Style::new().fg(color));
+        if let (Some(v), Some(p)) = (v, p) {
+            put(buf, x + label.len() as u16 + 1, base_y, &stats::delta(v, p), Style::new().fg(Color::Gray));
+        }
+    }
+    if !lay.has_charts() {
+        return;
+    }
+
+    // The 14-day context: dim captions, the bars in their series colours.
+    let today = n - 1;
+    let mark = cursor.unwrap_or(today);
+    let charts_w = (area.x + lay.charts[1] + lay.chart_w).min(area.right()).saturating_sub(area.x + lay.charts[0]) as usize;
+    if let Some(i) = cursor {
+        // A clicked day reads out over the chart captions; the figures stay.
+        let text = stats_day_text(app, axis, series[0], series[1], i);
+        let text = truncate(&text, charts_w.saturating_sub(4));
+        let x = area.x + lay.charts[0];
+        put(buf, x, head_y, &text, Style::new().fg(Color::White));
+        let r = Rect::new(x + text.width() as u16 + 1, head_y, 3, 1);
+        put(buf, r.x, head_y, " ✕ ", Style::new().fg(Color::Black).bg(ACCENT));
+        if r.right() <= area.right() {
+            app.hits.buttons.push((r, Action::StatsDay(None)));
+        }
+    }
+    for (c, (word, noun, color)) in [("OPENED / DAY", "opened", OPENED), ("MERGED / DAY", "merged", MERGED)].into_iter().enumerate() {
+        let vals = series[c];
+        let x0 = area.x + lay.charts[c];
+        let unknown = vals.iter().all(Option::is_none);
+        if cursor.is_none() {
+            let room = if c == 0 { lay.chart_w + stats::GUTTER - 1 } else { area.right().saturating_sub(x0 + 1) };
+            let room = room.saturating_sub(word.width() as u16 + 2) as usize;
+            put(buf, x0, head_y, word, Style::new().fg(color));
+            let caption = if c == 1 && !countable {
+                "not countable for this scope".to_string()
+            } else if unknown {
+                if app.stats.err[1 - c].is_empty() { "counting".into() } else { "not counted".into() }
+            } else {
+                let (total, peak) = stats::totals(vals);
+                let partial = if vals.iter().any(Option::is_none) { " · counting" } else { "" };
+                [
+                    format!("last {n}d · {total} {noun} · peak {peak}/day{partial}"),
+                    format!("{total} {noun} · peak {peak}/day{partial}"),
+                    format!("{total} {noun} · peak {peak}"),
+                    format!("{total} · pk {peak}"),
+                ]
+                .into_iter()
+                .find(|t| t.width() <= room)
+                .unwrap_or_else(|| total.to_string())
+            };
+            put(buf, x0 + word.width() as u16 + 2, head_y, &truncate(&caption, room), Style::new().fg(DIM));
+        }
+
+        if unknown || (c == 1 && !countable) {
+            let word = if c == 1 && !countable { "" } else if app.stats.err[1 - c].is_empty() { "counting" } else { "not counted" };
+            put(buf, x0, bars_y + 1, word, Style::new().fg(DIM));
+        } else {
+            let values: Vec<f64> = vals.iter().map(|v| v.unwrap_or(0) as f64).collect();
+            for (r, row) in stats::bars(&values, 3, 0.0).iter().enumerate() {
+                for (i, &ch) in row.iter().enumerate() {
+                    let (ch, mut style) = match vals[i] {
+                        Some(_) => (ch, Style::new().fg(color)),
+                        // A day the answer does not carry: a dim dot on the floor, never a zero.
+                        None => (if r == 2 { '·' } else { ' ' }, Style::new().fg(DIM)),
+                    };
+                    if i == today {
+                        style = style.bold();
+                    }
+                    if cursor == Some(i) {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    let x = area.x + lay.bar_x(c, i);
+                    for dx in 0..lay.barw {
+                        put(buf, x + dx, bars_y + r as u16, &ch.to_string(), style);
+                    }
+                }
+            }
+        }
+        // The baseline, with ▲ under today (or the day cursor).
+        put(buf, x0, base_y, &"─".repeat(lay.span as usize), Style::new().fg(DIM));
+        put(buf, area.x + lay.bar_x(c, mark) + lay.barw.saturating_sub(1) / 2, base_y, "▲", Style::new().fg(color));
+        let ago = format!("{n}d ago");
+        if lay.span as usize >= ago.len() + "today".len() + 1 {
+            put(buf, x0, labels_y, &ago, Style::new().fg(DIM));
+        }
+        put(buf, x0 + lay.span.saturating_sub(5), labels_y, "today", Style::new().fg(DIM));
+        for i in 0..n {
+            let w = if i + 1 < n { lay.slot } else { lay.barw };
+            app.hits.stats_days.push((Rect::new(area.x + lay.bar_x(c, i), bars_y, w, 4), i));
+        }
+    }
+}
+
 // ---------- list screen ----------
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
@@ -677,7 +1039,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let pinned = app.search.pinned_query();
     let page = inner.height as usize;
     let near = app.table_state.offset().min(app.sel).saturating_sub(page)..app.table_state.offset().max(app.sel) + 2 * page;
-    // The `#` column grows to hold a stack's tree glyph and `⧉ 2/4` chip.
+    // The `#` column grows to hold a stack's tree glyph and `2/4` chip.
     let num_w = vis
         .iter()
         .map(|r| {
@@ -948,12 +1310,13 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         info.truncate(end);
     }
     let cap = if collapsed { info.len() } else { (rest.height as usize * 45 / 100).max(5) };
-    let info_h = info.len().min(cap).min(rest.height.saturating_sub(6) as usize) as u16;
+    let tabs_h = tab_bar_height(app, rest.width);
+    let info_h = info.len().min(cap).min(rest.height.saturating_sub(5 + tabs_h) as usize) as u16;
     let margin = app.state.density.tab_margin();
     let [info_area, _, tabs_area, _, content] = Layout::vertical([
         Constraint::Length(info_h),
         Constraint::Length(margin),
-        Constraint::Length(1),
+        Constraint::Length(tabs_h),
         Constraint::Length(margin),
         Constraint::Min(1),
     ])
@@ -2226,8 +2589,22 @@ fn image_box(buf: &mut Buffer, area: Rect, r: Rect, y: isize, alt: &str) {
     }
 }
 
-fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
+/// One tab in the bar: its label (number, name, count, status icon) and optional new-items badge.
+struct TabChip {
+    tab: Tab,
+    label: String,
+    /// CI / Actions status, drawn in its own colour (so a running check animates).
+    icon: Option<Span<'static>>,
+    badge: Option<String>,
+}
+
+impl TabChip {
+    fn width(&self) -> u16 {
+        (self.label.width() + self.icon.as_ref().map_or(0, |i| i.width() + 1) + self.badge.as_ref().map_or(0, |b| b.width())) as u16
+    }
+}
+
+fn tab_chips(app: &App) -> Vec<TabChip> {
     let d = app.selected_detail();
     let chip = app.selected_pr().and_then(|p| app.chip(&p.id));
     let count = |t: Tab| -> String {
@@ -2252,65 +2629,87 @@ fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let outcomes = e.runs.iter().filter(|r| r.head_sha == e.sha).map(|r| rest_outcome(r.status(), r.conclusion.as_deref()));
         outcomes.min_by_key(|o| outcome_rank(o))
     });
-    let counts: Vec<String> = Tab::ALL.into_iter().map(count).collect();
-    let badges: Vec<Option<String>> = Tab::ALL.into_iter().map(|t| app.tab_badge(t)).collect();
-    // Eight tabs don't fit a narrow pane: shorten the inactive ones' names, then drop them.
-    let label_of = |i: usize, t: Tab, level: u8| -> String {
-        let name = match level {
-            _ if t == app.tab => t.label(),
-            0 => t.label(),
-            1 => t.short_label(),
-            _ => "",
-        };
-        let mut l = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
-        if (t == Tab::Checks && ci.is_some()) || (t == Tab::Actions && worst.is_some()) {
-            l.push_str("✓ ");
+    Tab::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let label = format!(" {} {}{} ", i + 1, t.label(), count(t));
+            let icon = match t {
+                Tab::Checks => ci.as_deref(),
+                Tab::Actions => worst.as_deref(),
+                _ => None,
+            }
+            .map(|state| ci_icon(Some(state)));
+            // ` 2 Conversation 7 +2 `: the badge is its own click target (the first new entry).
+            let badge = app.tab_badge(t).map(|b| format!("{b} "));
+            TabChip { tab: t, label, icon, badge }
+        })
+        .collect()
+}
+
+/// Width reserved at the right of the tab bar's first row for the info toggle.
+const INFO_TOGGLE_W: u16 = 9;
+
+/// Flow the tabs into rows that fit `width`, keeping every name whole; the first row leaves room
+/// for the info toggle.
+fn tab_rows(chips: &[TabChip], width: u16) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0u16;
+    for (i, c) in chips.iter().enumerate() {
+        let room = if rows.len() == 1 { width.saturating_sub(INFO_TOGGLE_W) } else { width };
+        if used + c.width() > room && !rows.last().is_some_and(|r| r.is_empty()) {
+            rows.push(Vec::new());
+            used = 0;
         }
-        l
-    };
-    let room = area.width.saturating_sub(9) as usize;
-    let fits = |level: u8| Tab::ALL.into_iter().enumerate().map(|(i, t)| label_of(i, t, level).width() + badges[i].as_ref().map_or(0, |b| b.width() + 1)).sum::<usize>() <= room;
-    let level = (0..2).find(|&l| fits(l)).unwrap_or(2);
-    let mut x = area.x;
-    let mut spans = Vec::new();
-    for (i, t) in Tab::ALL.into_iter().enumerate() {
-        let active = t == app.tab;
-        let name = match level {
-            _ if active => t.label(),
-            0 => t.label(),
-            1 => t.short_label(),
-            _ => "",
-        };
-        let mut label = if name.is_empty() { format!(" {}{} ", i + 1, counts[i]) } else { format!(" {} {name}{} ", i + 1, counts[i]) };
-        if t == Tab::Checks && ci.is_some() {
-            label.push_str(&ci_icon(ci.as_deref()).content);
-            label.push(' ');
-        }
-        if t == Tab::Actions && worst.is_some() {
-            label.push_str(&ci_icon(worst.as_deref()).content);
-            label.push(' ');
-        }
-        // ` 2 Conversation 7 +2 `: the badge is its own click target (the first new entry).
-        let badge = badges[i].as_ref().map(|b| format!("{b} "));
-        let (w, bw) = (label.width() as u16, badge.as_ref().map_or(0, |b| b.width() as u16));
-        if x + w + bw > area.right() {
+        rows.last_mut().unwrap().push(i);
+        used += c.width();
+    }
+    rows
+}
+
+/// Rows the tab bar needs at this width.
+fn tab_bar_height(app: &App, width: u16) -> u16 {
+    tab_rows(&tab_chips(app), width).len() as u16
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(Block::new().style(Style::new().bg(Color::Indexed(236))), area);
+    let chips = tab_chips(app);
+    for (row, idxs) in tab_rows(&chips, area.width).into_iter().enumerate() {
+        let y = area.y + row as u16;
+        if y >= area.bottom() {
             break;
         }
-        let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
-        spans.push(Span::styled(label, style));
-        app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::SetTab(t)));
-        x += w;
-        if let Some(b) = badge {
-            let bstyle = if active { style } else { Style::new().fg(ACCENT).bold() };
-            spans.push(Span::styled(b, bstyle));
-            app.hits.buttons.push((Rect::new(x, area.y, bw, 1), Action::OpenNew(t)));
-            x += bw;
+        let mut x = area.x;
+        let mut spans = Vec::new();
+        for i in idxs {
+            let c = &chips[i];
+            let active = c.tab == app.tab;
+            let style = if active { Style::new().fg(Color::Black).bg(ACCENT).bold() } else { Style::new().fg(Color::Gray) };
+            let mut w = c.label.width() as u16;
+            spans.push(Span::styled(c.label.clone(), style));
+            if let Some(icon) = &c.icon {
+                // On the active tab the icon keeps the tab's background.
+                let icon_style = if active { icon.style.bg(ACCENT) } else { icon.style };
+                spans.push(Span::styled(icon.content.clone(), icon_style));
+                spans.push(Span::styled(" ", style));
+                w += icon.width() as u16 + 1;
+            }
+            app.hits.buttons.push((Rect::new(x, y, w, 1), Action::SetTab(c.tab)));
+            x += w;
+            if let Some(b) = &c.badge {
+                let bw = b.width() as u16;
+                let bstyle = if active { style } else { Style::new().fg(ACCENT).bold() };
+                spans.push(Span::styled(b.clone(), bstyle));
+                app.hits.buttons.push((Rect::new(x, y, bw, 1), Action::OpenNew(c.tab)));
+                x += bw;
+            }
         }
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect::new(area.x, y, area.width, 1));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
     let toggle = if app.info_collapsed() { " ▾ info " } else { " ▴ info " };
     let tw = toggle.width() as u16;
-    if x + tw < area.right() {
+    if area.width > tw {
         let r = Rect::new(area.right() - tw, area.y, tw, 1);
         f.render_widget(Paragraph::new(toggle).style(Style::new().fg(DIM)), r);
         app.hits.buttons.push((r, Action::ToggleInfo));
@@ -3453,6 +3852,9 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("u / click N unread", "Only PRs with changes since you last opened them (• in the gutter)"),
         ("U", "Mark every listed PR read (opening a PR marks it read; J/K after 1 s)"),
         ("/ Sort unread first", "Unread PRs at the top (palette command)"),
+        ("T / click ▂▅ Stats", "Stats panel: opened / merged per UTC day, last 24 h (follows scope + repo)"),
+        ("  click bar · wheel", "Read one day's figures (click again or ✕ clears) · move the day"),
+        ("/ Stats: … my PRs", "Count only your PRs instead of the scope (palette, this session)"),
         ("?", "This help · Ctrl+C quits"),
         ("", "List"),
         ("↑↓ j k  PgUp PgDn  g G", "Move selection"),
@@ -3483,7 +3885,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("t", "Show / hide log timestamps"),
         ("Ctrl+F  n N", "Search the log · next / previous match"),
         ("Esc", "Clear search, then back from a job to its run"),
-        ("", "Stacks (⧉ 2/4 = position / size; accent = GitHub stack, gray = branch chain)"),
+        ("", "Stacks (2/4 = position / size; accent = GitHub stack, gray = branch chain)"),
         ("< >  click #n in the strip", "Previous (toward the base) / next PR in the stack"),
         ("8 · n p ↑ ↓ · Enter · Esc", "Stack tab: pick a member or Whole stack · its files, a file's diff · back"),
         ("b", "Update the PR's branch onto its parent (rebase, else merge; asks first)"),
@@ -3497,6 +3899,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("", "config.toml"),
         ("images = …", "auto · kitty · sixel · iterm2 · halfblocks · off  (GH_PR_MANAGER_IMAGES)"),
         ("[notify] bell desktop", "Bell / desktop notice: review asked, verdict, CI failed (off)"),
+        ("[stats] days scope", "Stats: 7-30 days (14) · \"follow\" or a qualifier · refresh_secs (300)"),
     ];
     let area = centered(f.area(), 88, rows.len() as u16 + 4);
     f.render_widget(Clear, area);
