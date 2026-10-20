@@ -231,7 +231,7 @@ pub fn chains(prs: &[&PrSummary], is_trunk: &dyn Fn(&str, &str) -> bool) -> Vec<
     };
     let better = |a: usize, b: usize| (rank(prs[a]), std::cmp::Reverse(prs[a].number)) < (rank(prs[b]), std::cmp::Reverse(prs[b].number));
     let repo = |p: &PrSummary| p.repository.name_with_owner.to_lowercase();
-    // Fork heads never chain: their branch isn't in the base repo.
+    // Fork PRs never chain: their branch isn't in the base repo, so no GitHub stack can hold them.
     let mut heads: HashMap<(String, &str), Vec<usize>> = HashMap::new();
     for (i, p) in prs.iter().enumerate() {
         if !p.is_cross_repository && !p.head_ref_name.is_empty() {
@@ -242,7 +242,7 @@ pub fn chains(prs: &[&PrSummary], is_trunk: &dyn Fn(&str, &str) -> bool) -> Vec<
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            if p.base_ref_name.is_empty() || is_trunk(&p.repository.name_with_owner, &p.base_ref_name) {
+            if p.is_cross_repository || p.base_ref_name.is_empty() || is_trunk(&p.repository.name_with_owner, &p.base_ref_name) {
                 return None;
             }
             let cands = heads.get(&(repo(p), p.base_ref_name.as_str()))?;
@@ -504,6 +504,10 @@ mod tests {
         let mut fork = chain_pr(4, "a/r", "fork-branch", "main", "OPEN");
         fork.is_cross_repository = true;
         prs.push(fork);
+        // Nor does a fork PR that targets one of ours.
+        let mut child = chain_pr(5, "a/r", "a", "a", "OPEN");
+        child.is_cross_repository = true;
+        prs.push(child);
         assert!(chains(&prs.iter().collect::<Vec<_>>(), &main_trunk).is_empty());
     }
 
