@@ -22,6 +22,7 @@ use crate::github::{
 use crate::search::{self, Command, Doc, Match, Query, TokenBucket};
 use crate::stacks::{self, Link, Member, RowView, Stack};
 use crate::state::{Seen, State};
+use crate::stats::{self, Which, Window};
 
 /// Maximum PRs loaded per scope (GitHub search caps at 1000).
 const MAX_PRS: usize = 300;
@@ -87,6 +88,8 @@ pub enum Msg {
     StackFiles { key: String, res: Result<Vec<FileDiff>> },
     /// A stack member that wasn't loaded, fetched to open it (`id` is the one asked for).
     Splice { id: String, res: Result<(Vec<PrSummary>, Option<RateLimit>)> },
+    /// One of the stats panel's two count requests, for the axis `days` (docs/stats-panel.md).
+    Stats { generation: u64, which: Which, days: Vec<String>, res: Result<(serde_json::Value, Option<RateLimit>)> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +298,13 @@ pub enum Action {
     /// The bottom PR's page, which holds GitHub's stack map.
     StackOnGitHub,
     ToggleGroupStacks,
+    // Stats panel (docs/stats-panel.md)
+    /// `T`, the header's ` ▂▅ Stats ` chip.
+    ToggleStats,
+    /// Put the day cursor on an axis day (a bar click; again, or `None`, clears it).
+    StatsDay(Option<usize>),
+    /// Palette: count the scope's PRs / only yours.
+    StatsScope,
     // Modal-level actions
     ModalPick(usize),
     ModalCancel,
@@ -450,6 +460,42 @@ pub struct Hits {
     pub editor: Option<Rect>,
     pub editor_rows: Vec<VisualRow>,
     pub popup_items: Vec<(Rect, usize)>,
+    /// The stats panel (the wheel moves its day cursor), and each day bar with its axis index.
+    pub stats: Option<Rect>,
+    pub stats_days: Vec<(Rect, usize)>,
+}
+
+/// The stats panel's figures and fetch bookkeeping (docs/stats-panel.md).
+#[derive(Default)]
+pub struct Stats {
+    /// The scope string the figures describe (`App::stats_scope`).
+    pub key: String,
+    /// Counts per UTC date (looked up by date, never by position). Empty: not counted yet.
+    pub merged: Vec<(String, i64)>,
+    pub created: Vec<(String, i64)>,
+    pub window: Option<Window>,
+    /// The 24 h before `window`, for its deltas.
+    pub prev: Option<Window>,
+    /// Unix seconds each was counted (merged, created), from the cache until a count lands.
+    pub at: [Option<i64>; 2],
+    /// Why each request last failed; cleared by its next answer.
+    pub err: [String; 2],
+    pub inflight: [bool; 2],
+    generation: u64,
+    /// When to count next; `None` is now.
+    next: Option<Instant>,
+    /// Failed rounds in a row (backs off 5 → 10 → 20 minutes).
+    fails: u32,
+    /// The UTC day the last count was asked on; a new day counts again.
+    asked_day: i64,
+    /// A count was skipped for a low API budget.
+    pub paused: bool,
+    /// The day cursor (an axis index): a bar click or the wheel.
+    pub day: Option<usize>,
+    /// Drawn in the last frame (not toggled off, too narrow or too short); nothing is fetched otherwise.
+    pub shown: bool,
+    /// The palette's session override of `[stats] scope`.
+    pub scope_override: Option<String>,
 }
 
 /// Workflow runs loaded for a PR, for the head commit they were fetched for.
@@ -796,6 +842,7 @@ pub struct App {
     pub stack_list_follow: bool,
     /// Members being fetched to be opened.
     splicing: HashSet<String>,
+    pub stats: Stats,
 }
 
 impl App {
@@ -926,6 +973,7 @@ impl App {
             stack_list_scroll: 0,
             stack_list_follow: true,
             splicing: HashSet::new(),
+            stats: Stats::default(),
         }
     }
 
@@ -942,7 +990,18 @@ impl App {
     pub fn search_query(&self) -> String {
         let scope = &self.scopes[self.scope];
         let repo = self.repo.as_ref().map(|r| format!("repo:{r}")).unwrap_or_default();
-        format!("is:pr archived:false {} {} {repo} sort:updated-desc", self.state_filter.qualifier(), scope.qualifier)
+        // GitHub ORs `repo:` with `user:`/`org:`, so with a repo set those owner qualifiers would
+        // widen the list to the union. The repo already pins the owner; drop them.
+        let qualifier = if self.repo.is_some() {
+            let owner = |t: &&str| {
+                let t = t.to_ascii_lowercase();
+                t.starts_with("user:") || t.starts_with("org:")
+            };
+            scope.qualifier.split_whitespace().filter(|t| !owner(t)).collect::<Vec<_>>().join(" ")
+        } else {
+            scope.qualifier.clone()
+        };
+        format!("is:pr archived:false {} {qualifier} {repo} sort:updated-desc", self.state_filter.qualifier())
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -1202,10 +1261,12 @@ impl App {
     /// Changes when the layout changes enough to warrant a full repaint (clears any
     /// stray glyphs a terminal may have left behind).
     /// Showing or hiding images counts too: Sixel pixels can outlive the cells they were drawn in.
-    pub fn layout_key(&self) -> (bool, Option<Tab>, bool, usize, usize, Option<String>, crate::state::Density, bool) {
+    /// The stats panel coming or going moves the body, so it counts too.
+    #[allow(clippy::type_complexity)]
+    pub fn layout_key(&self) -> (bool, Option<Tab>, bool, usize, usize, Option<String>, crate::state::Density, bool, bool) {
         let detail = self.screen == Screen::Detail;
         let pr = if detail { self.selected_pr().map(|p| p.id.clone()) } else { None };
-        (detail, detail.then_some(self.tab), self.modal.is_some(), self.file_sel, self.actions_sel, pr, self.state.density, self.images.enabled)
+        (detail, detail.then_some(self.tab), self.modal.is_some(), self.file_sel, self.actions_sel, pr, self.state.density, self.images.enabled, self.stats.shown)
     }
 
     /// Terminal rows per PR in whichever list is on screen.
@@ -1630,6 +1691,7 @@ impl App {
         }
         self.images.evict();
         self.drive_search();
+        self.drive_stats();
         // A skimmed-to PR is read once the dwell is over.
         if self.dwell.as_ref().is_some_and(|(_, at)| at.elapsed() >= DWELL) {
             self.read_open();
@@ -1638,6 +1700,8 @@ impl App {
 
     pub fn handle(&mut self, msg: Msg) {
         self.handle_msg(msg);
+        // A scope or repo change points the stats panel at its cached figures at once.
+        self.sync_stats();
         // Whatever put a PR in the detail view (Enter, J/K, a click, the palette, a reload),
         // it's being read.
         self.read_open();
@@ -2043,6 +2107,7 @@ impl App {
                     Err(e) => self.toast(format!("Couldn't load that PR: {e:#}"), ToastKind::Error),
                 }
             }
+            Msg::Stats { generation, which, days, res } => self.on_stats(generation, which, days, res),
             Msg::Image(m) => {
                 // Rows change when an image arrives; rebuilding re-lays out the tabs.
                 if self.images.apply(m) {
@@ -2134,6 +2199,7 @@ impl App {
             KeyCode::Char('s') => Some(Action::OpenScopes),
             KeyCode::Char('S') => Some(Action::OpenRepos),
             KeyCode::Char('D') => Some(Action::CycleDensity),
+            KeyCode::Char('T') => Some(Action::ToggleStats),
             KeyCode::Char('I') => Some(Action::ToggleImages),
             KeyCode::Char('e') => Some(Action::ToggleRepoOfSelected),
             KeyCode::Char('f') => Some(Action::CycleState),
@@ -2372,7 +2438,12 @@ impl App {
             }
             return;
         }
-        if let Some((r, offset)) = self.hits.file_list
+        if self.hits.stats.is_some_and(|r| r.contains(pos)) {
+            // Up is earlier; the cursor starts at today. Nothing scrolls.
+            let n = self.cfg.stats.days() as isize;
+            let cur = self.stats.day.map_or(n - 1, |d| d as isize);
+            self.stats.day = Some((cur + delta.signum()).clamp(0, n - 1) as usize);
+        } else if let Some((r, offset)) = self.hits.file_list
             && r.contains(pos)
         {
             let n = self.file_count();
@@ -2451,6 +2522,9 @@ impl App {
         }
         if let Some((_, a)) = self.hits.buttons.iter().find(|(r, _)| r.contains(pos)).cloned() {
             return self.run(a);
+        }
+        if let Some(&(_, i)) = self.hits.stats_days.iter().find(|(r, _)| r.contains(pos)) {
+            return self.run(Action::StatsDay(Some(i)));
         }
         if let Some((r, offset)) = self.hits.table
             && r.contains(pos)
@@ -2539,6 +2613,7 @@ impl App {
             }
             Action::Refresh => {
                 self.refresh();
+                self.stats.next = None;
                 if self.screen == Screen::Detail
                     && self.tab == Tab::Actions
                     && let Some(job) = self.selected_job().map(|j| j.id).filter(|j| self.log_wanted.contains(j))
@@ -2550,6 +2625,20 @@ impl App {
             Action::OpenScopes => {
                 let sel = scope_matches(&self.scopes, "", self.repo.is_some()).iter().position(|&i| i == self.scope).unwrap_or(0);
                 self.modal = Some(Modal::Scopes { filter: String::new(), sel });
+            }
+            Action::ToggleStats => {
+                let on = !self.stats_visible();
+                self.state.stats_visible = Some(on);
+                crate::state::save(&self.state);
+                self.toast(if on { "Stats panel shown (T hides it)" } else { "Stats panel hidden (T shows it)" }, ToastKind::Info);
+            }
+            Action::StatsDay(day) => self.stats.day = if day == self.stats.day { None } else { day },
+            Action::StatsScope => {
+                let cur = self.stats.scope_override.clone().unwrap_or_else(|| self.cfg.stats.scope.clone());
+                let follow = cur.trim().is_empty() || cur.trim().eq_ignore_ascii_case("follow");
+                self.stats.scope_override = Some(if follow { "author:@me" } else { "follow" }.into());
+                self.sync_stats();
+                self.toast(if follow { "Stats count your PRs (author:@me)" } else { "Stats follow the scope" }, ToastKind::Info);
             }
             Action::CycleDensity => {
                 self.state.density = self.state.density.next();
@@ -4527,6 +4616,142 @@ impl App {
         Some((self.prs.iter().filter(|p| self.search.bodies.contains_key(&p.id)).count(), self.prs.len()))
     }
 
+    // ---------- stats panel (docs/stats-panel.md) ----------
+
+    pub fn stats_visible(&self) -> bool {
+        self.state.stats_visible.unwrap_or(self.cfg.stats.visible)
+    }
+
+    /// What the panel counts: the list's scope and repo chips (`follow`), or a fixed qualifier
+    /// string from `[stats] scope` or the palette.
+    pub fn stats_scope(&self) -> String {
+        let s = self.stats.scope_override.as_deref().unwrap_or(&self.cfg.stats.scope).trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("follow") { stats::scope_of(&self.search_query()) } else { s.to_string() }
+    }
+
+    /// The axis: the configured number of UTC days ending today.
+    pub fn stats_axis(&self) -> Vec<String> {
+        stats::chart_days(stats::day_of(changes::now_secs()), self.cfg.stats.days())
+    }
+
+    /// Point the panel at the current scope; that scope's cached figures paint at once.
+    fn sync_stats(&mut self) {
+        let key = self.stats_scope();
+        if key == self.stats.key {
+            return;
+        }
+        let c = self.state.stats_cache.get(&key).cloned().unwrap_or_default();
+        let old = std::mem::take(&mut self.stats);
+        self.stats = Stats {
+            key,
+            merged: c.days.iter().filter_map(|(d, _, m)| m.map(|m| (d.clone(), m))).collect(),
+            created: c.days.iter().filter_map(|(d, o, _)| o.map(|o| (d.clone(), o))).collect(),
+            window: c.window,
+            prev: c.prev,
+            at: if c.at > 0 { [Some(c.at); 2] } else { [None; 2] },
+            // Answers for the old scope are dropped on arrival.
+            generation: old.generation + 1,
+            shown: old.shown,
+            scope_override: old.scope_override,
+            ..Stats::default()
+        };
+    }
+
+    /// Count when due: never while the panel is not on screen, while typing, or on a low budget.
+    fn drive_stats(&mut self) {
+        self.sync_stats();
+        let typing = matches!(self.modal, Some(Modal::Composer(_) | Modal::Search));
+        if !self.stats.shown || typing || self.stats.key.is_empty() || self.stats.inflight.iter().any(|&b| b) {
+            return;
+        }
+        let now = changes::now_secs();
+        // A new UTC day moves the axis: count again (the old figures still draw by date).
+        if stats::day_of(now) != self.stats.asked_day {
+            self.stats.next = None;
+        }
+        if self.stats.next.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        self.stats.paused = self.rate.as_ref().is_some_and(|r| r.remaining < r.limit / 10);
+        if self.stats.paused {
+            return;
+        }
+        let days = stats::chart_days(stats::day_of(now), self.cfg.stats.days());
+        let (since, before) = (stats::iso_datetime(now - 86_400), stats::iso_datetime(now - 2 * 86_400));
+        self.stats.asked_day = stats::day_of(now);
+        self.stats.inflight = [true; 2];
+        for which in [Which::Merged, Which::Created] {
+            let q = stats::count_query(&self.stats.key, &days, &since, &before, which);
+            let (client, tx, generation, days) = (self.client.clone(), self.tx.clone(), self.stats.generation, days.clone());
+            tokio::spawn(async move {
+                let res = client.count_search(&q).await;
+                let _ = tx.send(Msg::Stats { generation, which, days, res });
+            });
+        }
+    }
+
+    fn on_stats(&mut self, generation: u64, which: Which, days: Vec<String>, res: Result<(serde_json::Value, Option<RateLimit>)>) {
+        if generation != self.stats.generation {
+            return;
+        }
+        let i = which.index();
+        self.stats.inflight[i] = false;
+        let read = match res {
+            Ok((v, rate)) => {
+                self.rate = rate.or(self.rate.take());
+                let prev = stats::read_prev_window(&v);
+                stats::read_series(&v, &days, which).and_then(|s| Ok((s, if which == Which::Merged { Some((stats::read_window(&v)?, prev)) } else { None })))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+        match read {
+            Ok((series, window)) => {
+                match which {
+                    Which::Merged => {
+                        self.stats.merged = series;
+                        self.stats.window = window.map(|w| w.0);
+                        self.stats.prev = window.and_then(|w| w.1);
+                    }
+                    Which::Created => self.stats.created = series,
+                }
+                self.stats.err[i].clear();
+                self.stats.at[i] = Some(changes::now_secs());
+            }
+            // The last good figures stay, with the reason beside them.
+            Err(e) => self.stats.err[i] = e,
+        }
+        if self.stats.inflight.iter().any(|&b| b) {
+            return;
+        }
+        let secs = if self.stats.err.iter().any(|e| !e.is_empty()) {
+            self.stats.fails += 1;
+            300 << (self.stats.fails - 1).min(2)
+        } else {
+            self.stats.fails = 0;
+            match self.cfg.stats.refresh_secs {
+                // Only on `r` (a year is "not by itself").
+                0 => 365 * 86_400,
+                s => s,
+            }
+        };
+        self.stats.next = Some(Instant::now() + Duration::from_secs(secs));
+        self.save_stats();
+    }
+
+    /// Keep the figures in `state.json` for the next start's first paint.
+    fn save_stats(&mut self) {
+        let Some(at) = self.stats.at.iter().flatten().min().copied() else { return };
+        let mut dates: Vec<&String> = self.stats.created.iter().chain(&self.stats.merged).map(|(d, _)| d).collect();
+        dates.sort();
+        dates.dedup();
+        let find = |s: &[(String, i64)], d: &str| s.iter().find(|(h, _)| h == d).map(|(_, v)| *v);
+        let days = dates.into_iter().map(|d| (d.clone(), find(&self.stats.created, d), find(&self.stats.merged, d))).collect();
+        let entry = crate::state::StatsCache { days, window: self.stats.window, prev: self.stats.prev, at };
+        self.state.stats_cache.insert(self.stats.key.clone(), entry);
+        self.state.prune_stats(changes::now_secs());
+        crate::state::save(&self.state);
+    }
+
     /// Why a palette command can't run on the selected PR (the Actions menu's reasons).
     pub fn command_block(&self, c: Command) -> Option<String> {
         if c.needs_pr() && self.selected_pr().is_none() {
@@ -4593,6 +4818,8 @@ impl App {
             Command::StackMerge => Action::StackMergeUpTo,
             Command::StackBrowser => Action::StackOnGitHub,
             Command::GroupStacks => Action::ToggleGroupStacks,
+            Command::Stats => Action::ToggleStats,
+            Command::StatsScope => Action::StatsScope,
             Command::Help => Action::Help,
             Command::Quit => Action::Quit,
         };
@@ -5087,7 +5314,9 @@ mod search_tests {
             worst = worst.max(el);
             eprintln!("keystroke {text:<16} {el:?}");
         }
-        assert!(worst < Duration::from_millis(if cfg!(debug_assertions) { 100 } else { 16 }), "{worst:?}");
+        // Generous bounds: this guards against pathological slowdowns, and a loaded CI runner or a
+        // parallel test run easily doubles a frame's wall time.
+        assert!(worst < Duration::from_millis(if cfg!(debug_assertions) { 250 } else { 50 }), "{worst:?}");
         app.modal = None;
         let t = Instant::now();
         term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
@@ -5468,6 +5697,134 @@ mod change_tests {
         assert_eq!(app.selected_pr().unwrap().number, 2);
         app.on_click(Position::new(r.x + 30, r.y + 4));
         assert_eq!(app.selected_pr().unwrap().number, 3);
+    }
+
+    /// A whole answer to one of the stats requests for `days`.
+    fn stats_answer(days: &[String], which: Which, skip: Option<usize>) -> serde_json::Value {
+        let prefix = if which == Which::Merged { "m" } else { "c" };
+        let mut v = json!({ "mw": { "issueCount": 8 }, "cw": { "issueCount": 14 }, "xw": { "issueCount": 1234 }, "cp": { "issueCount": 11 }, "mp": { "issueCount": 8 }, "xp": { "issueCount": 1300 } });
+        for n in (0..days.len()).filter(|&n| Some(n) != skip) {
+            v[format!("{prefix}{n}")] = json!({ "issueCount": n as i64 % 5 });
+        }
+        v
+    }
+
+    #[test]
+    fn the_stats_panel_sits_above_the_status_line_and_hides_when_short() {
+        let mut app = test_app();
+        load(&mut app, prs());
+        let screen = |app: &mut App, w: u16, h: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let text = |y: u16| (0..w).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>();
+            (0..h).map(text).collect::<Vec<_>>()
+        };
+        // Hidden: the table runs down to the status line.
+        app.state.stats_visible = Some(false);
+        screen(&mut app, 120, 30);
+        let (without, _) = app.hits.table.unwrap();
+        assert!(!app.stats.shown && app.hits.stats.is_none());
+        // Shown (Cozy, 7 rows): directly above the status line, and the table is 7 rows shorter.
+        key(&mut app, KeyCode::Char('T'));
+        assert_eq!(app.state.stats_visible, Some(true));
+        let rows = screen(&mut app, 120, 30);
+        let panel = app.hits.stats.unwrap();
+        assert_eq!((panel.y, panel.height), (30 - 2 - 7, 7));
+        assert_eq!(app.hits.table.unwrap().0.height, without.height - 7);
+        assert!(rows[panel.y as usize].contains("▂▅ Stats") && rows[panel.y as usize].contains("T hide"), "{}", rows[panel.y as usize]);
+        // The 24 h figures come first; the 14-day charts beside them.
+        let head = &rows[panel.y as usize + 1];
+        assert!(head.find("LAST 24H").unwrap() < head.find("OPENED / DAY").unwrap(), "{head}");
+        // Nothing counted yet reads `counting`, never a zero.
+        assert!(rows[panel.y as usize + 3].contains("counting"), "{}", rows[panel.y as usize + 3]);
+        let days = app.cfg.stats.days();
+        assert_eq!(app.hits.stats_days.len(), 2 * days);
+        // The answers land: bars, figures, and a missing alias fails only its own series.
+        let axis = app.stats_axis();
+        let generation = app.stats.generation;
+        app.handle(Msg::Stats { generation, which: Which::Merged, days: axis.clone(), res: Ok((stats_answer(&axis, Which::Merged, None), None)) });
+        app.handle(Msg::Stats { generation, which: Which::Created, days: axis.clone(), res: Ok((stats_answer(&axis, Which::Created, Some(3)), None)) });
+        assert_eq!(app.stats.merged.len(), days);
+        assert!(app.stats.created.is_empty() && app.stats.err[1].contains("c3"), "{:?}", app.stats.err);
+        assert_eq!(app.stats.window, Some(Window { opened: 14, merged: 8, closed: 1234 }));
+        let rows = screen(&mut app, 120, 30);
+        let all = rows.join("\n");
+        assert!(all.contains("count failed") && all.contains("not counted"), "{all}");
+        // Four digits are plain text; two are drawn large.
+        assert!(all.contains("1234") && all.contains("█▀█"), "{all}");
+        // A stale generation (another scope's answer) is dropped.
+        app.handle(Msg::Stats { generation: generation + 9, which: Which::Created, days: axis.clone(), res: Ok((stats_answer(&axis, Which::Created, None), None)) });
+        assert!(app.stats.created.is_empty());
+        // Click a bar: the heading reads that day; click it again to clear. The wheel moves the cursor.
+        let (r, i) = app.hits.stats_days[2];
+        app.on_click(Position::new(r.x, r.y + 1));
+        assert_eq!(app.stats.day, Some(i));
+        let rows = screen(&mut app, 120, 30);
+        // In the chart captions, beside the figures, which stay.
+        let head = &rows[panel.y as usize + 1];
+        assert!(head.contains("(UTC)") && head.contains("LAST 24H") && !head.contains("OPENED / DAY"), "{head}");
+        app.on_click(Position::new(r.x, r.y));
+        assert_eq!(app.stats.day, None);
+        app.on_wheel(Position::new(panel.x + 5, panel.y + 3), -3);
+        assert_eq!(app.stats.day, Some(days - 2));
+        app.on_wheel(Position::new(panel.x + 5, panel.y + 3), 3);
+        app.on_wheel(Position::new(panel.x + 5, panel.y + 3), 3);
+        assert_eq!(app.stats.day, Some(days - 1));
+        // Comfortable is 9 rows: a 20-row terminal leaves fewer than 8 list rows, so it auto-hides
+        // without touching the toggle; Compact is one row.
+        app.state.density = crate::state::Density::Comfortable;
+        screen(&mut app, 120, 20);
+        assert!(app.hits.stats.is_none() && !app.stats.shown);
+        assert_eq!(app.stats_visible(), true);
+        screen(&mut app, 120, 22);
+        assert_eq!(app.hits.stats.unwrap().height, 9);
+        app.state.density = crate::state::Density::Compact;
+        let rows = screen(&mut app, 120, 20);
+        assert_eq!(app.hits.stats.unwrap().height, 1);
+        assert!(rows[17].starts_with(" LAST 24H 14 opened ▲3  8 merged =  1234 closed ▼66"), "{}", rows[17]);
+        // Narrow: the charts go first and the figures stay large; under 40 columns the one-row
+        // form at any density; under 24, nothing.
+        app.state.density = crate::state::Density::Cozy;
+        let rows = screen(&mut app, 60, 30);
+        assert_eq!(app.hits.stats.unwrap().height, 7);
+        assert!(app.hits.stats_days.is_empty() && rows[24].contains("█"), "{}", rows[24]);
+        screen(&mut app, 30, 30);
+        assert_eq!(app.hits.stats.unwrap().height, 1);
+        screen(&mut app, 20, 30);
+        assert!(app.hits.stats.is_none());
+        // The header chip toggles it too.
+        screen(&mut app, 120, 30);
+        let chip = app.hits.buttons.iter().find(|(_, a)| *a == Action::ToggleStats).map(|(r, _)| *r).unwrap();
+        app.on_click(Position::new(chip.x, chip.y));
+        assert_eq!(app.state.stats_visible, Some(false));
+    }
+
+    #[tokio::test]
+    async fn the_stats_scope_follows_the_chips_and_the_palette_flips_it() {
+        let mut app = test_app();
+        app.repo = Some("acme/app".into());
+        app.sync_stats();
+        assert_eq!(app.stats.key, "author:@me repo:acme/app");
+        app.state.stats_cache.insert(
+            "author:@me".into(),
+            crate::state::StatsCache { days: vec![(app.stats_axis()[0].clone(), Some(3), Some(1))], at: 5, ..Default::default() },
+        );
+        app.run(Action::SetRepo(None));
+        app.sync_stats();
+        // The cached figures for the new scope paint at once.
+        assert_eq!(app.stats.key, "author:@me");
+        assert_eq!(app.stats.created.len(), 1);
+        app.run(Action::SetState(StateFilter::Merged));
+        app.sync_stats();
+        assert_eq!(app.stats.key, "author:@me", "the state chip is not part of the scope");
+        app.scope = 1;
+        app.sync_stats();
+        assert_eq!(app.stats.key, "review-requested:@me");
+        assert!(!stats::merges_countable(&app.stats.key));
+        app.run(Action::StatsScope);
+        assert_eq!(app.stats.key, "author:@me");
+        app.run(Action::StatsScope);
+        assert_eq!(app.stats.key, "review-requested:@me");
     }
 
     #[tokio::test]

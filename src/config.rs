@@ -27,6 +27,34 @@ pub struct Config {
     pub search: SearchConfig,
     /// Bell / desktop notifications for interrupt-worthy changes (off by default).
     pub notify: NotifyConfig,
+    /// The opened / merged per day panel above the status line (docs/stats-panel.md).
+    pub stats: StatsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StatsConfig {
+    /// Days on the axis, 7 to 30.
+    pub days: u8,
+    /// Shown until toggled with `T` (the toggle is remembered in state.json).
+    pub visible: bool,
+    /// `"follow"` counts what the scope and repo chips list; anything else is a search
+    /// qualifier string to count instead (`"author:@me"`, `"user:me org:acme"`).
+    pub scope: String,
+    /// Seconds between counts; 0 counts only on `r`.
+    pub refresh_secs: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self { days: 14, visible: true, scope: "follow".into(), refresh_secs: 300 }
+    }
+}
+
+impl StatsConfig {
+    pub fn days(&self) -> usize {
+        (self.days as usize).clamp(crate::stats::MIN_DAYS, crate::stats::MAX_DAYS)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +126,7 @@ impl Default for Config {
             image_max_rows: 20,
             search: SearchConfig::default(),
             notify: NotifyConfig::default(),
+            stats: StatsConfig::default(),
         }
     }
 }

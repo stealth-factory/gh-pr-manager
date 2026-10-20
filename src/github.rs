@@ -130,6 +130,12 @@ impl Client {
         Ok((Viewer { login: r.viewer.login, orgs }, rate))
     }
 
+    /// Aliased `search(type:ISSUE) { issueCount }` counts for the stats panel
+    /// (`stats::count_query`); the answer's aliases are read by `stats::read_series`.
+    pub async fn count_search(&self, query: &str) -> Result<(Value, Option<RateLimit>)> {
+        self.graphql::<Value>(query, json!({})).await
+    }
+
     /// Fetch one page (`first` ≤ 100) of PR search results.
     pub async fn search_page(&self, query: &str, after: Option<String>, first: u32) -> Result<SearchPage> {
         #[derive(Deserialize)]

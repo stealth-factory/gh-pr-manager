@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::changes::Snapshot;
 use crate::github::RepoInfo;
+use crate::stats::Window;
 
 /// Most PRs remembered in `seen`; the least recently touched go first.
 const SEEN_CAP: usize = 2000;
@@ -30,7 +31,28 @@ pub struct State {
     pub unread_first: bool,
     /// Keep each stack's PRs together in the list, bottom first (docs/stacks.md).
     pub group_stacks: bool,
+    /// The stats panel (`T`); `None` follows `[stats] visible`.
+    pub stats_visible: Option<bool>,
+    /// The stats panel's last counts per scope string, for an instant first paint.
+    pub stats_cache: HashMap<String, StatsCache>,
 }
+
+/// Stats cached for one scope (docs/stats-panel.md §3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatsCache {
+    /// (UTC date, opened, merged); a figure that never arrived is `None`, never 0.
+    pub days: Vec<(String, Option<i64>, Option<i64>)>,
+    pub window: Option<Window>,
+    /// The 24 h before `window` (its deltas).
+    pub prev: Option<Window>,
+    /// Unix seconds of the older of the two counts.
+    pub at: i64,
+}
+
+/// Scopes kept in `stats_cache`, and how old an entry may get.
+const STATS_CAP: usize = 8;
+const STATS_TTL_SECS: i64 = 7 * 86400;
 
 impl Default for State {
     fn default() -> Self {
@@ -43,6 +65,8 @@ impl Default for State {
             seen: HashMap::new(),
             unread_first: false,
             group_stacks: true,
+            stats_visible: None,
+            stats_cache: HashMap::new(),
         }
     }
 }
@@ -182,6 +206,15 @@ impl State {
         }
     }
 
+    /// Drop stats older than a week, then all but the newest `STATS_CAP` scopes.
+    pub fn prune_stats(&mut self, now: i64) {
+        self.stats_cache.retain(|_, c| now - c.at <= STATS_TTL_SECS);
+        while self.stats_cache.len() > STATS_CAP {
+            let Some(oldest) = self.stats_cache.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else { break };
+            self.stats_cache.remove(&oldest);
+        }
+    }
+
     pub fn push_recent(&mut self, repo: &str) {
         self.recent_repos.retain(|r| !r.eq_ignore_ascii_case(repo));
         self.recent_repos.insert(0, repo.to_string());
@@ -233,6 +266,34 @@ mod tests {
         assert!(old.seen.is_empty());
         let partial: State = serde_json::from_str(r#"{"seen":{"PR_2":{"comments":3}}}"#).unwrap();
         assert_eq!((partial.seen["PR_2"].snap.comments, partial.seen["PR_2"].at, partial.seen["PR_2"].unread), (3, 0, false));
+    }
+
+    #[test]
+    fn stats_cache_round_trips_and_prunes() {
+        let mut s = State::default();
+        let c = StatsCache {
+            days: vec![("2026-10-19".into(), Some(4), None), ("2026-10-20".into(), Some(1), Some(2))],
+            window: Some(Window { opened: 14, merged: 8, closed: 0 }),
+            prev: Some(Window { opened: 11, merged: 8, closed: 2 }),
+            at: 1_000_000,
+        };
+        s.stats_cache.insert("org:acme".into(), c.clone());
+        s.stats_visible = Some(false);
+        let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.stats_cache["org:acme"], c);
+        assert_eq!(back.stats_visible, Some(false));
+        // A state file from before the stats panel.
+        let old: State = serde_json::from_str(r#"{"density":"Cozy","recent_repos":[],"unread_first":true}"#).unwrap();
+        assert!(old.stats_cache.is_empty() && old.stats_visible.is_none());
+        // A week old goes; beyond eight scopes the oldest go.
+        let now = 100 * 86400;
+        for i in 0..10 {
+            s.stats_cache.insert(format!("k{i}"), StatsCache { at: now - i, ..StatsCache::default() });
+        }
+        s.stats_cache.insert("stale".into(), StatsCache { at: now - 8 * 86400, ..StatsCache::default() });
+        s.prune_stats(now);
+        assert_eq!(s.stats_cache.len(), STATS_CAP);
+        assert!(s.stats_cache.contains_key("k0") && s.stats_cache.contains_key("k7") && !s.stats_cache.contains_key("k8"));
     }
 
     #[test]

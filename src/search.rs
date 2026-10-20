@@ -831,12 +831,14 @@ pub enum Command {
     StackMerge,
     StackBrowser,
     GroupStacks,
+    Stats,
+    StatsScope,
     Help,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 30] = [
+    pub const ALL: [Command; 32] = [
         Command::Comment,
         Command::Merge,
         Command::Approve,
@@ -865,6 +867,8 @@ impl Command {
         Command::StackMerge,
         Command::StackBrowser,
         Command::GroupStacks,
+        Command::Stats,
+        Command::StatsScope,
         Command::Help,
         Command::Quit,
     ];
@@ -899,6 +903,8 @@ impl Command {
             Command::StackMerge => "Stack: merge up to here…",
             Command::StackBrowser => "Stack: open on GitHub",
             Command::GroupStacks => "Group by stack (on / off)",
+            Command::Stats => "Show / hide the stats panel",
+            Command::StatsScope => "Stats: follow the scope / count my PRs",
             Command::Help => "Help",
             Command::Quit => "Quit",
         }
@@ -930,7 +936,8 @@ impl Command {
             Command::StackUpdate => "b",
             Command::StackLink => "L",
             Command::StackMerge => "M",
-            Command::StackBrowser | Command::GroupStacks => "",
+            Command::StackBrowser | Command::GroupStacks | Command::StatsScope => "",
+            Command::Stats => "T",
             Command::Help => "?",
             Command::Quit => "q",
         }
