@@ -2550,6 +2550,33 @@ mod tests {
         assert!(super::files_match_head(None, "abc"));
     }
 
+    fn job(attempt: u64) -> super::Job {
+        super::Job {
+            id: attempt,
+            run_id: 1,
+            run_attempt: attempt,
+            name: String::new(),
+            status: "completed".into(),
+            conclusion: None,
+            started_at: None,
+            completed_at: None,
+            html_url: None,
+            labels: Vec::new(),
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rerun_refetches_only_an_older_attempt() {
+        assert!(!super::rerun(&[job(2)], Some(2)));
+        assert!(super::rerun(&[job(1)], Some(2)));
+        assert!(!super::rerun(&[job(2)], Some(1)));
+        assert!(!super::rerun(&[job(1), job(3)], Some(3)));
+        assert!(super::rerun(&[job(1), job(2)], Some(3)));
+        assert!(!super::rerun(&[], Some(2)));
+        assert!(!super::rerun(&[job(1)], None));
+    }
+
     #[test]
     fn cached_repos_stay_hidden_until_the_login_matches() {
         let cache = super::ReposCache {
@@ -2599,10 +2626,12 @@ fn cached_repos(cache: Option<&ReposCache>, login: &str) -> Option<Vec<RepoInfo>
     cache.filter(|c| c.login == login).map(|c| c.repos.clone())
 }
 
-/// Whether cached jobs belong to an earlier attempt than the run's `attempt` (a re-run keeps
-/// the run id but brings new jobs).
+/// Whether cached jobs are behind the run's `attempt`. A re-run keeps the run id and
+/// replaces the jobs. Jobs from a newer attempt than the run list are already current
+/// (the list has not caught up); treating that as stale starts the same fetch on every reply.
 fn rerun(jobs: &[Job], attempt: Option<u64>) -> bool {
-    attempt.is_some_and(|a| jobs.first().is_some_and(|j| j.run_attempt != a))
+    let cached = jobs.iter().map(|j| j.run_attempt).max();
+    attempt.is_some_and(|a| cached.is_some_and(|cached| cached < a))
 }
 
 fn count_repos(prs: &[PrSummary]) -> Vec<(String, usize)> {
