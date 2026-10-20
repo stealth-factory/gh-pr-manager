@@ -43,7 +43,8 @@ rejected; at `first:100` even today's query costs 2 and that org scope returns a
 page size stays 50. `DETAIL_QUERY` gains `baseRefOid`, `repository { defaultBranchRef { name } }` and `stack { … entries(first:30) {
 totalCount nodes { position pullRequest { id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus
 reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}} } } } }`: cost **2 → 2**, 1.8–2.0 s. The detail is the source of
-truth for the open PR's stack (members beyond the loaded list included); the list fields give every row its chip.
+truth for the open PR's stack (members beyond the loaded list included); the list fields give every row its chip. Only details
+fetched since the list started loading override it, newest last, so a stack changed or dissolved elsewhere isn't kept alive.
 
 **Implicit** (`stacks::chains`): among loaded `PrSummary`s of one repo, `parent(p)` = the PR whose `headRefName == p.baseRefName`,
 preferring OPEN over MERGED over CLOSED, newest number on ties; a PR whose base is the repo's default branch (or whose parent is not
