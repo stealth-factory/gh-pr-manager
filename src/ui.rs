@@ -18,6 +18,7 @@ use crate::app::{
     Action, App, ComposeKind, DetailRow, Focus, Hits, Item, LogView, Marks, Modal, RepoItem, Screen, Tab, ToastKind, TreeNode, repo_items,
     scope_matches, search_items,
 };
+use crate::changes::Change;
 use crate::search::Command;
 use crate::state::Density;
 use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, WorkflowRunInfo, login_of};
@@ -316,6 +317,26 @@ fn review_span(decision: Option<&str>) -> Span<'static> {
     }
 }
 
+/// The unread gutter mark: a `•` (not colour alone), or a blank keeping the column.
+fn unread_dot(unread: bool) -> Span<'static> {
+    if unread { Span::styled("•", Style::new().fg(ACCENT).bold()) } else { Span::raw(" ") }
+}
+
+/// New comments since you last looked (list counts can't tell bots or yourself apart).
+fn new_comments(changes: Option<&Vec<Change>>) -> usize {
+    changes.and_then(|c| c.iter().find_map(|c| if let Change::Comments(n) = c { Some(*n) } else { None })).unwrap_or(0)
+}
+
+/// The Cmts cell: the count, then `+n` new ones.
+fn comment_spans(total: usize, changes: Option<&Vec<Change>>) -> Vec<Span<'static>> {
+    let mut out = vec![Span::styled(if total > 0 { total.to_string() } else { String::new() }, Style::new().fg(Color::Gray))];
+    let n = new_comments(changes);
+    if n > 0 {
+        out.push(Span::styled(format!(" +{n}"), Style::new().fg(ACCENT).bold()));
+    }
+    out
+}
+
 // ---------- header / status / footer ----------
 
 fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
@@ -356,8 +377,9 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.buttons.push((Rect::new(x, area.y, search_label.width() as u16, 1), Action::OpenSearch));
     spans.push(Span::styled(search_label, Style::new().fg(Color::Magenta).bold().add_modifier(Modifier::UNDERLINED)));
     spans.push(Span::raw("  "));
+    x += search_label.width() as u16 + 2;
 
-    let shown = app.visible().len();
+    let shown = app.visible_base().len();
     let count = if app.search.pinned.is_some() {
         format!("{shown} matching of {}", app.prs.len())
     } else if app.total > app.prs.len() {
@@ -365,7 +387,29 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("{} PRs", app.prs.len())
     };
-    spans.push(Span::styled(count, Style::new().fg(Color::Gray)));
+    // ` 87 PRs · 4 unread ` (click toggles the unread filter); with it on, ` 4 unread of 87 PRs ✕ `.
+    let unread = app.unread_count();
+    let unread_style = Style::new().fg(ACCENT).bold().add_modifier(Modifier::UNDERLINED);
+    if app.unread_only {
+        let label = format!("{unread} unread");
+        let w = label.width() as u16;
+        app.hits.buttons.push((Rect::new(x, area.y, w, 1), Action::ToggleUnreadOnly));
+        spans.push(Span::styled(label, unread_style));
+        let of = format!(" of {count} ");
+        x += w + of.width() as u16;
+        spans.push(Span::styled(of, Style::new().fg(Color::Gray)));
+        app.hits.buttons.push((Rect::new(x, area.y, 3, 1), Action::ToggleUnreadOnly));
+        spans.push(Span::styled(" ✕ ", Style::new().fg(Color::Black).bg(ACCENT)));
+    } else {
+        x += count.width() as u16;
+        spans.push(Span::styled(count, Style::new().fg(Color::Gray)));
+        if unread > 0 {
+            spans.push(Span::styled(" · ", Style::new().fg(DIM)));
+            let label = format!("{unread} unread");
+            app.hits.buttons.push((Rect::new(x + 3, area.y, label.width() as u16, 1), Action::ToggleUnreadOnly));
+            spans.push(Span::styled(label, unread_style));
+        }
+    }
     if app.loading_list || !app.detail_loading.is_empty() || !app.busy.is_empty() {
         spans.push(Span::styled(format!("  {} loading", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT)));
     }
@@ -387,6 +431,8 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let rw = right.iter().map(|s| s.width()).sum::<usize>() as u16;
     if rw < area.width / 2 {
         let r = Rect::new(area.right() - rw, area.y, rw, 1);
+        // On a narrow screen this covers the end of the left side; so are its click targets.
+        app.hits.buttons.retain(|(b, a)| *a != Action::ToggleUnreadOnly || b.right() <= r.x);
         app.hits.buttons.push((Rect::new(area.right() - 3, area.y, 3, 1), Action::Help));
         app.hits.buttons.push((Rect::new(r.x, area.y, density.width() as u16, 1), Action::CycleDensity));
         f.render_widget(Paragraph::new(Line::from(right)), r);
@@ -394,7 +440,38 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
-    let line = if let Some((msg, kind, _)) = &app.toast {
+    // The refresh digest beats an older toast, never an error or the log-search prompt.
+    let log_search = app.log_view.search.is_some() && app.screen == Screen::Detail && app.tab == Tab::Actions;
+    let digest = app.digest.as_ref().filter(|d| !log_search && app.toast.as_ref().is_none_or(|(_, kind, at)| *kind != ToastKind::Error && *at <= d.at));
+    let line = if let Some(d) = digest {
+        // ↻ 3 PRs changed · #151 CI failed · #437 review requested · +2 more   u unread only
+        let mut spans = Vec::new();
+        let mut x = area.x;
+        // Clicks past the text area belong to the `img:` chip on the right.
+        let right = area.right().saturating_sub(format!(" img: {} ", app.images.protocol_label()).width() as u16);
+        let mut push = |spans: &mut Vec<Span<'static>>, text: String, style: Style, action: Option<Action>| {
+            let w = text.width() as u16;
+            if let Some(a) = action
+                && x < right
+            {
+                app.hits.buttons.push((Rect::new(x, area.y, w.min(right - x), 1), a));
+            }
+            x += w;
+            spans.push(Span::styled(text, style));
+        };
+        let first = d.items.first().map(|(id, _)| Action::JumpTo(id.clone()));
+        let head = format!(" ↻ {} PR{} changed{}", d.count, if d.count == 1 { "" } else { "s" }, if d.since_last { " since you last looked" } else { "" });
+        push(&mut spans, head, Style::new().fg(ACCENT).bold(), first);
+        for (id, text) in &d.items {
+            push(&mut spans, " · ".into(), Style::new().fg(DIM), None);
+            push(&mut spans, text.clone(), Style::new().add_modifier(Modifier::UNDERLINED), Some(Action::JumpTo(id.clone())));
+        }
+        if d.more > 0 {
+            push(&mut spans, format!(" · +{} more", d.more), Style::new().fg(DIM), None);
+        }
+        push(&mut spans, "   u unread only · click to jump".into(), Style::new().fg(DIM), None);
+        Line::from(spans)
+    } else if let Some((msg, kind, _)) = &app.toast {
         let (icon, color) = match kind {
             ToastKind::Info => ("ℹ", ACCENT),
             ToastKind::Success => ("✓", Color::Green),
@@ -475,6 +552,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("S", "Repo", Action::OpenRepos),
             ("f", "State", Action::CycleState),
             ("/", "Search", Action::OpenSearch),
+            ("u", "Unread", Action::ToggleUnreadOnly),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("o", "Browser", Action::Browser),
@@ -502,6 +580,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Tab", "Switch pane", Action::ToggleFocus),
             ("[ ]", "Tabs", Action::NextTab),
             ("/", "Search", Action::OpenSearch),
+            ("u", "Unread", Action::ToggleUnreadOnly),
             ("c", "Comment", Action::Comment),
             ("m", "Merge", Action::MergeMenu),
             ("a", "Approve", Action::Approve),
@@ -535,6 +614,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             vec![Line::styled(format!("Failed to load PRs: {e}"), Style::new().fg(Color::Red)), Line::raw(""), Line::raw("Press r to retry")]
         } else if app.loading_list {
             vec![Line::styled(format!("{} Loading pull requests…", SPINNER[app.tick % SPINNER.len()]), Style::new().fg(ACCENT))]
+        } else if app.unread_only {
+            vec![Line::raw("No unread pull requests here."), Line::styled("u or Esc shows them all", Style::new().fg(DIM))]
         } else if let Some(p) = &app.search.pinned {
             vec![Line::raw(format!("No PRs match “{p}”")), Line::styled("Esc clears the search · / searches again (GitHub too)", Style::new().fg(DIM))]
         } else if let Some(r) = &app.repo {
@@ -565,7 +646,11 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(row, &i)| {
             let p = &app.prs[i];
             let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, Some(60))).unwrap_or_default();
+            let changes = app.unread.get(&p.id);
             let title_style = if p.is_draft { Style::new().fg(Color::Gray) } else { Style::new() };
+            let title_style = if changes.is_some() { title_style.bold() } else { title_style };
+            let changed = |f: fn(&Change) -> bool| changes.is_some_and(|c| c.iter().any(f));
+            let bold_if = |span: Span<'static>, on: bool| if on { span.bold() } else { span };
             let mut title = hl_spans(&p.title, &mk.title, |_| title_style, usize::MAX);
             if body_only(&mk)
                 && let Some((text, ranges)) = &mk.snippet
@@ -574,17 +659,14 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 title.extend(hl_spans(text, &ranges_idx(ranges), |_| Style::new().fg(DIM), usize::MAX));
             }
             Row::new(vec![
-                Cell::from(Line::from(vec![Span::raw(" "), state_icon(&p.state, p.is_draft)])),
+                Cell::from(Line::from(vec![unread_dot(changes.is_some()), state_icon(&p.state, p.is_draft)])),
                 Cell::from(Line::from(hl_spans(&p.repository.name_with_owner, &mk.repo, |_| Style::new().fg(Color::Blue), usize::MAX))),
                 Cell::from(Line::from(number_spans(p.number, &mk.number))),
                 Cell::from(Line::from(title)),
                 Cell::from(Line::from(hl_spans(login_of(&p.author), &mk.author, |_| Style::new(), usize::MAX))),
-                Cell::from(ci_icon(p.ci_state())),
-                Cell::from(review_span(p.review_decision.as_deref())),
-                Cell::from(
-                    Line::styled(if p.comments.total_count > 0 { p.comments.total_count.to_string() } else { String::new() }, Style::new().fg(Color::Gray))
-                        .right_aligned(),
-                ),
+                Cell::from(bold_if(ci_icon(p.ci_state()), changed(|c| matches!(c, Change::Ci { .. })))),
+                Cell::from(bold_if(review_span(p.review_decision.as_deref()), changed(|c| matches!(c, Change::Verdict { .. })))),
+                Cell::from(Line::from(comment_spans(p.comments.total_count, changes)).right_aligned()),
                 Cell::from(Span::styled(ago(&p.updated_at), Style::new().fg(DIM))),
             ])
             .bottom_margin(density.table_row_h() as u16 - 1)
@@ -598,7 +680,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(14),
         Constraint::Length(2),
         Constraint::Length(10),
-        Constraint::Length(4),
+        // `20 +12`
+        Constraint::Length(7),
         Constraint::Length(7),
     ];
     let header = Row::new(vec![
@@ -650,14 +733,33 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(row, &i)| {
             let p = &app.prs[i];
             let mk = pinned.as_ref().filter(|_| near.contains(&row)).map(|q| app.marks(q, i, None)).unwrap_or_default();
+            let changes = app.unread.get(&p.id);
             let num = format!("#{} ", p.number);
-            let mut l1 = vec![state_icon(&p.state, p.is_draft), Span::raw(" "), ci_icon(p.ci_state()), Span::raw(" ")];
+            // Compact has no second line, so the new-comment count follows the title.
+            let extra = match (app.state.density, new_comments(changes)) {
+                (Density::Compact, n) if n > 0 => format!(" +{n}"),
+                _ => String::new(),
+            };
+            let title_style = if changes.is_some() { Style::new().bold() } else { Style::new() };
+            let mut l1 = vec![unread_dot(changes.is_some()), state_icon(&p.state, p.is_draft), Span::raw(" "), ci_icon(p.ci_state()), Span::raw(" ")];
             l1.extend(number_spans(p.number, &mk.number));
             l1.push(Span::raw(" "));
-            l1.extend(hl_spans(&p.title, &mk.title, |_| Style::new(), w.saturating_sub(4 + num.width())));
+            l1.extend(hl_spans(&p.title, &mk.title, |_| title_style, w.saturating_sub(5 + num.width() + extra.width())));
+            if !extra.is_empty() {
+                l1.push(Span::styled(extra, Style::new().fg(ACCENT).bold()));
+            }
             let l1 = Line::from(l1);
-            let meta = format!("    {} · {} · {}", p.repository.name_with_owner, login_of(&p.author), ago(&p.updated_at));
-            let l2 = Line::styled(truncate(&meta, w), Style::new().fg(DIM));
+            // The dim second line ends with the top two changes.
+            let mut meta = format!("     {} · {} · {}", p.repository.name_with_owner, login_of(&p.author), ago(&p.updated_at));
+            let what: Vec<String> = changes.map(|c| c.iter().take(2).map(Change::label).collect()).unwrap_or_default();
+            let l2 = if what.is_empty() {
+                Line::styled(truncate(&meta, w), Style::new().fg(DIM))
+            } else {
+                let what = format!(" · {}", what.join(" · "));
+                // Keep the changes in view: shorten the repo/author part first.
+                meta = truncate(&meta, w.saturating_sub(what.width()).max(w / 3));
+                Line::from(vec![Span::styled(meta, Style::new().fg(DIM)), Span::styled(truncate(&what, w), Style::new().fg(ACCENT))])
+            };
             match app.state.density {
                 Density::Comfortable => ListItem::new(vec![l1, l2, Line::raw("")]),
                 Density::Cozy => ListItem::new(vec![l1, l2]),
@@ -2654,9 +2756,12 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("o", "Open the selected PR in your browser"),
         ("y", "Copy `gh pr checkout` command to clipboard"),
         ("D / click ≡", "Display density: Comfortable → Cozy → Compact"),
+        ("u / click N unread", "Only PRs with changes since you last opened them (• in the gutter)"),
+        ("U", "Mark every listed PR read (opening a PR marks it read)"),
         ("?", "This help · Ctrl+C quits"),
         ("", "List"),
         ("↑↓ j k  PgUp PgDn  g G", "Move selection"),
+        ("Esc", "Clear the unread filter, then the search filter"),
         ("Enter / double-click", "Open the PR detail view"),
         ("", "Detail view"),
         ("Tab  h l  ← →  click", "Switch focus between list and details"),
@@ -2684,6 +2789,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("Esc", "Clear search, then back from a job to its run"),
         ("", "Mouse"),
         ("click", "Select rows, buttons, menu items, check links"),
+        ("click ↻ digest", "Jump to a PR the last refresh changed (status line)"),
         ("click outside", "Dismiss a popup"),
         ("", "Images (config.toml)"),
         ("images = …", "auto · kitty · sixel · iterm2 · halfblocks · off  (GH_PR_MANAGER_IMAGES)"),

@@ -11,6 +11,7 @@ use ratatui::widgets::{ListState, TableState};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::actions_log::{self, ParsedLog};
+use crate::changes::{self, Change, Snapshot};
 use crate::config::Config;
 use crate::editor::{Editor, VisualRow};
 use crate::images::{ImageKey, ImageMsg, ImagePlacement, ImageStore};
@@ -19,7 +20,7 @@ use crate::github::{
     Viewer, WorkflowRunInfo,
 };
 use crate::search::{self, Command, Doc, Match, Query, TokenBucket};
-use crate::state::{ReposCache, State};
+use crate::state::{ReposCache, Seen, State};
 
 /// Maximum PRs loaded per scope (GitHub search caps at 1000).
 const MAX_PRS: usize = 300;
@@ -39,6 +40,12 @@ pub const POLL_SECS: u64 = 10;
 const POLL_SECS_LOW: u64 = 30;
 /// Seconds before asking again for a finished job's log that wasn't there yet.
 const LOG_RETRY_SECS: u64 = 5;
+/// How long the refresh digest stays on the status line.
+pub const DIGEST_SECS: u64 = 10;
+/// Changes to a PR this soon after your own mutation on it are yours (search lags a little).
+const OWN_SECS: u64 = 120;
+/// PRs named in the refresh digest before "+n more".
+const DIGEST_ITEMS: usize = 3;
 
 /// A rendered detail row plus its clickable link ranges (start col, end col, url).
 pub type DetailRow = (ratatui::text::Line<'static>, Vec<(u16, u16, String)>);
@@ -171,6 +178,12 @@ pub enum Action {
     ToggleRepoOfSelected,
     CycleState,
     SetState(StateFilter),
+    /// Show only unread PRs (`u`, the header's unread count).
+    ToggleUnreadOnly,
+    /// Mark every listed PR read (`U`).
+    MarkAllRead,
+    /// Select (in the detail view: open) a PR by id; the refresh digest's items.
+    JumpTo(String),
     /// Open the search palette (empty), or with the pinned query to edit it.
     OpenSearch,
     EditSearch,
@@ -302,6 +315,18 @@ pub enum ToastKind {
     Info,
     Success,
     Error,
+}
+
+/// What the last refresh changed, for the status line.
+pub struct Digest {
+    /// PRs that changed.
+    pub count: usize,
+    /// (PR id, `#n what`), most important first.
+    pub items: Vec<(String, String)>,
+    pub more: usize,
+    pub at: Instant,
+    /// The session's first load: changes since the stored baselines, not since the last refresh.
+    pub since_last: bool,
 }
 
 /// Click targets recorded during the last render.
@@ -642,6 +667,21 @@ pub struct App {
     last_click: Option<(Instant, usize)>,
     pub hits: Hits,
     pub quit: bool,
+    /// Unread PRs (in `prs`): what changed since you last opened each, empty when it's unread
+    /// without a diff (GitHub says unread, or it newly appeared).
+    pub unread: HashMap<String, Vec<Change>>,
+    pub unread_only: bool,
+    /// Read while the unread filter is on; they stay listed until it's toggled.
+    unread_keep: HashSet<String>,
+    pub digest: Option<Digest>,
+    /// PRs you just changed yourself, and when; their next changes aren't news.
+    own_pending: HashMap<String, Instant>,
+    /// The list being replaced by the load in progress: its query, PRs, and whether it was complete.
+    prev_list: Option<(String, Vec<PrSummary>, bool)>,
+    /// The query of the load in flight, and of the list on screen once it fully landed.
+    loading_query: String,
+    list_query: String,
+    list_complete: bool,
 }
 
 impl App {
@@ -741,6 +781,15 @@ impl App {
             last_click: None,
             hits: Hits::default(),
             quit: false,
+            unread: HashMap::new(),
+            unread_only: false,
+            unread_keep: HashSet::new(),
+            digest: None,
+            own_pending: HashMap::new(),
+            prev_list: None,
+            loading_query: String::new(),
+            list_query: String::new(),
+            list_complete: false,
         }
     }
 
@@ -763,6 +812,14 @@ impl App {
             .join(" ")
     }
 
+    /// The rows on screen are no longer the last complete load of `list_query`.
+    fn clear_list(&mut self) {
+        self.prs.clear();
+        self.prs_rev += 1;
+        self.total = 0;
+        self.list_complete = false;
+    }
+
     fn load_list(&mut self) {
         // Counts describe the unfiltered list they came from; another scope or state voids them.
         if self.scope_repos_key != (self.scope, self.state_filter) {
@@ -771,6 +828,7 @@ impl App {
         self.list_gen += 1;
         self.loading_list = true;
         self.last_refresh = Instant::now();
+        self.loading_query = self.search_query();
         let (client, tx, generation, q) = (self.client.clone(), self.tx.clone(), self.list_gen, self.search_query());
         tokio::spawn(async move {
             // Stream pages so the first 50 show up as soon as possible.
@@ -1067,8 +1125,22 @@ impl App {
 
     // ---------- selection helpers ----------
 
-    /// Indices into `prs` the list shows: all of them, or the pinned query's matches, best first.
+    /// Indices into `prs` the list shows: `visible_base`, narrowed to unread PRs when that filter is on.
     pub fn visible(&self) -> Vec<usize> {
+        let base = self.visible_base();
+        if !self.unread_only {
+            return base;
+        }
+        base.into_iter().filter(|&i| self.unread.contains_key(&self.prs[i].id) || self.unread_keep.contains(&self.prs[i].id)).collect()
+    }
+
+    /// Unread PRs among `visible_base`.
+    pub fn unread_count(&self) -> usize {
+        self.visible_base().iter().filter(|&&i| self.unread.contains_key(&self.prs[i].id)).count()
+    }
+
+    /// Indices into `prs` before the unread filter: all of them, or the pinned query's matches, best first.
+    pub fn visible_base(&self) -> Vec<usize> {
         let Some(pinned) = self.search.pinned.as_deref() else { return (0..self.prs.len()).collect() };
         {
             let cache = self.search.pinned_results.borrow();
@@ -1370,6 +1442,9 @@ impl App {
                 self.toast = None;
             }
         }
+        if self.digest.as_ref().is_some_and(|d| d.at.elapsed() > Duration::from_secs(DIGEST_SECS)) {
+            self.digest = None;
+        }
         let every = self.cfg.refresh_secs;
         let composing = matches!(self.modal, Some(Modal::Composer(_) | Modal::Search));
         if every > 0 && !composing && !self.loading_list && self.last_refresh.elapsed() > Duration::from_secs(every) {
@@ -1399,6 +1474,13 @@ impl App {
     }
 
     pub fn handle(&mut self, msg: Msg) {
+        self.handle_msg(msg);
+        // Whatever put a PR in the detail view (Enter, J/K, a click, the palette, a reload),
+        // it's being read.
+        self.read_open();
+    }
+
+    fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Input(ev) => self.on_event(ev),
             Msg::Viewer(Ok((v, rate))) => {
@@ -1442,6 +1524,13 @@ impl App {
                         let has_next = page.next.is_some();
                         let prev = if first { self.pending_select.take() } else { None }.or_else(|| self.selected_pr().map(|p| p.id.clone()));
                         self.queue_bodies(page.prs.iter().map(|p| (p.id.clone(), p.updated_at.clone())).collect());
+                        let page_ids: HashSet<String> = page.prs.iter().map(|p| p.id.clone()).collect();
+                        // The list this load replaces, for the digest. A load that never finished
+                        // (superseded or failed) leaves the last complete one in place.
+                        if first && self.prev_list.is_none() {
+                            let old = self.prs.iter().filter(|p| !self.search.spliced.contains(&p.id)).cloned().collect();
+                            self.prev_list = Some((self.list_query.clone(), old, self.list_complete));
+                        }
                         if first {
                             // A GitHub result opened from the palette survives while it's open.
                             let keep: Vec<PrSummary> = self
@@ -1458,9 +1547,14 @@ impl App {
                             let seen: HashSet<String> = self.prs.iter().map(|p| p.id.clone()).collect();
                             self.prs.extend(page.prs.into_iter().filter(|p| !seen.contains(&p.id)));
                         }
+                        self.absorb_details(&page_ids);
                         self.prs_rev += 1;
                         self.total = page.total;
                         self.loading_list = has_next && self.prs.len() < MAX_PRS;
+                        self.observe(&page_ids);
+                        if !self.loading_list {
+                            self.finish_list();
+                        }
                         if self.repo.is_none() {
                             self.scope_repos = count_repos(&self.prs);
                             self.scope_repos_key = (self.scope, self.state_filter);
@@ -1496,6 +1590,10 @@ impl App {
                             self.prs_rev += 1;
                             reranked = true;
                         }
+                        if self.own(&id) {
+                            self.mark_read(&id);
+                        }
+                        self.rebuild_unread();
                         self.details.insert(id, (d, Instant::now()));
                         // A pinned query re-ranks when the title or state changes. `sel` is an
                         // ordinal, so put it back on the PR that was open.
@@ -1675,6 +1773,7 @@ impl App {
                             self.modal = None;
                         }
                         self.toast(m, ToastKind::Success);
+                        self.own_pending.insert(id.clone(), Instant::now());
                         self.details.remove(&id);
                         self.load_detail(&id);
                         self.load_list();
@@ -1786,7 +1885,12 @@ impl App {
             KeyCode::Char('Z') if actions => Some(Action::LogFoldAll),
             KeyCode::Char('t') if actions => Some(Action::LogTimestamps),
             KeyCode::Char('q') => Some(if self.screen == Screen::Detail { Action::Back } else { Action::Quit }),
-            KeyCode::Esc => Some(if self.screen == Screen::Detail { Action::Back } else { Action::ClearSearch }),
+            KeyCode::Esc => Some(match self.screen {
+                Screen::Detail => Action::Back,
+                // The unread filter goes before the search filter.
+                Screen::List if self.unread_only => Action::ToggleUnreadOnly,
+                Screen::List => Action::ClearSearch,
+            }),
             KeyCode::Char('?') => Some(Action::Help),
             KeyCode::Char('r') | KeyCode::F(5) => Some(Action::Refresh),
             KeyCode::Char('s') => Some(Action::OpenScopes),
@@ -1795,6 +1899,8 @@ impl App {
             KeyCode::Char('I') => Some(Action::ToggleImages),
             KeyCode::Char('e') => Some(Action::ToggleRepoOfSelected),
             KeyCode::Char('f') => Some(Action::CycleState),
+            KeyCode::Char('u') if !ctrl => Some(Action::ToggleUnreadOnly),
+            KeyCode::Char('U') => Some(Action::MarkAllRead),
             KeyCode::Char('/') => Some(Action::OpenSearch),
             KeyCode::Char('o') => Some(Action::Browser),
             KeyCode::Char('c') => Some(Action::Comment),
@@ -2218,9 +2324,7 @@ impl App {
                     self.toast(format!("Scope reset to {}", self.scopes[0].name), ToastKind::Info);
                 }
                 self.pending_select = self.selected_pr().map(|p| p.id.clone());
-                self.prs.clear();
-                self.prs_rev += 1;
-                self.total = 0;
+                self.clear_list();
                 self.sel = 0;
                 self.load_list();
             }
@@ -2238,10 +2342,48 @@ impl App {
                 self.search.remote_cache.clear();
                 self.pending_select = self.selected_pr().map(|p| p.id.clone());
                 self.sel = 0;
-                self.prs.clear();
-                self.prs_rev += 1;
-                self.total = 0;
+                self.clear_list();
                 self.load_list();
+            }
+            Action::ToggleUnreadOnly => {
+                let prev = self.selected_pr().map(|p| p.id.clone());
+                self.unread_only = !self.unread_only;
+                self.unread_keep.clear();
+                // The open PR stays listed (it's read), or the view would jump to another.
+                if self.unread_only
+                    && self.screen == Screen::Detail
+                    && let Some(id) = &prev
+                {
+                    self.unread_keep.insert(id.clone());
+                }
+                self.keep_selected(prev);
+                let msg = if self.unread_only { "Showing unread PRs only (u shows all)" } else { "Showing all PRs" };
+                self.toast(msg, ToastKind::Info);
+            }
+            Action::MarkAllRead => {
+                let ids: Vec<String> = self.visible().iter().map(|&i| self.prs[i].id.clone()).filter(|id| self.unread.contains_key(id)).collect();
+                if ids.is_empty() {
+                    return self.toast("Nothing unread here", ToastKind::Info);
+                }
+                for id in &ids {
+                    self.mark_read(id);
+                }
+                self.save_state();
+                self.toast(format!("Marked {} PR{} read", ids.len(), if ids.len() == 1 { "" } else { "s" }), ToastKind::Success);
+            }
+            Action::JumpTo(id) => {
+                let Some(idx) = self.prs.iter().position(|p| p.id == id) else {
+                    return self.toast("That PR is no longer in the list", ToastKind::Info);
+                };
+                if !self.visible().contains(&idx) && self.unread_only {
+                    self.unread_keep.insert(id.clone());
+                }
+                if !self.visible().contains(&idx) && self.search.pinned.is_some() {
+                    self.pin(None, Some(id.clone()));
+                }
+                if let Some(pos) = self.visible().iter().position(|&i| i == idx) {
+                    self.select(pos);
+                }
             }
             Action::OpenSearch | Action::EditSearch => {
                 // Never over a draft or a yes/no question (a header click while one is open).
@@ -2791,6 +2933,163 @@ impl App {
         starts
     }
 
+    // ---------- change signals ----------
+
+    /// A recent mutation of yours on PR `id`.
+    fn own(&self, id: &str) -> bool {
+        self.own_pending.get(id).is_some_and(|at| at.elapsed() < Duration::from_secs(OWN_SECS))
+    }
+
+    /// A list row whose open detail is newer takes the detail's fields: search results can lag
+    /// a little, and a stale row would read as a change back and forth.
+    fn absorb_details(&mut self, ids: &HashSet<String>) {
+        for p in self.prs.iter_mut().filter(|p| ids.contains(&p.id)) {
+            if let Some((d, _)) = self.details.get(&p.id)
+                && d.updated_at > p.updated_at
+            {
+                p.title = d.title.clone();
+                p.state = d.state.clone();
+                p.is_draft = d.is_draft;
+                p.review_decision = d.review_decision.clone();
+                p.updated_at = d.updated_at.clone();
+            }
+        }
+    }
+
+    /// Give the PRs in `ids` a baseline if they have none (quiet, unless GitHub says unread or
+    /// the PR is new to a complete list), take your own changes as seen, and recompute unread.
+    fn observe(&mut self, ids: &HashSet<String>) {
+        let now = changes::now_secs();
+        let me = self.viewer.as_ref().map(|v| v.login.clone());
+        let appeared: Option<HashSet<&str>> = self
+            .prev_list
+            .as_ref()
+            .filter(|(q, _, complete)| *complete && *q == self.loading_query)
+            .map(|(_, old, _)| old.iter().map(|p| p.id.as_str()).collect());
+        for p in self.prs.iter().filter(|p| ids.contains(&p.id)) {
+            let own = self.own_pending.get(&p.id).is_some_and(|at| at.elapsed() < Duration::from_secs(OWN_SECS));
+            let snap = Snapshot::of_summary(p, me.as_deref());
+            match self.state.seen.get_mut(&p.id) {
+                Some(s) if own => *s = Seen { snap: snap.rebase_on(Some(&s.snap)), at: now, unread: false },
+                // Still listed: keep it from being evicted (daily is plenty for a 30-day TTL).
+                Some(s) => {
+                    s.snap.learn_mergeable(snap.mergeable.as_deref());
+                    if now - s.at > 86400 {
+                        s.at = now;
+                    }
+                }
+                None => {
+                    let unread = !own && (p.is_read_by_viewer == Some(false) || appeared.as_ref().is_some_and(|old| !old.contains(p.id.as_str())));
+                    self.state.seen.insert(p.id.clone(), Seen { snap, at: now, unread });
+                }
+            }
+        }
+        self.rebuild_unread();
+    }
+
+    fn rebuild_unread(&mut self) {
+        let me = self.viewer.as_ref().map(|v| v.login.as_str());
+        let seen = &self.state.seen;
+        self.unread = self
+            .prs
+            .iter()
+            .filter_map(|p| {
+                let s = seen.get(&p.id)?;
+                let c = changes::diff(&s.snap, &Snapshot::of_summary(p, me));
+                (s.unread || !c.is_empty()).then(|| (p.id.clone(), c))
+            })
+            .collect();
+    }
+
+    /// The last page of a load landed: digest what changed since the previous load of the same
+    /// query (none for a new scope, state or repo), and persist the baselines.
+    fn finish_list(&mut self) {
+        let now: Vec<PrSummary> = self.prs.iter().filter(|p| !self.search.spliced.contains(&p.id)).cloned().collect();
+        self.list_complete = now.len() >= self.total;
+        let first_of_session = self.list_query.is_empty();
+        match self.prev_list.take() {
+            Some((q, old, old_complete)) if q == self.loading_query => {
+                let me = self.viewer.as_ref().map(|v| v.login.as_str());
+                let mut ch = changes::diff_list(&old, &now, me, old_complete && self.list_complete);
+                ch.retain(|(id, _)| !self.own(id));
+                // `old` too: PRs that left the list are only there.
+                let all: Vec<PrSummary> = now.into_iter().chain(old).collect();
+                self.set_digest(&ch, &all, false);
+            }
+            // Startup: what changed since you last looked (baselines from an earlier session;
+            // ones seeded just now have no diff, so a first run stays quiet).
+            _ if first_of_session => {
+                let ch: Vec<(String, Vec<Change>)> =
+                    now.iter().filter_map(|p| self.unread.get(&p.id).filter(|c| !c.is_empty()).map(|c| (p.id.clone(), c.clone()))).collect();
+                self.set_digest(&ch, &now, true);
+            }
+            // A different query's digest would still point at the previous list.
+            Some(_) => self.digest = None,
+            _ => {}
+        }
+        self.list_query = self.loading_query.clone();
+        self.own_pending.retain(|_, at| at.elapsed() < Duration::from_secs(OWN_SECS));
+        self.save_state();
+    }
+
+    fn set_digest(&mut self, ch: &[(String, Vec<Change>)], prs: &[PrSummary], since_last: bool) {
+        if ch.is_empty() {
+            self.digest = None;
+            return;
+        }
+        let (items, more) = changes::digest_items(ch, prs, DIGEST_ITEMS);
+        self.digest = Some(Digest { count: ch.len(), items, more, at: Instant::now(), since_last });
+    }
+
+    /// Take PR `id` as it is now as seen.
+    fn mark_read(&mut self, id: &str) {
+        let Some(p) = self.prs.iter().find(|p| p.id == id) else { return };
+        let me = self.viewer.as_ref().map(|v| v.login.as_str());
+        let snap = Snapshot::of_summary(p, me).rebase_on(self.state.seen.get(id).map(|s| &s.snap));
+        self.state.seen.insert(id.to_string(), Seen { snap, at: changes::now_secs(), unread: false });
+        if self.unread.remove(id).is_some() && self.unread_only {
+            self.unread_keep.insert(id.to_string());
+        }
+    }
+
+    /// The PR in the detail view is read.
+    fn read_open(&mut self) {
+        if self.screen != Screen::Detail {
+            return;
+        }
+        let Some(id) = self.selected_pr().map(|p| p.id.clone()) else { return };
+        if self.unread.contains_key(&id) || !self.state.seen.contains_key(&id) {
+            self.mark_read(&id);
+            self.save_state();
+        }
+    }
+
+    fn save_state(&mut self) {
+        self.state.prune_seen(changes::now_secs());
+        crate::state::save(&self.state);
+    }
+
+    /// After the list's filtering changed: keep PR `prev` selected if it's still listed.
+    fn keep_selected(&mut self, prev: Option<String>) {
+        let vis = self.visible();
+        self.sel = prev
+            .as_ref()
+            .and_then(|id| vis.iter().position(|&i| self.prs[i].id == *id))
+            .unwrap_or(self.sel.min(vis.len().saturating_sub(1)));
+        if vis.get(self.sel).map(|&i| self.prs[i].id.clone()) != prev {
+            self.detail_scroll = 0;
+            self.info_scroll = 0;
+            self.file_sel = 0;
+            self.file_list_scroll = 0;
+            self.actions_sel = 0;
+            self.actions_tree_scroll = 0;
+            self.actions_tree_follow = true;
+            if self.screen == Screen::Detail {
+                self.ensure_detail();
+            }
+        }
+    }
+
     // ---------- search palette ----------
 
     fn set_search_text(&mut self, text: String) {
@@ -2976,6 +3275,13 @@ impl App {
             self.search.spliced.retain(|id| select.as_ref() == Some(id));
         }
         self.search.pinned = text;
+        // Unread-only hides a read or newly spliced row, and `visible` would then
+        // fall back to another PR. Keep the one the palette chose.
+        if self.unread_only
+            && let Some(id) = &select
+        {
+            self.unread_keep.insert(id.clone());
+        }
         let vis = self.visible();
         let want = select.or(prev.clone());
         self.sel = want.and_then(|id| vis.iter().position(|&i| self.prs[i].id == id)).unwrap_or(0);
@@ -2997,9 +3303,7 @@ impl App {
         if idx != self.scope || self.prs.is_empty() {
             self.scope = idx;
             self.sel = 0;
-            self.prs.clear();
-            self.prs_rev += 1;
-            self.total = 0;
+            self.clear_list();
             self.screen = Screen::List;
             self.search.remote_cache.clear();
             self.load_list();
@@ -3441,6 +3745,8 @@ impl App {
             Command::StateAll => Action::SetState(StateFilter::All),
             Command::OnlyRepo => Action::ToggleRepoOfSelected,
             Command::Images => Action::ToggleImages,
+            Command::UnreadOnly => Action::ToggleUnreadOnly,
+            Command::MarkAllRead => Action::MarkAllRead,
             Command::Help => Action::Help,
             Command::Quit => Action::Quit,
         };
@@ -4122,5 +4428,267 @@ mod search_tests {
         assert_eq!(delete_word("form atlas skin"), "form atlas ");
         assert_eq!(delete_word("form atlas "), "form ");
         assert_eq!(delete_word("form"), "");
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+    use crate::search::tests::pr;
+    use ratatui::crossterm::event::KeyEvent;
+    use serde_json::json;
+
+    fn test_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.search.bodies = false;
+        let detection = crate::images::Detection { picker: None, note: None, off_reason: String::new() };
+        let mut app = App::new(Client::new("test".into()).unwrap(), tx, cfg, detection);
+        app.state = State::default();
+        app.viewer = Some(Viewer { login: "wiiiimm".into(), orgs: Vec::new() });
+        app
+    }
+
+    /// A whole one-page load of the current query, as `load_list` would dispatch it.
+    fn load(app: &mut App, prs: Vec<PrSummary>) {
+        app.list_gen += 1;
+        app.loading_query = app.search_query();
+        let total = prs.len();
+        app.handle(Msg::Prs { generation: app.list_gen, first: true, res: Ok(SearchPage { prs, total, next: None, rate: None }) });
+    }
+
+    fn key(app: &mut App, c: KeyCode) {
+        app.handle(Msg::Input(Event::Key(KeyEvent::new(c, KeyModifiers::NONE))));
+    }
+
+    fn prs() -> Vec<PrSummary> {
+        (1..=4).map(|n| pr(n, "acme/app", &format!("pr {n}"), "2026-10-19T00:00:00Z")).collect()
+    }
+
+    fn unread(app: &App) -> Vec<u64> {
+        let mut v: Vec<u64> = app.prs.iter().filter(|p| app.unread.contains_key(&p.id)).map(|p| p.number).collect();
+        v.sort();
+        v
+    }
+
+    fn detail(p: &PrSummary, review: Option<&str>) -> PrDetail {
+        serde_json::from_value(json!({
+            "id": p.id, "number": p.number, "title": p.title, "body": "", "bodyHTML": "", "state": p.state, "isDraft": p.is_draft,
+            "mergeable": "MERGEABLE", "reviewDecision": review, "createdAt": "2026-10-18T00:00:00Z", "updatedAt": "2026-10-19T01:00:00Z",
+            "author": { "login": "alice" }, "headRefName": "feat", "baseRefName": "main", "additions": 1, "deletions": 1, "changedFiles": 1,
+            "headRefOid": p.head_ref_oid, "canBeRebased": true, "viewerCanClose": true, "viewerCanReopen": false, "viewerCanMergeAsAdmin": false,
+            "labels": { "nodes": [] }, "assignees": { "nodes": [] }, "reviewRequests": { "nodes": [] }, "participants": { "nodes": [] },
+            "repository": { "nameWithOwner": "acme/app", "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": true,
+                "mentionableUsers": { "nodes": [] } },
+            "commits": { "totalCount": 1, "nodes": [] }, "reviews": { "nodes": [] }, "comments": { "nodes": [] }, "reviewThreads": { "nodes": [] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn quiet_first_run_seeded_by_github_unread() {
+        let mut app = test_app();
+        let mut list = prs();
+        list[1].is_read_by_viewer = Some(false);
+        list[2].is_read_by_viewer = Some(true);
+        load(&mut app, list.clone());
+        // Only what GitHub calls unread is dotted; no digest on a first load.
+        assert_eq!(unread(&app), vec![2]);
+        assert!(app.unread[&list[1].id].is_empty());
+        assert!(app.digest.is_none());
+        // A baseline exists now: GitHub's flag no longer matters, real changes do.
+        list[2].is_read_by_viewer = Some(false);
+        list[0].comments.total_count = 2;
+        load(&mut app, list.clone());
+        assert_eq!(unread(&app), vec![1, 2]);
+        let d = app.digest.as_ref().unwrap();
+        assert_eq!((d.count, d.items[0].1.as_str()), (1, "#1 +2 comments"));
+        // Baselines are persisted state.
+        assert_eq!(app.state.seen[&list[0].id].snap.comments, 0);
+        assert!(app.state.seen[&list[1].id].unread);
+    }
+
+    #[tokio::test]
+    async fn opening_marks_read_and_u_composes_with_the_text_filter() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        for p in &mut list[..3] {
+            p.comments.total_count = 1;
+        }
+        load(&mut app, list.clone());
+        assert_eq!(unread(&app), vec![1, 2, 3]);
+        let numbers = |app: &App| app.visible().iter().map(|&i| app.prs[i].number).collect::<Vec<_>>();
+        key(&mut app, KeyCode::Char('u'));
+        assert!(app.unread_only);
+        assert_eq!(numbers(&app), vec![1, 2, 3]);
+        // Selecting in the list doesn't read it; opening does.
+        app.select(1);
+        assert!(app.unread.contains_key(&list[1].id));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(unread(&app), vec![1, 3]);
+        assert_eq!(app.state.seen[&list[1].id].snap.comments, 1);
+        key(&mut app, KeyCode::Esc);
+        // Read while filtering: it stays listed and selected until the filter is toggled.
+        assert_eq!(numbers(&app), vec![1, 2, 3]);
+        assert_eq!(app.selected_pr().unwrap().number, 2);
+        // With a pinned query, both filters apply.
+        app.pin(Some("pr 3".into()), None);
+        assert_eq!(numbers(&app), vec![3]);
+        app.pin(None, None);
+        // Esc clears the unread filter before the search filter; u toggles it back on.
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.unread_only);
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(numbers(&app), vec![1, 3]);
+        // The selection follows by id where it can (#2 is gone, the row below takes it).
+        assert_eq!(app.selected_pr().unwrap().number, 3);
+        // U marks everything listed read.
+        key(&mut app, KeyCode::Char('U'));
+        assert!(unread(&app).is_empty());
+        assert!(app.toast.as_ref().is_some_and(|(m, ..)| m == "Marked 2 PRs read"));
+    }
+
+    #[tokio::test]
+    async fn own_actions_never_count_in_either_order() {
+        for detail_first in [false, true] {
+            let mut app = test_app();
+            let mut list = prs();
+            load(&mut app, list.clone());
+            let id = list[0].id.clone();
+            app.handle(Msg::Done { id: id.clone(), res: Ok("Approved".into()) });
+            list[0].review_decision = Some("APPROVED".into());
+            list[0].reviews.total_count = 1;
+            list[0].updated_at = "2026-10-19T01:00:00Z".into();
+            // Someone else's change in the same refresh still counts.
+            list[1].comments.total_count = 1;
+            let d = detail(&list[0], Some("APPROVED"));
+            if detail_first {
+                app.handle(Msg::Detail { id: id.clone(), res: Ok((d, None)) });
+                assert!(unread(&app).is_empty(), "detail first");
+                load(&mut app, list.clone());
+            } else {
+                load(&mut app, list.clone());
+                app.handle(Msg::Detail { id: id.clone(), res: Ok((d, None)) });
+            }
+            assert_eq!(unread(&app), vec![2], "detail_first={detail_first}");
+            let dg = app.digest.as_ref().unwrap();
+            assert_eq!(dg.items.iter().map(|(i, _)| i.clone()).collect::<Vec<_>>(), vec![list[1].id.clone()]);
+        }
+    }
+
+    #[test]
+    fn digest_only_for_the_same_query_and_never_for_spliced_results() {
+        let mut app = test_app();
+        let list = prs();
+        load(&mut app, list.clone());
+        // A GitHub result opened from the palette, then the list refreshes without it.
+        let mut remote = pr(99, "other/repo", "remote", "2026-10-19T00:00:00Z");
+        remote.is_read_by_viewer = Some(false);
+        app.prs.insert(0, remote.clone());
+        app.search.spliced.insert(remote.id.clone());
+        app.prs_rev += 1;
+        load(&mut app, list.clone());
+        assert!(app.digest.is_none(), "{:?}", app.digest.as_ref().map(|d| &d.items));
+        // Another state filter is another list: baselines stay, no digest.
+        let mut changed = list.clone();
+        changed[0].comments.total_count = 5;
+        app.state_filter = StateFilter::All;
+        load(&mut app, changed);
+        assert!(app.digest.is_none());
+        assert_eq!(unread(&app), vec![1]);
+    }
+
+    #[test]
+    fn a_new_session_digests_changes_since_the_stored_baselines() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        let stored = std::mem::take(&mut app.state);
+        // Next session: same baselines, #3 got a comment and GitHub calls #4 unread meanwhile.
+        let mut app = test_app();
+        app.state = stored;
+        list[2].comments.total_count = 1;
+        list[3].is_read_by_viewer = Some(false);
+        load(&mut app, list);
+        assert_eq!(unread(&app), vec![3]);
+        let d = app.digest.as_ref().unwrap();
+        assert!(d.since_last);
+        assert_eq!(d.items.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), vec!["#3 +1 comment"]);
+    }
+
+    #[test]
+    fn new_to_a_complete_list_is_unread() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list.push(pr(5, "acme/app", "pr 5", "2026-10-19T00:00:00Z"));
+        list.remove(0);
+        load(&mut app, list);
+        assert_eq!(unread(&app), vec![5]);
+        let d = app.digest.as_ref().unwrap();
+        assert_eq!(d.count, 2);
+        assert!(d.items.iter().any(|(_, t)| t == "#5 new") && d.items.iter().any(|(_, t)| t == "#1 left the list"), "{:?}", d.items);
+    }
+
+    #[test]
+    fn quiet_refresh_clears_the_previous_digest() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[0].comments.total_count = 1;
+        load(&mut app, list.clone());
+        assert!(app.digest.is_some());
+        load(&mut app, list);
+        assert!(app.digest.is_none());
+    }
+
+    #[test]
+    fn unread_filter_opens_the_pr_chosen_in_search() {
+        let mut app = test_app();
+        let list = prs();
+        load(&mut app, list.clone());
+        app.unread_only = true;
+        assert!(app.visible().is_empty());
+        app.pin(Some("pr 3".into()), Some(list[2].id.clone()));
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(3));
+        // A GitHub hit that is not unread yet is inserted, then opened.
+        let remote = pr(99, "other/repo", "remote", "2026-10-19T00:00:00Z");
+        app.prs.insert(0, remote.clone());
+        app.prs_rev += 1;
+        app.pin(None, Some(remote.id.clone()));
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(99));
+    }
+
+    #[test]
+    fn unknown_mergeable_is_learned_before_it_counts() {
+        let mut app = test_app();
+        let mut list = prs();
+        list[0].mergeable = Some("UNKNOWN".into());
+        load(&mut app, list.clone());
+        list[0].mergeable = Some("MERGEABLE".into());
+        load(&mut app, list.clone());
+        assert!(app.digest.is_none());
+        assert!(!app.unread.contains_key(&list[0].id));
+        assert_eq!(app.state.seen[&list[0].id].snap.mergeable.as_deref(), Some("MERGEABLE"));
+        list[0].mergeable = Some("CONFLICTING".into());
+        load(&mut app, list.clone());
+        assert!(app.unread.contains_key(&list[0].id));
+    }
+
+    #[test]
+    fn clearing_the_list_is_not_a_complete_previous_load() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        assert!(app.list_complete);
+        list[0].comments.total_count = 4;
+        load(&mut app, list.clone());
+        assert!(app.digest.is_some());
+        app.clear_list();
+        assert!(!app.list_complete);
+        assert!(app.prs.is_empty());
+        load(&mut app, list);
+        assert!(app.digest.is_none());
     }
 }

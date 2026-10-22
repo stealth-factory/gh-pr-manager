@@ -1,9 +1,17 @@
-//! Machine-written state at `$XDG_STATE_HOME/gh-pr-manager/state.json`: recent repos and a repo list cache.
+//! Machine-written state at `$XDG_STATE_HOME/gh-pr-manager/state.json`: recent repos, a repo
+//! list cache, and what you last saw of each PR.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::changes::Snapshot;
 use crate::github::RepoInfo;
+
+/// Most PRs remembered in `seen`; the least recently touched go first.
+const SEEN_CAP: usize = 2000;
+/// `seen` entries untouched for this long are dropped.
+const SEEN_TTL_SECS: i64 = 30 * 86400;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -16,12 +24,35 @@ pub struct State {
     pub images_enabled: bool,
     /// Searches picked or pinned in the `/` palette, newest first.
     pub recent_searches: Vec<String>,
+    /// What you last saw of each PR, by PR id; a row is unread when it differs from this.
+    pub seen: HashMap<String, Seen>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { density: Density::default(), recent_repos: Vec::new(), repos_cache: None, images_enabled: true, recent_searches: Vec::new() }
+        Self {
+            density: Density::default(),
+            recent_repos: Vec::new(),
+            repos_cache: None,
+            images_enabled: true,
+            recent_searches: Vec::new(),
+            seen: HashMap::new(),
+        }
     }
+}
+
+/// The baseline a PR is diffed against.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    #[serde(flatten)]
+    pub snap: Snapshot,
+    /// Unix seconds this entry was last written or seen in a list (for eviction).
+    #[serde(default)]
+    pub at: i64,
+    /// Unread with no diff yet: GitHub said unread when the baseline was taken, or the PR
+    /// newly appeared in a list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
 }
 
 /// How much spacing the UI uses, from roomy to tight.
@@ -105,18 +136,43 @@ pub fn load() -> State {
     path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-/// Best effort; failing to persist state should never interrupt the user.
+/// Best effort; failing to persist state should never interrupt the user. Tests never write.
 pub fn save(state: &State) {
-    let Some(p) = path() else { return };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if cfg!(test) {
+        return;
     }
-    if let Ok(s) = serde_json::to_string(state) {
-        let _ = std::fs::write(p, s);
+    let Some(p) = path() else { return };
+    let Some(dir) = p.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(s) = serde_json::to_string(state) else { return };
+    let tmp = dir.join(format!(".state-{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, s).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 impl State {
+    /// Drop `seen` entries untouched for 30 days, then the oldest beyond the cap.
+    pub fn prune_seen(&mut self, now: i64) {
+        self.seen.retain(|_, s| now - s.at <= SEEN_TTL_SECS);
+        if self.seen.len() > SEEN_CAP {
+            let mut ats: Vec<i64> = self.seen.values().map(|s| s.at).collect();
+            ats.sort_unstable_by(|a, b| b.cmp(a));
+            let cutoff = ats[SEEN_CAP - 1];
+            self.seen.retain(|_, s| s.at >= cutoff);
+            // Ties at the cutoff: drop arbitrary ones to honour the cap exactly.
+            let extra = self.seen.len().saturating_sub(SEEN_CAP);
+            let drop: Vec<String> = self.seen.iter().filter(|(_, s)| s.at == cutoff).take(extra).map(|(k, _)| k.clone()).collect();
+            for k in drop {
+                self.seen.remove(&k);
+            }
+        }
+    }
+
     pub fn push_recent(&mut self, repo: &str) {
         self.recent_repos.retain(|r| !r.eq_ignore_ascii_case(repo));
         self.recent_repos.insert(0, repo.to_string());
@@ -151,5 +207,39 @@ mod tests {
         assert_eq!(s.recent_searches.iter().filter(|r| r.eq_ignore_ascii_case("q5")).count(), 1);
         s.push_recent_search("   ");
         assert_eq!(s.recent_searches[0], "Q5");
+    }
+
+    #[test]
+    fn seen_round_trips_and_older_files_load() {
+        let mut s = State::default();
+        let snap = Snapshot { state: "OPEN".into(), comments: 7, head: "d1e3597".into(), ci: Some("FAILURE".into()), ..Snapshot::default() };
+        s.seen.insert("PR_1".into(), Seen { snap: snap.clone(), at: 42, unread: true });
+        let json = serde_json::to_string(&s).unwrap();
+        // The snapshot is flattened into the entry, as docs/change-signals.md shows.
+        assert!(json.contains(r#""PR_1":{"updated_at":"#), "{json}");
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.seen["PR_1"], Seen { snap, at: 42, unread: true });
+        // A state file from before `seen`, and an entry missing newer fields.
+        let old: State = serde_json::from_str(r#"{"density":"Cozy","recent_repos":[]}"#).unwrap();
+        assert!(old.seen.is_empty());
+        let partial: State = serde_json::from_str(r#"{"seen":{"PR_2":{"comments":3}}}"#).unwrap();
+        assert_eq!((partial.seen["PR_2"].snap.comments, partial.seen["PR_2"].at, partial.seen["PR_2"].unread), (3, 0, false));
+    }
+
+    #[test]
+    fn seen_cap_and_eviction() {
+        let now = 100 * 86400;
+        let mut s = State::default();
+        for i in 0..2100 {
+            s.seen.insert(format!("PR_{i}"), Seen { at: now - i as i64, ..Seen::default() });
+        }
+        s.seen.insert("stale".into(), Seen { at: now - 31 * 86400, ..Seen::default() });
+        s.seen.insert("recent".into(), Seen { at: now - 29 * 86400, ..Seen::default() });
+        s.prune_seen(now);
+        assert!(!s.seen.contains_key("stale"));
+        assert_eq!(s.seen.len(), SEEN_CAP);
+        // The newest survive; the oldest beyond the cap (and the 29-day one) go.
+        assert!(s.seen.contains_key("PR_0") && s.seen.contains_key("PR_1999"));
+        assert!(!s.seen.contains_key("PR_2000") && !s.seen.contains_key("recent"));
     }
 }

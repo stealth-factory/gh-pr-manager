@@ -225,3 +225,52 @@ own-action suppression; quiet first run seeded by `isReadByViewer`.
 timeline actors ("merged by alice") and the force-push banner; `[notify]` bell/desktop; `isReadByViewer` read-on-web sync; Actions
 tab run completions feeding the same digest; a 1 s dwell before `J`/`K` marks read; "unread first" sort; comment ids for exact
 marks after edits/deletions.
+
+## Implementation notes
+
+What shipped is the MVP cut, with these deviations:
+
+- **Query.** The list fields (`pr_fields!`, which the palette's by-number lookup shares) gained `reviews`/`reviewThreads`/
+  `reviewRequests{totalCount}`, `headRefOid mergeable lastEditedAt isReadByViewer viewerLatestReviewRequest{asCodeOwner}`,
+  and `commits(last:1)` gained `totalCount` (`PrSummary.commits` is now `LastCommit { total_count, nodes }`). Re-measured on
+  2026-10-19: `involves:@me`, 50 nodes, `rateLimit.cost` 1. `DETAIL_QUERY` is unchanged (detail-level diffs are later).
+- **`Snapshot.mine`.** The snapshot also records "you authored it", so a green CI is a change only on your own PRs. That
+  means `of_summary(p, me)` takes the viewer's login. `of_detail` is not written yet.
+- **`Change::Left` has no state.** A list can't tell merged from closed, so the label is "left the list".
+- **`seen` entries.** Each entry is `Seen { snapshot (flattened), at, unread }`. `at` is when it was last written, or
+  re-touched (once a day) while the PR is still listed; eviction uses it. `unread` is the flag for a PR that is unread
+  without a diff.
+- **Seeding.** Any PR without a baseline gets one quietly, not only on the very first run. It is flagged unread when
+  `isReadByViewer == false`, or when it is new to a complete reload of the same query (`Appeared`). The
+  `isReadByViewer` false → true sync is not done (later).
+- **Own actions** use a 120 s window (`own_pending: HashMap<id, Instant>`), not "until the next page". GitHub search
+  lags behind mutations, so the refetch right after your comment or approval often doesn't show it yet. While the
+  window is open, list pages and details re-baseline that PR and keep it out of the digest. Anyone else's change to
+  that PR inside the 120 s is absorbed too.
+- **Startup digest.** The session's first complete load shows `↻ N PRs changed since you last looked`, built from the
+  stored baselines. A first run (no baselines) stays quiet. Later loads digest refresh-to-refresh, for the same query
+  only. Results spliced in from the palette are left out of both sides.
+- **Where the digest lives.** It is `App::digest` (a `Digest` struct), not `ToastKind::Changes`. It shows over an
+  older non-error toast and never over an error toast or the log-search prompt. Each `#n what` item and the `↻ N PRs
+  changed` head (which goes to the top item) are clickable. When the PR is hidden, it is kept visible through the unread
+  filter, and the pinned query is cleared only if that query is what hides it.
+- **`U`** marks every listed PR read on both screens. In the detail pane the open PR is already read, so a
+  "just this one" variant would do nothing.
+- **Read-on-open** runs after every message (`App::read_open`). That covers Enter, `J`/`K`, a sidebar click, opening
+  from the palette, a digest click in the detail view, and a reload that swaps the open PR. Changes that land while the
+  PR is open are therefore read at once. They still appear in the digest.
+- **Unread filter.** Rows read while the filter is on stay listed until it is toggled, mail-client style. Turning it on
+  in the detail view keeps the open PR listed, so the view doesn't jump to, and silently read, another PR. `Esc` on the
+  list clears it before the search filter. The header reads ` 63 PRs · 23 unread ` (click toggles) and, with the filter
+  on, ` 23 unread of 63 PRs ✕ `.
+- **Stability guards.** A list row takes the open detail's title, state, draft flag, verdict and `updatedAt` when the
+  detail is newer, so a lagging search result doesn't flap a change back and forth. A `MERGEABLE`/`CONFLICTING`
+  baseline is never overwritten by `UNKNOWN` (`Snapshot::rebase_on`).
+- **Sidebar.** The Cozy and Comfortable second line ends with the top two change labels in accent; the repo and author
+  are shortened first. Compact puts the `+n` after the title. Comfortable list rows don't use their second line yet
+  (later).
+- **Persistence.** `state.json` is written (pruned to 2000 entries, 30 days) on every read or mark and after each
+  completed list load. `state::save` is a no-op under `cfg(test)`, so tests never touch the real file.
+
+Known limitations: list-level counts can't exclude bots or yourself outside the 120 s window (a comment you post on
+github.com shows as `+1`). A PR that only left the list can't be jumped to. Search lag can still flap PRs that aren't open.
