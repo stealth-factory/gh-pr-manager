@@ -142,11 +142,16 @@ pub fn save(state: &State) {
         return;
     }
     let Some(p) = path() else { return };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let Some(dir) = p.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(s) = serde_json::to_string(state) else { return };
+    let tmp = dir.join(format!(".state-{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, s).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
     }
-    if let Ok(s) = serde_json::to_string(state) {
-        let _ = std::fs::write(p, s);
+    if std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
