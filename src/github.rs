@@ -383,7 +383,8 @@ impl Client {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await?;
+        // reqwest has no default timeout: a stalled merge-async poll would hold the PR busy.
+        let resp = req.timeout(GRAPHQL_TIMEOUT).send().await?;
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
         if let (Some(remaining), Some(limit)) = (header("x-ratelimit-remaining"), header("x-ratelimit-limit"))
             && let Ok(mut r) = self.rest_rate.lock()
