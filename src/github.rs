@@ -1403,7 +1403,7 @@ query($id:ID!) {
     repository { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission
       mentionableUsers(first:100) { nodes { login } } defaultBranchRef { name } }
     stackEntry { position }
-    stack { id number size baseRefName entries(first:30) { totalCount nodes { position pullRequest {
+    stack { id number size baseRefName entries(first:100) { totalCount nodes { position pullRequest {
       id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision
       commits(last:1) { nodes { commit { statusCheckRollup { state } } } } } } } }
     statusCheckRollup { state contexts(first:100) { nodes { __typename
@@ -1490,7 +1490,7 @@ mod tests {
 
     #[test]
     fn detail_query_asks_for_the_whole_stack() {
-        assert!(DETAIL_QUERY.contains("entries(first:30)"));
+        assert!(DETAIL_QUERY.contains("entries(first:100)"));
         assert!(DETAIL_QUERY.contains("defaultBranchRef { name }"));
     }
 

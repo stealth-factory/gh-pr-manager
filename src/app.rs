@@ -1809,8 +1809,12 @@ impl App {
                             self.mark_read(&id);
                         }
                         self.rebuild_unread();
-                        if let Some(b) = &d.repository.default_branch_ref {
-                            let old = self.default_branches.insert(d.repository.name_with_owner.to_lowercase(), b.name.clone());
+                        // A pre-list detail only fills in a trunk not known yet; it never replaces a newer one.
+                        let repo = d.repository.name_with_owner.to_lowercase();
+                        if let Some(b) = &d.repository.default_branch_ref
+                            && (current || !self.default_branches.contains_key(&repo))
+                        {
+                            let old = self.default_branches.insert(repo, b.name.clone());
                             chained |= old.as_ref() != Some(&b.name);
                         }
                         let stacked = chained || d.stack.is_some() || self.membership.contains_key(&id);
@@ -6289,8 +6293,11 @@ mod stack_tests {
         app.detail_asked.insert(list[2].id.clone(), asked);
         app.last_refresh = asked + Duration::from_secs(1);
         load(&mut app, list.clone());
+        // A newer detail already taught the repo's trunk; the stale one mustn't undo it.
+        app.default_branches.insert("acme/app".into(), "trunk".into());
         app.handle(Msg::Detail { id: list[2].id.clone(), res: Ok((detail(&list[2], Some(stack)), None)) });
         assert_eq!(app.details[&list[2].id].1, asked);
+        assert_eq!(app.default_branches["acme/app"], "trunk");
         // Neither its snapshot nor its row update applies: the list's view of the stack stands.
         assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
     }
@@ -6442,6 +6449,22 @@ mod stack_tests {
             assert!(app.own_pending.contains_key(id), "{id}");
         }
         assert!(app.detail_loading.contains("acme/app#3"));
+    }
+
+    #[tokio::test]
+    async fn clicking_whole_stack_selects_it() {
+        let mut app = test_app();
+        load(&mut app, chain());
+        open(&mut app, 2);
+        key(&mut app, KeyCode::Char('8'));
+        assert_eq!(app.stack_cursor(), 3);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let (r, offset) = app.hits.stack_list.unwrap();
+        let row = app.hits.stack_list_rows.iter().position(|e| *e == Some(0)).expect("Whole stack is a click target") - offset;
+        app.on_click(Position::new(r.x + 2, r.y + row as u16));
+        assert_eq!(app.stack_cursor(), 0);
+        assert!(app.stack_cursor_member().is_none());
     }
 
     #[tokio::test]

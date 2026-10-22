@@ -40,7 +40,7 @@ call was made.
 **Native.** `pr_fields!` gains `baseRefName stack { id number size baseRefName } stackEntry { position }`. Measured on `org:stealth-factory
 is:open`, 50 nodes, interleaved: cost **1 → 1**, 5.8–7.1 s vs 6.3–7.1 s (noise). Nesting `entries(first:20)` in the list costs **2** —
 rejected; at `first:100` even today's query costs 2 and that org scope returns all-null nodes (`RESOURCE_LIMITS_EXCEEDED`), so the
-page size stays 50. `DETAIL_QUERY` gains `baseRefOid`, `repository { defaultBranchRef { name } }` and `stack { … entries(first:30) {
+page size stays 50. `DETAIL_QUERY` gains `baseRefOid`, `repository { defaultBranchRef { name } }` and `stack { … entries(first:100) {
 totalCount nodes { position pullRequest { id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus
 reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}} } } } }`: cost **2 → 2**, 1.8–2.0 s. The detail is the source of
 truth for the open PR's stack (members beyond the loaded list included); the list fields give every row its chip. Only details
@@ -269,7 +269,7 @@ v1 as built (branch `feat/stacks`), and where it departs from the design above.
 
 **Detection.**
 - The list query gains `baseRefName isCrossRepository stack { id number size baseRefName } stackEntry { position }`. `isCrossRepository` is new: it is how "forks never chain" is enforced. Measured on `org:stealth-factory is:open`, `first:50`: cost **1 → 1**. The page size stays 50.
-- The detail query gains `stackEntry`, `stack { … entries(first:30) { … } }` and `repository.defaultBranchRef`. Measured: cost **2 → 2**. `baseRefOid` is not fetched, because nothing reads it: the compare query is the staleness signal.
+- The detail query gains `stackEntry`, `stack { … entries(first:100) { … } }` and `repository.defaultBranchRef`. Measured at `entries(first:30)`: cost **2 → 2**; raised to 100 so a large stack is never truncated (unmeasured, at most about a point more: one `commits(last:1)` per extra entry). `baseRefOid` is not fetched, because nothing reads it: the compare query is the staleness signal.
 - Needs-rebase uses one aliased `ref(child).compare(headRef: base)` query per stack. Measured on the #1→#4 chain: **cost 1**. It pairs every *open* member's head with its own base, so the bottom one is compared with the trunk. That bottom member shows `needs rebase` when the trunk moved, not just an informational `behind main`.
   - The query runs with each detail refresh, at most once every 10 s, and when the open PR changes (stale after `detail_refresh_secs`, at least 20 s).
   - A failed query keeps the last answer. It is skipped while GraphQL `remaining < 100`.
