@@ -60,6 +60,14 @@ impl Snapshot {
         }
         self
     }
+
+    /// Remember the first real mergeability. `UNKNOWN` is not a baseline, so a later
+    /// `CONFLICTING` would otherwise have nothing to diff against.
+    pub fn learn_mergeable(&mut self, new: Option<&str>) {
+        if !known_mergeable(self.mergeable.as_deref()) && known_mergeable(new) {
+            self.mergeable = new.map(str::to_string);
+        }
+    }
 }
 
 fn known_mergeable(m: Option<&str>) -> bool {
@@ -365,6 +373,18 @@ mod tests {
         unknown.mergeable = Some("UNKNOWN".into());
         assert_eq!(unknown.clone().rebase_on(Some(&snap())).mergeable.as_deref(), Some("MERGEABLE"));
         assert_eq!(unknown.rebase_on(None).mergeable.as_deref(), Some("UNKNOWN"));
+    }
+
+    #[test]
+    fn learn_mergeable_keeps_the_first_known_value() {
+        let mut s = snap();
+        s.mergeable = Some("UNKNOWN".into());
+        s.learn_mergeable(Some("MERGEABLE"));
+        assert_eq!(s.mergeable.as_deref(), Some("MERGEABLE"));
+        s.learn_mergeable(Some("CONFLICTING"));
+        assert_eq!(s.mergeable.as_deref(), Some("MERGEABLE"));
+        s.learn_mergeable(None);
+        assert_eq!(s.mergeable.as_deref(), Some("MERGEABLE"));
     }
 
     #[test]

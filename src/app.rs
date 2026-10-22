@@ -812,6 +812,14 @@ impl App {
             .join(" ")
     }
 
+    /// The rows on screen are no longer the last complete load of `list_query`.
+    fn clear_list(&mut self) {
+        self.prs.clear();
+        self.prs_rev += 1;
+        self.total = 0;
+        self.list_complete = false;
+    }
+
     fn load_list(&mut self) {
         // Counts describe the unfiltered list they came from; another scope or state voids them.
         if self.scope_repos_key != (self.scope, self.state_filter) {
@@ -2316,9 +2324,7 @@ impl App {
                     self.toast(format!("Scope reset to {}", self.scopes[0].name), ToastKind::Info);
                 }
                 self.pending_select = self.selected_pr().map(|p| p.id.clone());
-                self.prs.clear();
-                self.prs_rev += 1;
-                self.total = 0;
+                self.clear_list();
                 self.sel = 0;
                 self.load_list();
             }
@@ -2336,9 +2342,7 @@ impl App {
                 self.search.remote_cache.clear();
                 self.pending_select = self.selected_pr().map(|p| p.id.clone());
                 self.sel = 0;
-                self.prs.clear();
-                self.prs_rev += 1;
-                self.total = 0;
+                self.clear_list();
                 self.load_list();
             }
             Action::ToggleUnreadOnly => {
@@ -2969,6 +2973,7 @@ impl App {
                 Some(s) if own => *s = Seen { snap: snap.rebase_on(Some(&s.snap)), at: now, unread: false },
                 // Still listed: keep it from being evicted (daily is plenty for a 30-day TTL).
                 Some(s) => {
+                    s.snap.learn_mergeable(snap.mergeable.as_deref());
                     if now - s.at > 86400 {
                         s.at = now;
                     }
@@ -3018,6 +3023,8 @@ impl App {
                     now.iter().filter_map(|p| self.unread.get(&p.id).filter(|c| !c.is_empty()).map(|c| (p.id.clone(), c.clone()))).collect();
                 self.set_digest(&ch, &now, true);
             }
+            // A different query's digest would still point at the previous list.
+            Some(_) => self.digest = None,
             _ => {}
         }
         self.list_query = self.loading_query.clone();
@@ -3027,6 +3034,7 @@ impl App {
 
     fn set_digest(&mut self, ch: &[(String, Vec<Change>)], prs: &[PrSummary], since_last: bool) {
         if ch.is_empty() {
+            self.digest = None;
             return;
         }
         let (items, more) = changes::digest_items(ch, prs, DIGEST_ITEMS);
@@ -3267,6 +3275,13 @@ impl App {
             self.search.spliced.retain(|id| select.as_ref() == Some(id));
         }
         self.search.pinned = text;
+        // Unread-only hides a read or newly spliced row, and `visible` would then
+        // fall back to another PR. Keep the one the palette chose.
+        if self.unread_only
+            && let Some(id) = &select
+        {
+            self.unread_keep.insert(id.clone());
+        }
         let vis = self.visible();
         let want = select.or(prev.clone());
         self.sel = want.and_then(|id| vis.iter().position(|&i| self.prs[i].id == id)).unwrap_or(0);
@@ -3288,9 +3303,7 @@ impl App {
         if idx != self.scope || self.prs.is_empty() {
             self.scope = idx;
             self.sel = 0;
-            self.prs.clear();
-            self.prs_rev += 1;
-            self.total = 0;
+            self.clear_list();
             self.screen = Screen::List;
             self.search.remote_cache.clear();
             self.load_list();
@@ -4616,5 +4629,66 @@ mod change_tests {
         let d = app.digest.as_ref().unwrap();
         assert_eq!(d.count, 2);
         assert!(d.items.iter().any(|(_, t)| t == "#5 new") && d.items.iter().any(|(_, t)| t == "#1 left the list"), "{:?}", d.items);
+    }
+
+    #[test]
+    fn quiet_refresh_clears_the_previous_digest() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[0].comments.total_count = 1;
+        load(&mut app, list.clone());
+        assert!(app.digest.is_some());
+        load(&mut app, list);
+        assert!(app.digest.is_none());
+    }
+
+    #[test]
+    fn unread_filter_opens_the_pr_chosen_in_search() {
+        let mut app = test_app();
+        let list = prs();
+        load(&mut app, list.clone());
+        app.unread_only = true;
+        assert!(app.visible().is_empty());
+        app.pin(Some("pr 3".into()), Some(list[2].id.clone()));
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(3));
+        // A GitHub hit that is not unread yet is inserted, then opened.
+        let remote = pr(99, "other/repo", "remote", "2026-10-19T00:00:00Z");
+        app.prs.insert(0, remote.clone());
+        app.prs_rev += 1;
+        app.pin(None, Some(remote.id.clone()));
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(99));
+    }
+
+    #[test]
+    fn unknown_mergeable_is_learned_before_it_counts() {
+        let mut app = test_app();
+        let mut list = prs();
+        list[0].mergeable = Some("UNKNOWN".into());
+        load(&mut app, list.clone());
+        list[0].mergeable = Some("MERGEABLE".into());
+        load(&mut app, list.clone());
+        assert!(app.digest.is_none());
+        assert!(!app.unread.contains_key(&list[0].id));
+        assert_eq!(app.state.seen[&list[0].id].snap.mergeable.as_deref(), Some("MERGEABLE"));
+        list[0].mergeable = Some("CONFLICTING".into());
+        load(&mut app, list.clone());
+        assert!(app.unread.contains_key(&list[0].id));
+    }
+
+    #[test]
+    fn clearing_the_list_is_not_a_complete_previous_load() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        assert!(app.list_complete);
+        list[0].comments.total_count = 4;
+        load(&mut app, list.clone());
+        assert!(app.digest.is_some());
+        app.clear_list();
+        assert!(!app.list_complete);
+        assert!(app.prs.is_empty());
+        load(&mut app, list);
+        assert!(app.digest.is_none());
     }
 }
