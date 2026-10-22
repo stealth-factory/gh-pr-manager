@@ -431,6 +431,19 @@ impl Item {
     }
 }
 
+/// Identity of a palette row, so a later GitHub response can put the highlight back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchAnchor {
+    Pr(String),
+    Remote(String),
+    More,
+    Repo(String),
+    Scope(usize),
+    Command(Command),
+    Recent(String),
+    GitHub,
+}
+
 /// Highlight spans for one drawn PR row (char indices per field) and its description snippet.
 #[derive(Default)]
 pub struct Marks {
@@ -1468,19 +1481,27 @@ impl App {
             }
             Msg::Detail { id, res } => {
                 self.detail_loading.remove(&id);
+                let keep = self.selected_pr().map(|p| p.id.clone());
                 match res {
                     Ok((d, rate)) => {
                         self.rate = rate.or(self.rate.take());
                         self.detail_errors.remove(&id);
                         // Keep the list row in sync with the fresher detail.
+                        let mut reranked = false;
                         if let Some(p) = self.prs.iter_mut().find(|p| p.id == id) {
                             p.title = d.title.clone();
                             p.state = d.state.clone();
                             p.is_draft = d.is_draft;
                             p.review_decision = d.review_decision.clone();
                             self.prs_rev += 1;
+                            reranked = true;
                         }
                         self.details.insert(id, (d, Instant::now()));
+                        // A pinned query re-ranks when the title or state changes. `sel` is an
+                        // ordinal, so put it back on the PR that was open.
+                        if reranked {
+                            self.retain_list_sel(keep);
+                        }
                         self.ensure_files(false);
                         self.ensure_runs(false);
                     }
@@ -1671,6 +1692,8 @@ impl App {
                     self.search.bodies_loading.remove(id);
                 }
                 let Ok((bodies, rate)) = res else { return };
+                let keep = self.selected_pr().map(|p| p.id.clone());
+                let anchor = self.capture_search_sel();
                 self.rate = rate.or(self.rate.take());
                 for b in bodies {
                     let stripped = search::strip_body(&b.body, search::BODY_CAP);
@@ -1682,11 +1705,14 @@ impl App {
                     self.search.bodies.insert(b.id, (b.updated_at, stripped));
                 }
                 if self.search.bodies.len() > 1000 {
-                    let keep: HashSet<&str> =
+                    let alive: HashSet<&str> =
                         self.prs.iter().map(|p| p.id.as_str()).chain(self.search.remote.iter().flat_map(|r| r.hits.iter().map(|p| p.id.as_str()))).collect();
-                    self.search.bodies.retain(|id, _| keep.contains(id.as_str()));
+                    self.search.bodies.retain(|id, _| alive.contains(id.as_str()));
                 }
                 self.prs_rev += 1;
+                // New description matches can insert a PR ahead of the one on screen.
+                self.retain_list_sel(keep);
+                self.restore_search_sel(anchor);
             }
             Msg::Remote { generation, key, res } => self.on_remote(generation, key, res),
             Msg::Image(m) => {
@@ -3066,9 +3092,84 @@ impl App {
     }
 
     fn set_remote(&mut self, kind: RemoteKind, query: String, hits: Vec<PrSummary>, loading: bool, error: Option<String>, repos: usize) {
+        // GitHub rows land ahead of repos, scopes and commands. Keep a moved highlight on the same row.
+        let anchor = self.capture_search_sel();
         let bodies = &self.search.bodies;
         let docs = hits.iter().map(|p| Doc::new(p, bodies.get(&p.id).map(|(_, b)| b.as_str()))).collect();
         self.search.remote = Some(Remote { kind, query, hits, docs, loading, error, repos });
+        self.restore_search_sel(anchor);
+    }
+
+    /// Show number-lookup hits and, unless the user moved the highlight, sit it on an exact `#n`.
+    fn show_number(&mut self, n: u64, hits: Vec<PrSummary>, loading: bool, error: Option<String>, repos: usize) {
+        self.set_remote(RemoteKind::Number(n), format!("#{n}"), hits, loading, error, repos);
+        self.prefer_exact_number(n);
+    }
+
+    fn prefer_exact_number(&mut self, n: u64) {
+        if self.search.moved {
+            return;
+        }
+        let items = self.selectable_items();
+        if items.get(self.search.sel).and_then(|it| self.item_number(it)) == Some(n) {
+            return;
+        }
+        if let Some(i) = items.iter().position(|it| self.item_number(it) == Some(n)) {
+            self.search.sel = i;
+        }
+    }
+
+    fn capture_search_sel(&self) -> Option<SearchAnchor> {
+        if !self.search.moved || !matches!(self.modal, Some(Modal::Search)) {
+            return None;
+        }
+        self.selectable_items().get(self.search.sel).and_then(|it| self.anchor_of(it))
+    }
+
+    fn restore_search_sel(&mut self, saved: Option<SearchAnchor>) {
+        let Some(saved) = saved else { return };
+        let items = self.selectable_items();
+        if let Some(i) = items.iter().position(|it| self.anchor_of(it).as_ref() == Some(&saved)) {
+            self.search.sel = i;
+            return;
+        }
+        if !items.is_empty() {
+            self.search.sel = self.search.sel.min(items.len() - 1);
+        }
+    }
+
+    fn anchor_of(&self, it: &Item) -> Option<SearchAnchor> {
+        Some(match it {
+            Item::Pr { idx, .. } => SearchAnchor::Pr(self.prs.get(*idx)?.id.clone()),
+            Item::Remote { i, .. } => SearchAnchor::Remote(self.search.remote.as_ref()?.hits.get(*i)?.id.clone()),
+            Item::More(_) => SearchAnchor::More,
+            Item::Repo { nwo, .. } => SearchAnchor::Repo(nwo.clone()),
+            Item::Scope(i) => SearchAnchor::Scope(*i),
+            Item::Command { cmd, .. } => SearchAnchor::Command(*cmd),
+            Item::Recent(s) => SearchAnchor::Recent(s.clone()),
+            Item::SearchGitHub => SearchAnchor::GitHub,
+            Item::Header(_) | Item::Note(_) => return None,
+        })
+    }
+
+    /// After a pinned list re-ranks, keep `prev` selected (or clamp if it fell out of the filter).
+    fn retain_list_sel(&mut self, prev: Option<String>) {
+        let vis = self.visible();
+        let sel = prev.as_ref().and_then(|id| vis.iter().position(|&i| self.prs[i].id == *id)).unwrap_or_else(|| self.sel.min(vis.len().saturating_sub(1)));
+        let now = vis.get(sel).map(|&i| self.prs[i].id.clone());
+        if now != prev {
+            self.detail_scroll = 0;
+            self.info_scroll = 0;
+            self.file_sel = 0;
+            self.file_list_scroll = 0;
+            self.actions_sel = 0;
+            self.actions_tree_scroll = 0;
+            self.actions_tree_follow = true;
+            if self.screen == Screen::Detail {
+                self.ensure_detail();
+            }
+        }
+        self.sel = sel;
     }
 
     /// Whether a GitHub request may go out now (one at a time, 20/min, not while paused or rate limited).
@@ -3158,11 +3259,10 @@ impl App {
         let fresh = |e: &(Instant, Option<PrSummary>)| e.0.elapsed() < Duration::from_secs(600);
         let unknown: Vec<String> = repos.iter().filter(|r| !self.search.number_cache.get(&(r.to_lowercase(), n)).is_some_and(fresh)).cloned().collect();
         let hits = self.number_hits(&repos, n);
-        let key = format!("#{n}");
         if unknown.is_empty() {
             self.search.dirty = false;
             self.search.force = false;
-            self.set_remote(RemoteKind::Number(n), key, hits, false, None, repos.len());
+            self.show_number(n, hits, false, None, repos.len());
             return self.check_open_on_arrival();
         }
         if self.search.remote.as_ref().is_some_and(|r| r.kind == RemoteKind::Number(n) && r.loading) {
@@ -3170,7 +3270,7 @@ impl App {
             return;
         }
         // Show what the cache has while waiting for a slot (or for Enter / Ctrl-g with `live = false`).
-        self.set_remote(RemoteKind::Number(n), key.clone(), hits.clone(), false, None, repos.len());
+        self.show_number(n, hits.clone(), false, None, repos.len());
         if !self.cfg.search.live && !self.search.force {
             self.search.dirty = false;
             return;
@@ -3182,7 +3282,7 @@ impl App {
         self.search.inflight = true;
         self.search.dirty = false;
         self.search.force = false;
-        self.set_remote(RemoteKind::Number(n), key, hits, true, None, repos.len());
+        self.show_number(n, hits, true, None, repos.len());
         let (client, tx, generation) = (self.client.clone(), self.tx.clone(), self.search.remote_gen);
         tokio::spawn(async move {
             let res = client.prs_by_number(&unknown, n).await;
@@ -3236,18 +3336,19 @@ impl App {
                 Err(e) => self.set_remote(RemoteKind::Text, q, Vec::new(), false, Some(e), 0),
             },
             RemoteKey::Number { n, .. } => {
+                // `#14` can still be in flight when the user has typed `#142` and pressed Enter.
+                // That older response must not finish the pending open, or it reports "No PR #142".
+                if self.search.query().number() != Some(n) {
+                    if self.search.remote.as_ref().is_some_and(|r| r.kind == RemoteKind::Number(n)) {
+                        self.search.remote = None;
+                    }
+                    return;
+                }
                 let repos = self.number_repos();
                 let hits = self.number_hits(&repos, n);
-                self.set_remote(RemoteKind::Number(n), format!("#{n}"), hits, false, res.err(), repos.len());
-                if self.search.open_on_arrival.is_some() {
-                    return self.check_open_on_arrival();
-                }
-                // An exact hit beats a prefix one: put the highlight on it unless the user moved it.
-                let items = self.selectable_items();
-                if !self.search.moved && items.get(self.search.sel).and_then(|it| self.item_number(it)) != Some(n)
-                    && let Some(i) = items.iter().position(|it| self.item_number(it) == Some(n))
-                {
-                    self.search.sel = i;
+                self.show_number(n, hits, false, res.err(), repos.len());
+                if self.search.open_on_arrival == Some(n) {
+                    self.check_open_on_arrival();
                 }
             }
         }
@@ -3378,7 +3479,42 @@ pub fn search_items(app: &App) -> Vec<Item> {
         }
         return items;
     }
-    let local = app.palette_results();
+    let mut local = app.palette_results();
+    // GitHub rows not already shown, re-ranked with the full text (number hits keep repo order).
+    // A loaded PR that only matches in its description is kept when GitHub returned it and the
+    // body cache has not (bodies off, rate limit, or a failed fetch).
+    let remote = app.current_remote(&q);
+    let mut rows: Vec<(usize, Match)> = Vec::new();
+    if let Some(r) = remote {
+        let mut added = false;
+        {
+            let mut m = s.matcher.borrow_mut();
+            for (i, (p, d)) in r.hits.iter().zip(&r.docs).enumerate() {
+                if let Some(idx) = app.prs.iter().position(|x| x.id == p.id) {
+                    // Same PR, missed by local ranking (usually a body GitHub searched and we have not cached).
+                    if !local.iter().any(|(j, _)| *j == idx)
+                        && let Some(sc) = search::score(&mut m, &q, d, p, true)
+                    {
+                        local.push((idx, sc));
+                        added = true;
+                    }
+                    continue;
+                }
+                if let Some(sc) = search::score(&mut m, &q, d, p, true) {
+                    rows.push((i, sc));
+                }
+            }
+        }
+        if added {
+            local.sort_by(|a, b| {
+                let updated = |i: usize| crate::ui::parse_ts(&app.prs[i].updated_at).unwrap_or(0);
+                search::order((&a.1, updated(a.0), a.0), (&b.1, updated(b.0), b.0))
+            });
+        }
+        if r.kind == RemoteKind::Text {
+            rows.sort_by(|a, b| search::order((&a.1, r.docs[a.0].updated, a.0), (&b.1, r.docs[b.0].updated, b.0)));
+        }
+    }
     let best = local.first().map_or(0, |(_, m)| m.score);
     items.push(Item::Header("Pull requests".into()));
     if q.number_mode && q.number().is_none() {
@@ -3389,24 +3525,6 @@ pub fn search_items(app: &App) -> Vec<Item> {
     items.extend(local.iter().take(PALETTE_PRS).map(|&(idx, m)| Item::Pr { idx, m }));
     if local.len() > PALETTE_PRS {
         items.push(Item::More(local.len() - PALETTE_PRS));
-    }
-
-    // GitHub: rows not already loaded, re-ranked with the full text (number hits keep repo order).
-    let remote = app.current_remote(&q);
-    let mut rows: Vec<(usize, Match)> = Vec::new();
-    if let Some(r) = remote {
-        let mut m = s.matcher.borrow_mut();
-        for (i, (p, d)) in r.hits.iter().zip(&r.docs).enumerate() {
-            if app.prs.iter().any(|x| x.id == p.id) {
-                continue;
-            }
-            if let Some(sc) = search::score(&mut m, &q, d, p, true) {
-                rows.push((i, sc));
-            }
-        }
-        if r.kind == RemoteKind::Text {
-            rows.sort_by(|a, b| search::order((&a.1, r.docs[a.0].updated, a.0), (&b.1, r.docs[b.0].updated, b.0)));
-        }
     }
     if q.number_mode {
         if q.number().is_some() {
@@ -3769,6 +3887,162 @@ mod search_tests {
         // Local prefix match first, then the GitHub exact hit.
         assert_eq!(numbers, vec![140, 14]);
         assert!(items.iter().all(|it| !matches!(it, Item::Repo { .. } | Item::Command { .. })));
+    }
+
+    #[test]
+    fn cached_number_highlights_the_exact_hit() {
+        let mut app = test_app();
+        app.modal = Some(Modal::Search);
+        app.prs = vec![pr(140, "acme/one", "x", "2026-01-02T00:00:00Z")];
+        app.prs_rev += 1;
+        app.scope_repos = count_repos(&app.prs);
+        app.search.number_cache.insert(("acme/one".into(), 14), (Instant::now(), Some(pr(14, "acme/one", "exact", "2026-01-03T00:00:00Z"))));
+        app.search.text = "#14".into();
+        app.search.dirty = true;
+        app.search.force = true;
+        app.drive_search();
+        let items = app.selectable_items();
+        // Enter opens the highlight. The cached exact hit has to be that row, or #140 opens.
+        assert_eq!(app.item_number(&items[app.search.sel]), Some(14));
+        assert!(!app.number_lookup_pending(14));
+    }
+
+    #[test]
+    fn stale_number_lookup_does_not_finish_a_newer_enter() {
+        let mut app = test_app();
+        app.modal = Some(Modal::Search);
+        app.prs = vec![pr(140, "acme/one", "x", "2026-01-02T00:00:00Z")];
+        app.prs_rev += 1;
+        app.scope_repos = count_repos(&app.prs);
+        app.search.text = "#142".into();
+        app.search.open_on_arrival = Some(142);
+        app.search.dirty = true;
+        app.search.remote_gen = 1;
+        app.set_remote(RemoteKind::Number(14), "#14".into(), Vec::new(), true, None, 1);
+        app.handle(Msg::Remote {
+            generation: 1,
+            key: RemoteKey::Number { n: 14, repos: vec!["acme/one".into()] },
+            res: Ok((Vec::new(), None)),
+        });
+        assert_eq!(app.search.open_on_arrival, Some(142));
+        assert!(app.toast.as_ref().is_none_or(|(m, _, _)| !m.contains("142")));
+        assert!(app.search.remote.as_ref().is_none_or(|r| r.kind != RemoteKind::Number(14)));
+    }
+
+    #[test]
+    fn remote_rows_keep_a_moved_selection() {
+        let mut app = test_app();
+        app.modal = Some(Modal::Search);
+        app.prs = vec![pr(1, "acme/form-atlas", "merge queue", "2026-01-01T00:00:00Z")];
+        app.prs_rev += 1;
+        app.scope_repos = count_repos(&app.prs);
+        app.search.text = "form".into();
+        let items = app.selectable_items();
+        let repo_at = items.iter().position(|it| matches!(it, Item::Repo { .. })).expect("repo row");
+        app.search.sel = repo_at;
+        app.search.moved = true;
+        let nwo = match &items[repo_at] {
+            Item::Repo { nwo, .. } => nwo.clone(),
+            _ => unreachable!(),
+        };
+        app.search.remote_gen = 1;
+        let q = app.wanted_remote(&app.search.query(), true).unwrap();
+        app.handle(Msg::Remote {
+            generation: 1,
+            key: RemoteKey::Text(q),
+            res: Ok((vec![pr(9, "acme/other", "form from github", "2026-01-02T00:00:00Z")], None)),
+        });
+        let items = app.selectable_items();
+        match &items[app.search.sel] {
+            Item::Repo { nwo: n, .. } => assert_eq!(n, &nwo),
+            other => panic!("selection jumped to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_hit_keeps_a_loaded_pr_without_a_cached_body() {
+        let mut app = test_app();
+        let loaded = pr(1, "a/b", "unrelated title", "2026-01-01T00:00:00Z");
+        app.prs = vec![loaded.clone()];
+        app.prs_rev += 1;
+        app.search.text = "shoulder".into();
+        let q = app.wanted_remote(&app.search.query(), true).unwrap();
+        app.set_remote(RemoteKind::Text, q, vec![loaded], false, None, 0);
+        assert!(search_items(&app).iter().any(|it| matches!(it, Item::Pr { idx: 0, .. })));
+    }
+
+    #[test]
+    fn bodies_and_detail_keep_the_selected_pr() {
+        let mut app = test_app();
+        let older = pr(1, "a/b", "unrelated older", "2026-01-01T00:00:00Z");
+        let newer = pr(2, "a/b", "unrelated newer", "2026-01-05T00:00:00Z");
+        app.prs = vec![older.clone(), newer.clone()];
+        app.prs_rev += 1;
+        app.search.bodies.insert(older.id.clone(), (older.updated_at.clone(), "mesh details".into()));
+        app.search.pinned = Some("mesh".into());
+        app.sel = 0;
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        app.handle(Msg::Bodies {
+            ids: vec![newer.id.clone()],
+            res: Ok((vec![PrBody { id: newer.id.clone(), updated_at: newer.updated_at.clone(), body: "mesh details".into() }], None)),
+        });
+        assert_eq!(app.visible(), vec![1, 0]);
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+
+        app.search.pinned = Some("mesh".into());
+        app.prs[0].title = "mesh alpha".into();
+        app.prs[1].title = "zzz".into();
+        app.search.bodies.clear();
+        app.prs_rev += 1;
+        app.sel = 0;
+        assert_eq!(app.selected_pr().unwrap().number, 1);
+        let detail = serde_json::from_value::<crate::github::PrDetail>(serde_json::json!({
+            "id": newer.id,
+            "number": 2,
+            "title": "mesh beta",
+            "body": "",
+            "bodyHTML": "",
+            "state": "OPEN",
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": null,
+            "reviewDecision": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": newer.updated_at,
+            "author": null,
+            "headRefName": "feat",
+            "baseRefName": "main",
+            "additions": 0,
+            "deletions": 0,
+            "changedFiles": 0,
+            "headRefOid": "abc",
+            "isCrossRepository": false,
+            "canBeRebased": true,
+            "viewerCanClose": true,
+            "viewerCanReopen": true,
+            "viewerCanMergeAsAdmin": false,
+            "labels": {"nodes": []},
+            "assignees": {"nodes": []},
+            "reviewRequests": {"nodes": []},
+            "participants": {"nodes": []},
+            "repository": {
+                "nameWithOwner": "a/b",
+                "mergeCommitAllowed": true,
+                "squashMergeAllowed": true,
+                "rebaseMergeAllowed": true,
+                "viewerPermission": null,
+                "mentionableUsers": {"nodes": []}
+            },
+            "statusCheckRollup": null,
+            "commits": {"totalCount": 0, "nodes": []},
+            "reviews": {"nodes": []},
+            "comments": {"nodes": []},
+            "reviewThreads": {"nodes": []}
+        }))
+        .unwrap();
+        app.handle(Msg::Detail { id: newer.id.clone(), res: Ok((detail, None)) });
+        assert_eq!(app.prs[1].title, "mesh beta");
+        assert_eq!(app.selected_pr().unwrap().number, 1);
     }
 
     #[test]

@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.github.com/graphql";
+/// A stalled GraphQL call must fail, or a palette search stays in flight for the whole session.
+const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The only hosts an image request may send the token to.
 const TOKEN_HOSTS: [&str; 3] = ["github.com", "api.github.com", "raw.githubusercontent.com"];
 /// Image downloads larger than this are refused.
@@ -93,6 +96,7 @@ impl Client {
             .http
             .post(ENDPOINT)
             .bearer_auth(&self.token)
+            .timeout(GRAPHQL_TIMEOUT)
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?;

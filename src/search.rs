@@ -122,6 +122,11 @@ pub fn lower(s: &str) -> String {
 
 const PREFIXES: [&str; 8] = ["repo:", "author:", "label:", "head:", "branch:", "is:", "ci:", "review:"];
 
+/// Prefixes that accept a leading `-`. `head`/`ci`/`review` have no negated form.
+fn negatable(prefix: &str) -> bool {
+    matches!(prefix, "repo:" | "author:" | "label:" | "is:")
+}
+
 fn classify(word: &str, me: Option<&str>) -> Token {
     let (neg, body) = match word.strip_prefix('-') {
         Some(rest) if PREFIXES.iter().any(|p| rest.to_ascii_lowercase().starts_with(p)) => (true, rest),
@@ -137,10 +142,11 @@ fn classify(word: &str, me: Option<&str>) -> Token {
         let p = prefix.to_ascii_lowercase();
         let value = value.trim_matches('"');
         let v = value.to_lowercase();
-        if PREFIXES.contains(&format!("{p}:").as_str()) && value.is_empty() {
-            return Token::Pending;
-        }
         let invalid = || Token::Invalid;
+        if PREFIXES.contains(&format!("{p}:").as_str()) && value.is_empty() {
+            // `-ci:` has no negated form; draw it red instead of as a pending filter.
+            return if neg && !negatable(&format!("{p}:")) { invalid() } else { Token::Pending };
+        }
         match p.as_str() {
             "repo" => return Token::Repo(v, neg),
             "author" => {
@@ -180,6 +186,8 @@ fn classify(word: &str, me: Option<&str>) -> Token {
                     _ => invalid(),
                 };
             }
+            // `-head:`, `-ci:`, `-review:` and any other negated prefix with no meaning.
+            _ if neg => return invalid(),
             _ => {}
         }
     }
@@ -251,6 +259,8 @@ pub fn remote_query(q: &Query, base: &str, all_tokens: bool, repos: &[String]) -
                 match found {
                     Some(nwo) => quals.push(format!("{}repo:{nwo}", minus(*neg))),
                     None if r.contains('/') => quals.push(format!("{}repo:{r}", minus(*neg))),
+                    // `repo:atlas` with nothing loaded is not a GitHub qualifier.
+                    // Returned rows are still dropped unless the owner/name matches.
                     None => {}
                 }
             }
@@ -271,6 +281,7 @@ pub fn remote_query(q: &Query, base: &str, all_tokens: bool, repos: &[String]) -
                 CiFlag::Failing => quals.push("status:failure".into()),
                 CiFlag::Passing => quals.push("status:success".into()),
                 CiFlag::Pending => quals.push("status:pending".into()),
+                // No qualifier for "no checks". `passes` drops rows that have a rollup.
                 CiFlag::None => {}
             },
             Token::Review(f) => quals.push(
@@ -524,10 +535,16 @@ fn fuzzy(m: &mut Matcher, needle: &str, hay: &Utf32String) -> bool {
 }
 
 /// Whether the filters let `pr` through.
-fn passes(m: &mut Matcher, q: &Query, d: &Doc, pr: &PrSummary) -> bool {
+///
+/// `lenient` is for a row GitHub already returned. A positive `label:` is then trusted when
+/// the summary's label list is full (`labels(first:10)` in `pr_fields`): the matching name
+/// may sit past that page, and the search qualifier already required it.
+fn passes(m: &mut Matcher, q: &Query, d: &Doc, pr: &PrSummary, lenient: bool) -> bool {
+    let trust_label = lenient && pr.labels.nodes.len() >= 10;
     q.tokens.iter().all(|t| match t {
         Token::Repo(r, neg) => fuzzy(m, r, &d.repo) != *neg,
         Token::Author(a, neg) => fuzzy(m, a, &d.author) != *neg,
+        Token::Label(_, false) if trust_label => true,
         Token::Label(l, neg) => d.labels_lc.iter().any(|x| x.contains(l.as_str())) != *neg,
         Token::Head(h) => fuzzy(m, h, &d.branch),
         Token::Is(f, neg) => {
@@ -563,8 +580,10 @@ fn passes(m: &mut Matcher, q: &Query, d: &Doc, pr: &PrSummary) -> bool {
 
 /// Score one PR: every free term must hit some field (AND), summed over terms; filters gate.
 /// `lenient` (rows GitHub returned) keeps a PR whose terms miss locally, counting the misses.
+/// Filters still apply: a query GitHub cannot express (`ci:none`, an unresolved `repo:`)
+/// must not show rows that contradict it.
 pub fn score(m: &mut Matcher, q: &Query, d: &Doc, pr: &PrSummary, lenient: bool) -> Option<Match> {
-    if !lenient && !passes(m, q, d, pr) {
+    if !passes(m, q, d, pr, lenient) {
         return None;
     }
     let mut out = Match { score: 0, field: Field::Title, body_hit: None, exact_number: false, missed: 0 };
@@ -737,13 +756,17 @@ pub fn complete(q: &Query, values: &Values) -> Vec<String> {
     let Some(span) = q.spans.last().filter(|s| s.end == q.raw.len()) else { return Vec::new() };
     let word = &q.raw[span.clone()];
     let (neg, body) = match word.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", word),
+        Some(rest) => (true, rest),
+        None => (false, word),
     };
+    let minus = if neg { "-" } else { "" };
     let Some((prefix, value)) = body.split_once(':') else {
         let w = body.to_ascii_lowercase();
-        return PREFIXES.iter().filter(|p| !w.is_empty() && p.starts_with(&w) && **p != w).map(|p| format!("{neg}{p}")).collect();
+        return PREFIXES.iter().filter(|p| !w.is_empty() && p.starts_with(&w) && **p != w && (!neg || negatable(p))).map(|p| format!("{minus}{p}")).collect();
     };
+    if neg && !negatable(&format!("{}:", prefix.to_ascii_lowercase())) {
+        return Vec::new();
+    }
     let v = value.trim_matches('"').to_lowercase();
     let list: Vec<String> = match prefix.to_ascii_lowercase().as_str() {
         "repo" => values.repos.clone(),
@@ -762,7 +785,7 @@ pub fn complete(q: &Query, values: &Values) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in list.iter().filter(|c| fits(c)) {
         let quoted = if c.contains(' ') { format!("\"{c}\"") } else { c.clone() };
-        let t = format!("{neg}{prefix}:{quoted}");
+        let t = format!("{minus}{prefix}:{quoted}");
         if !out.contains(&t) {
             out.push(t);
         }
@@ -958,7 +981,7 @@ impl TokenBucket {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::github::{Count, LabelName, Login, Nodes, RepoRef};
+    use crate::github::{CommitNode, Count, LabelName, Login, Nodes, RepoRef, RollupOnly, RollupState};
     use std::time::{Duration, Instant};
 
     pub fn pr(number: u64, repo: &str, title: &str, updated: &str) -> PrSummary {
@@ -1093,6 +1116,23 @@ pub(crate) mod tests {
         assert_eq!(ranked("ci:none review:none", &prs, &[]), vec![2, 1]);
         // Invalid filters are ignored, not fatal.
         assert_eq!(ranked("is:foo one", &prs, &[]), vec![1]);
+        assert_eq!(ranked("-ci:failing one", &prs, &[]), vec![1]);
+    }
+
+    #[test]
+    fn negated_unsupported_prefixes_are_invalid() {
+        for s in ["-head:feat", "-branch:feat", "-ci:failing", "-ci:", "-review:approved"] {
+            assert!(matches!(parse(s, None).tokens[0], Token::Invalid), "{s}");
+        }
+        assert!(matches!(parse("head:feat", None).tokens[0], Token::Head(_)));
+        assert!(matches!(parse("ci:failing", None).tokens[0], Token::Ci(CiFlag::Failing)));
+        assert!(matches!(parse("-repo:atlas", None).tokens[0], Token::Repo(_, true)));
+        assert!(matches!(parse("-is:draft", None).tokens[0], Token::Is(IsFlag::Draft, true)));
+        let v = Values::default();
+        assert!(complete(&parse("-c", None), &v).is_empty());
+        assert!(complete(&parse("-ci:f", None), &v).is_empty());
+        assert_eq!(complete(&parse("-r", None), &v), vec!["-repo:"]);
+        assert_eq!(complete(&parse("-is:d", None), &v), vec!["-is:draft"]);
     }
 
     #[test]
@@ -1114,6 +1154,35 @@ pub(crate) mod tests {
         assert_eq!(s.missed, 2);
         let hit = score(&mut m, &parse("unrelated", None), &d, &p, true).unwrap();
         assert_eq!(order((&hit, 0, 1), (&s, 0, 0)), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn lenient_still_applies_filters() {
+        let mut failing = pr(1, "a/b", "unrelated", "2026-01-01T00:00:00Z");
+        failing.commits = Nodes {
+            nodes: vec![Some(CommitNode { commit: RollupOnly { status_check_rollup: Some(RollupState { state: "FAILURE".into() }) } })],
+        };
+        let other = pr(2, "a/other", "unrelated", "2026-01-02T00:00:00Z");
+        let d_fail = Doc::new(&failing, None);
+        let d_other = Doc::new(&other, None);
+        let mut m = matcher();
+        let q = parse("shoulder ci:none", None);
+        assert!(score(&mut m, &q, &d_fail, &failing, true).is_none());
+        assert_eq!(score(&mut m, &q, &d_other, &other, true).unwrap().missed, 1);
+        let q = parse("shoulder repo:other", None);
+        assert!(score(&mut m, &q, &d_fail, &failing, true).is_none());
+        assert!(score(&mut m, &q, &d_other, &other, true).is_some());
+        // Fewer than 10 labels: a missing label is a real miss, on GitHub rows too.
+        assert!(score(&mut m, &parse("label:nope", None), &d_other, &other, true).is_none());
+        // A full label page can hide the name GitHub already matched.
+        let mut many = pr(3, "a/b", "shoulder", "2026-01-03T00:00:00Z");
+        many.labels = Nodes { nodes: (0..10).map(|i| Some(LabelName { name: format!("l{i}") })).collect() };
+        let d_many = Doc::new(&many, None);
+        assert!(score(&mut m, &parse("label:hidden", None), &d_many, &many, false).is_none());
+        assert!(score(&mut m, &parse("label:hidden", None), &d_many, &many, true).is_some());
+        many.commits = failing.commits.clone();
+        let d_many = Doc::new(&many, None);
+        assert!(score(&mut m, &parse("label:hidden ci:none", None), &d_many, &many, true).is_none());
     }
 
     #[test]
