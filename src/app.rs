@@ -1769,7 +1769,10 @@ impl App {
             }
             Msg::Detail { id, res } => {
                 self.detail_loading.remove(&id);
-                let asked = self.detail_asked.remove(&id);
+                // A detail is as fresh as its request; one asked for before the list on screen started
+                // loading mustn't overwrite that list's rows (or its stacks, in `rebuild_stacks`).
+                let asked = self.detail_asked.remove(&id).unwrap_or_else(Instant::now);
+                let current = self.list_at.is_none_or(|l| asked >= l);
                 let keep = self.selected_pr().map(|p| p.id.clone());
                 match res {
                     Ok((d, rate)) => {
@@ -1795,7 +1798,7 @@ impl App {
                         // state, or a newly learnt trunk, can redraw implicit chains.
                         let mut chained = false;
                         let mut reranked = false;
-                        if let Some(p) = self.prs.iter_mut().find(|p| p.id == id) {
+                        if current && let Some(p) = self.prs.iter_mut().find(|p| p.id == id) {
                             let before = (p.base_ref_name.clone(), p.head_ref_name.clone(), p.state.clone());
                             p.absorb(&d, me.as_deref());
                             chained = before != (p.base_ref_name.clone(), p.head_ref_name.clone(), p.state.clone());
@@ -1811,7 +1814,7 @@ impl App {
                             chained |= old.as_ref() != Some(&b.name);
                         }
                         let stacked = chained || d.stack.is_some() || self.membership.contains_key(&id);
-                        self.details.insert(id.clone(), (d, asked.unwrap_or_else(Instant::now)));
+                        self.details.insert(id.clone(), (d, asked));
                         if stacked {
                             self.rebuild_stacks_keep();
                         }
@@ -6284,8 +6287,8 @@ mod stack_tests {
         load(&mut app, list.clone());
         app.handle(Msg::Detail { id: list[2].id.clone(), res: Ok((detail(&list[2], Some(stack)), None)) });
         assert_eq!(app.details[&list[2].id].1, asked);
-        // The older snapshot doesn't apply: #7, which only it knew, isn't in the stack.
-        assert!(app.stacks.iter().flat_map(|s| &s.members).all(|m| m.number != 7));
+        // Neither its snapshot nor its row update applies: the list's view of the stack stands.
+        assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
     }
 
     #[tokio::test]
