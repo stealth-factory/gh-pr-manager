@@ -274,3 +274,74 @@ What shipped is the MVP cut, with these deviations:
 
 Known limitations: list-level counts can't exclude bots or yourself outside the 120 s window (a comment you post on
 github.com shows as `+1`). A PR that only left the list can't be jumped to. Search lag can still flap PRs that aren't open.
+
+### Later items (second PR)
+
+All of the "Later" list shipped, with these deviations:
+
+- **Query cost.** `DETAIL_QUERY` gained `totalCount` on comments/reviews/reviewThreads, `id` on comments, reviews and
+  inline comments, `oid` on commits, `lastEditedAt isReadByViewer`, and `timelineItems(last:5, …)` with `actor` and
+  `createdAt` per event. Re-measured on 2026-10-19: `rateLimit.cost` is **2 both before and after**. The "1" above came
+  from a stripped probe; the full query was already 2. Thread ids and the force-push event's before/after commits are
+  left out: nothing reads them (thread *comment* ids carry the marks; the banner uses the baseline's head).
+- **`PrSummary::absorb(&d, me)`** copies every signal field from a detail into its list row (both on `Msg::Detail`
+  and when a lagging search page arrives), so `of_summary(row) == of_detail(d)`. The detail sees direct review
+  requests only, so it can set `viewerLatestReviewRequest` but never clear it (team requests would flap).
+  `review_requests` in a detail snapshot is the node count (≤ 20), not a `totalCount`.
+- **Visits.** `App::visit` (`Visit { since: Option<Seen>, marks, checks, runs, ack, … }`) replaces the sketched
+  `viewing_since`/`new_marks` pair. It starts in `read_open` *before* the PR is marked read, so the frozen baseline is
+  what you'd seen; it ends when you leave the detail view or move to another PR. The tab cache key includes the
+  visit's serial, since the markers depend on it.
+- **Comment ids (exact marks).** `Seen` gains `ids: Vec<u32>`: FNV-1a hashes of every comment, review, inline
+  comment and commit oid the detail showed when you last read it (only written by a detail-level read; a summary-level
+  read such as `U` clears them, so the next marks go by time). With ids, an entry is new when its id is unknown, which
+  survives edits and deletions and catches inline comments drafted before you looked but published after. Without
+  ids, `createdAt > since.updated_at` decides (equal is not new) and commits are the newest `commits` delta; a
+  force-push without ids marks no commit (the banner says it). Known edge: deleting a comment on a PR with more than
+  80 lets an older one into the window, which then reads as new.
+- **Bots** are only what `cfg.bots` lists plus a `[bot]` suffix. GraphQL gives Bot authors bare logins
+  (`greptile-apps`, `vercel`, `chatgpt-codex-connector`), so those count as people unless listed. `author { __typename }`
+  would tell them apart for free; not added, as the doc didn't list it.
+- **`diff_detail`** returns the snapshot diff with comments/reviews/threads re-counted as others' new entries (reviews
+  only when they carry a verdict or words). It feeds the digest and notifications only for details refetched *within*
+  the visit (earlier ones were already digested from the list). Checks are diffed separately (`checks_changed`: a
+  context whose outcome changed to a finished one) and only drive the Checks badge, so running CI doesn't flood the
+  digest every 20 s.
+- **Tab badges.** Totals per tab: Description `✎` (edited since the baseline), Conversation (new comments + new
+  reviews it shows), Commits, Reviews (new reviews it shows + new inline comments), Checks (contexts changed during
+  the visit), Actions (head runs that finished during the visit). `SetTab`, `n`/`p` and a badge click record the
+  tab's total as seen (`Visit::ack`); later arrivals show a fresh `+n`, on the active tab too (bold only). The badge is
+  a separate click target: `Action::OpenNew(tab)` switches and scrolls to the first new entry.
+- **Markers.** A yellow `▍` and ` · NEW` on the entry header; `── N new since you last looked ──` before the first new
+  entry drawn (Reviews: one divider across summaries and threads; Commits: above the newest). Clicking the divider
+  goes to the next new entry. A new verdict also gets `NEW` in Reviews' reviewer list (not an `n` target). `n`/`p`
+  find entries through a zero-width `#new` link on the header row (`hits.new_rows`), step from the last jump while
+  the view hasn't moved, else from the view's top, and wrap.
+- **Banners.** Commits: `! head moved 1111111 → 92d6d1b (force-push by alice, 5m ago)` when the head changed and either
+  the count didn't grow or a `HeadRefForcePushedEvent` is newer than the baseline. The info header: `── Merged 2h ago
+  by alice since you last looked ──` (or Closed) when the baseline was OPEN.
+- **Comfortable list rows** are now one two-line row (`Row::height(2)`), not a one-line row plus a margin, so the
+  height and `table_row_h` are unchanged. The words sit in the Title column (cells can't span), clipped to it:
+  `CI failed · 2 new comments · 3 commits pushed`; a row unread without a diff says `unread on GitHub` or `unread`.
+  The selection highlight now covers both lines.
+- **Read-on-web.** `Seen.gh_unread` remembers GitHub's last `isReadByViewer == false`; a later `true` re-baselines the
+  PR (unread cleared, ids dropped). Persisted, so the edge also spans sessions.
+- **Actions.** A runs reload for the same head that finds runs newly `completed` puts `#151 1 run failed` (or
+  `2 runs passed`) in the digest (`Change::Runs`) and counts them for the Actions badge. It rides the existing Actions
+  polling, so it only happens while that tab is open.
+- **Dwell.** J/K, the list keys and the wheel in the detail view start the visit at once but read the PR after 1 s
+  (`DWELL`; checked on the tick). Enter, a sidebar click, the palette and the digest still read at once.
+- **Unread first** is a persisted toggle (`state.unread_first`), from the palette only (`Sort unread first`); no free
+  key was obvious. It's a stable sort over the visible rows; PRs read meanwhile stay in place until the next completed
+  reload (the open one stays put).
+- **Notifications.** `[notify]` defaults: `events` = the doc's six plus `closed`, `mine_only = true`, `bell = false`,
+  `desktop = "off"`, so nothing is emitted until `bell` or `desktop` is set. Sources: the list digest (including the
+  session's first "since you last looked" digest, so a CI failure while you were away rings on launch), in-visit
+  detail diffs. One per PR per 5 min, none while a modal is open, raw stdout like OSC 52 (`write_raw`, a no-op under
+  `cfg(test)`). `auto`: Kitty → OSC 99, iTerm2/WezTerm → OSC 9, Ghostty/urxvt → OSC 777; inside tmux only when
+  `tmux show -gv allow-passthrough` is on/all (then DCS-wrapped); Herdr (`TERM_PROGRAM=herdr` or `HERDR_ENV`) and
+  anything unknown get BEL. A named `desktop` is sent as asked (wrapped when inside tmux). OSC 99 is sent as a title
+  chunk (`d=0`) plus a `p=body` chunk; text is stripped of controls and `;` becomes `,`.
+- **Keys.** `n`/`p` on Conversation, Commits and Reviews (Changes and Actions keep theirs). Palette: `Sort unread
+  first`, `Next new entry`. Footer: `n p New` on those tabs. Help gained three rows; it was already taller than a
+  45-row terminal before this change.

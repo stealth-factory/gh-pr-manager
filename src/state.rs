@@ -26,6 +26,8 @@ pub struct State {
     pub recent_searches: Vec<String>,
     /// What you last saw of each PR, by PR id; a row is unread when it differs from this.
     pub seen: HashMap<String, Seen>,
+    /// Sort unread PRs to the top of the list.
+    pub unread_first: bool,
 }
 
 impl Default for State {
@@ -37,6 +39,7 @@ impl Default for State {
             images_enabled: true,
             recent_searches: Vec::new(),
             seen: HashMap::new(),
+            unread_first: false,
         }
     }
 }
@@ -53,6 +56,14 @@ pub struct Seen {
     /// newly appeared in a list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unread: bool,
+    /// Entry ids (comments, reviews, inline comments, commit oids; `changes::id_hash`) shown
+    /// when it was last read in the detail view; exact `NEW` marks. Empty: go by time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<u32>,
+    /// GitHub called it unread (`isReadByViewer == false`) last time; a later `true` means
+    /// it was read on github.com.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gh_unread: bool,
 }
 
 /// How much spacing the UI uses, from roomy to tight.
@@ -213,12 +224,12 @@ mod tests {
     fn seen_round_trips_and_older_files_load() {
         let mut s = State::default();
         let snap = Snapshot { state: "OPEN".into(), comments: 7, head: "d1e3597".into(), ci: Some("FAILURE".into()), ..Snapshot::default() };
-        s.seen.insert("PR_1".into(), Seen { snap: snap.clone(), at: 42, unread: true });
+        s.seen.insert("PR_1".into(), Seen { snap: snap.clone(), at: 42, unread: true, ids: vec![7, 9], gh_unread: true });
         let json = serde_json::to_string(&s).unwrap();
         // The snapshot is flattened into the entry, as docs/change-signals.md shows.
         assert!(json.contains(r#""PR_1":{"updated_at":"#), "{json}");
         let back: State = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.seen["PR_1"], Seen { snap, at: 42, unread: true });
+        assert_eq!(back.seen["PR_1"], Seen { snap, at: 42, unread: true, ids: vec![7, 9], gh_unread: true });
         // A state file from before `seen`, and an entry missing newer fields.
         let old: State = serde_json::from_str(r#"{"density":"Cozy","recent_repos":[]}"#).unwrap();
         assert!(old.seen.is_empty());

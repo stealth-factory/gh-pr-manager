@@ -25,6 +25,40 @@ pub struct Config {
     pub image_max_rows: u16,
     /// The `/` search palette.
     pub search: SearchConfig,
+    /// Bell / desktop notifications for interrupt-worthy changes (off by default).
+    pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Which changes notify: review_requested, approved, changes_requested, ci_failed, merged,
+    /// closed, conflicts. `[]` turns notifications off.
+    pub events: Vec<String>,
+    /// Only PRs you authored or were asked to review.
+    pub mine_only: bool,
+    /// Ring the terminal bell (BEL).
+    pub bell: bool,
+    /// Desktop notification escape: "auto", "osc9", "osc777", "osc99" or "off".
+    pub desktop: String,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            events: ["review_requested", "approved", "changes_requested", "ci_failed", "merged", "closed", "conflicts"].map(String::from).to_vec(),
+            mine_only: true,
+            bell: false,
+            desktop: "off".into(),
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// Anything would be emitted at all.
+    pub fn enabled(&self) -> bool {
+        !self.events.is_empty() && (self.bell || !self.desktop.trim().eq_ignore_ascii_case("off"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +97,7 @@ impl Default for Config {
             images: "auto".into(),
             image_max_rows: 20,
             search: SearchConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }
