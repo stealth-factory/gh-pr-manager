@@ -1628,7 +1628,7 @@ impl App {
                         self.loading_list = has_next && self.prs.len() < MAX_PRS;
                         self.observe(&page_ids);
                         if !self.loading_list {
-                            self.finish_list();
+                            self.finish_list(prev.as_deref());
                         }
                         if self.repo.is_none() {
                             self.scope_repos = count_repos(&self.prs);
@@ -1662,8 +1662,12 @@ impl App {
                         if let Some(v) = self.visit.as_mut().filter(|v| v.id == id)
                             && let Some((old, at)) = self.details.get(&id)
                         {
-                            v.checks.extend(changes::checks_changed(old, &d));
-                            if *at >= v.started && !self.own_pending.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(OWN_SECS)) {
+                            // A cache from before this visit is the baseline, not news from it.
+                            let during = *at >= v.started;
+                            if during {
+                                v.checks.extend(changes::checks_changed(old, &d));
+                            }
+                            if during && !self.own_pending.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(OWN_SECS)) {
                                 ch = changes::diff_detail(old, &d, me.as_deref(), &self.cfg.bots);
                             }
                         }
@@ -3131,7 +3135,7 @@ impl App {
 
     /// The last page of a load landed: digest what changed since the previous load of the same
     /// query (none for a new scope, state or repo), and persist the baselines.
-    fn finish_list(&mut self) {
+    fn finish_list(&mut self, open_id: Option<&str>) {
         let now: Vec<PrSummary> = self.prs.iter().filter(|p| !self.search.spliced.contains(&p.id)).cloned().collect();
         self.list_complete = now.len() >= self.total;
         let first_of_session = self.list_query.is_empty();
@@ -3159,10 +3163,11 @@ impl App {
         }
         self.list_query = self.loading_query.clone();
         self.own_pending.retain(|_, at| at.elapsed() < Duration::from_secs(OWN_SECS));
-        // "Unread first" re-sorts on each reload (the open PR stays put).
+        // "Unread first" re-sorts on each reload. `sel` is still the previous ordinal here,
+        // so the open PR is the id captured before this load, not `selected_pr()`.
         if self.state.unread_first && !self.unread_only {
-            let open = self.selected_pr().map(|p| p.id.clone()).filter(|_| self.screen == Screen::Detail);
-            self.unread_keep.retain(|id| Some(id) == open.as_ref());
+            let open = open_id.filter(|_| self.screen == Screen::Detail);
+            self.unread_keep.retain(|id| Some(id.as_str()) == open);
         }
         self.save_state();
     }
@@ -3262,7 +3267,7 @@ impl App {
         let Some(d) = self.details.get(&v.id).map(|(d, _)| d) else { return 0 };
         let m = &v.marks;
         // Reviews both tabs show: a verdict, or words (empty COMMENTED ones hold inline comments).
-        let review = |i: &&usize| d.reviews.iter().nth(**i).is_some_and(|r| r.state != "COMMENTED" || !r.body.trim().is_empty());
+        let review = |i: &&usize| d.reviews.iter().nth(**i).is_some_and(|r| r.state != "COMMENTED" || !changes::clean_body(&r.body).trim().is_empty());
         match t {
             Tab::Description => {
                 let edited = v.since.as_ref().is_some_and(|s| d.last_edited_at.is_some() && d.last_edited_at != s.snap.edited_at && !s.snap.updated_at.is_empty());
@@ -3300,18 +3305,22 @@ impl App {
     fn runs_finished(&mut self, id: &str, sha: &str, runs: &[crate::github::WorkflowRunInfo]) {
         let Some(prev) = self.runs.get(id).filter(|e| e.sha == sha) else { return };
         let before: HashMap<u64, &str> = prev.runs.iter().map(|r| (r.id, r.status())).collect();
-        let done: Vec<&crate::github::WorkflowRunInfo> =
-            runs.iter().filter(|r| r.head_sha == sha && r.status() == "completed" && before.get(&r.id).is_some_and(|s| *s != "completed")).collect();
+        // A run that appears already completed was missed between polls; the first load of a head stays quiet.
+        let done: Vec<&crate::github::WorkflowRunInfo> = runs
+            .iter()
+            .filter(|r| r.head_sha == sha && r.status() == "completed" && before.get(&r.id).is_none_or(|s| *s != "completed"))
+            .collect();
         if done.is_empty() {
             return;
         }
         let failed = done.iter().filter(|r| matches!(r.conclusion.as_deref(), Some("failure" | "timed_out" | "startup_failure" | "action_required"))).count();
+        let passed = done.iter().filter(|r| r.conclusion.as_deref() == Some("success")).count();
         if let Some(v) = self.visit.as_mut().filter(|v| v.id == id) {
             v.runs.extend(done.iter().map(|r| r.id));
         }
         if !self.own(id) {
             let prs = self.prs.clone();
-            self.set_digest(&[(id.to_string(), vec![Change::Runs { done: done.len(), failed }])], &prs, false);
+            self.set_digest(&[(id.to_string(), vec![Change::Runs { done: done.len(), failed, passed }])], &prs, false);
         }
     }
 
@@ -3326,7 +3335,11 @@ impl App {
         let Some((ids, text)) = changes::notification(&fresh, prs, me, &self.cfg.notify) else { return };
         let cfg = &self.cfg.notify;
         let em = *self.emission.get_or_insert_with(|| changes::emission(&cfg.desktop, cfg.bell, &|k| std::env::var(k).ok(), tmux_passthrough()));
-        write_raw(&em.bytes(&text));
+        let bytes = em.bytes(&text);
+        if bytes.is_empty() {
+            return;
+        }
+        write_raw(&bytes);
         let now = Instant::now();
         for id in ids {
             self.notified.insert(id, now);
@@ -5193,6 +5206,100 @@ mod change_tests {
         app.handle(msg(run("completed", Some("failure"))));
         assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run failed");
         assert_eq!(app.tab_badge(Tab::Actions).as_deref(), Some("+1"));
+        // Started and finished between two polls: it was never seen in progress.
+        app.digest = None;
+        let mut quick = run("completed", Some("success"));
+        quick.id = 10;
+        app.handle(msg(quick));
+        assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run passed");
+        app.digest = None;
+        let mut cancelled = run("completed", Some("cancelled"));
+        cancelled.id = 11;
+        app.handle(msg(cancelled));
+        assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run finished");
+    }
+
+    #[test]
+    fn unread_first_reload_keeps_the_open_pr_pinned() {
+        let mut app = test_app();
+        let mut list = prs();
+        load(&mut app, list.clone());
+        list[1].comments.total_count = 1;
+        load(&mut app, list.clone());
+        app.run(Action::ToggleUnreadFirst);
+        app.select(0);
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(2));
+        app.screen = Screen::Detail;
+        app.read_open();
+        assert!(app.unread_keep.contains(&list[1].id));
+        app.details.insert(list[1].id.clone(), (detail(&list[1], None), Instant::now()));
+        list[3].comments.total_count = 1;
+        load(&mut app, list.clone());
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(2));
+        assert!(app.unread_keep.contains(&list[1].id));
+        assert!(!app.unread_keep.contains(&list[3].id));
+        assert_eq!(app.prs[app.visible()[0]].number, 2);
+    }
+
+    #[test]
+    fn detail_refresh_keeps_selection_when_unread_first_reorders() {
+        let mut app = test_app();
+        let list = prs();
+        load(&mut app, list.clone());
+        app.run(Action::ToggleUnreadFirst);
+        app.select(1);
+        let mut d = detail(&list[1], None);
+        d.comments.total_count = 3;
+        d.updated_at = "2026-10-19T04:00:00Z".into();
+        app.handle(Msg::Detail { id: list[1].id.clone(), res: Ok((d.clone(), None)) });
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(2));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.visit.as_ref().map(|v| v.id.as_str()), Some(list[1].id.as_str()));
+        d.comments.total_count = 4;
+        d.updated_at = "2026-10-19T05:00:00Z".into();
+        app.handle(Msg::Detail { id: list[1].id.clone(), res: Ok((d, None)) });
+        assert_eq!(app.selected_pr().map(|p| p.number), Some(2));
+        assert_eq!(app.visit.as_ref().map(|v| v.id.as_str()), Some(list[1].id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn checks_from_before_the_visit_are_not_a_badge() {
+        let (mut app, list, mut d) = open_with_news().await;
+        let id = list[0].id.clone();
+        let at = app.details[&id].1;
+        app.visit.as_mut().unwrap().started = at + Duration::from_secs(30);
+        d.status_check_rollup = Some(
+            serde_json::from_value(json!({ "state": "SUCCESS", "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" }
+            ] } }))
+            .unwrap(),
+        );
+        app.handle(Msg::Detail { id: id.clone(), res: Ok((d.clone(), None)) });
+        assert_eq!(app.tab_badge(Tab::Checks), None);
+        let at = app.details[&id].1;
+        app.visit.as_mut().unwrap().started = at.checked_sub(Duration::from_millis(1)).unwrap();
+        d.status_check_rollup = Some(
+            serde_json::from_value(json!({ "state": "SUCCESS", "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+                { "__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS" }
+            ] } }))
+            .unwrap(),
+        );
+        app.handle(Msg::Detail { id, res: Ok((d, None)) });
+        assert_eq!(app.tab_badge(Tab::Checks).as_deref(), Some("+1"));
+    }
+
+    #[tokio::test]
+    async fn html_only_review_does_not_badge() {
+        let (mut app, list, _) = open_with_news().await;
+        let id = list[0].id.clone();
+        let review = serde_json::from_value(json!({
+            "id": "rhtml", "author": { "login": "eve" }, "state": "COMMENTED", "body": "<!-- bot -->", "bodyHTML": "", "submittedAt": "2026-10-19T04:00:00Z"
+        }))
+        .unwrap();
+        app.details.get_mut(&id).unwrap().0.reviews.nodes.push(Some(review));
+        app.visit.as_mut().unwrap().marks.reviews.push(0);
+        assert_eq!(app.tab_badge(Tab::Conversation).as_deref(), Some("+2"));
     }
 
     #[test]

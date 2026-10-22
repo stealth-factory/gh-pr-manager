@@ -685,17 +685,11 @@ impl PrSummary {
         if d.is_read_by_viewer.is_some() {
             self.is_read_by_viewer = d.is_read_by_viewer;
         }
-        // The detail sees direct requests only (not via a team): it can add the flag, never clear it.
-        if me.is_some_and(|me| d.requested(me)) {
-            self.viewer_latest_review_request = Some(Value::Object(Default::default()));
+        // `reviewRequests(first:20)` can miss the viewer. The detail carries the same
+        // viewer-specific field as the list, so a dropped request clears the flag.
+        if me.is_some() {
+            self.viewer_latest_review_request = d.viewer_latest_review_request.clone();
         }
-    }
-}
-
-impl PrDetail {
-    /// `login`'s review is requested directly.
-    pub fn requested(&self, login: &str) -> bool {
-        self.review_requests.iter().filter_map(|r| r.requested_reviewer.as_ref()?.login.as_deref()).any(|l| l.eq_ignore_ascii_case(login))
     }
 }
 
@@ -744,6 +738,9 @@ pub struct PrDetail {
     pub last_edited_at: Option<String>,
     #[serde(default)]
     pub is_read_by_viewer: Option<bool>,
+    /// Viewer-specific, including team and code-owner requests. Not derived from `reviewRequests(first:20)`.
+    #[serde(default)]
+    pub viewer_latest_review_request: Option<Value>,
     /// The last few merge/close/review-request/force-push/ready events, for "merged by alice".
     #[serde(default)]
     pub timeline_items: Nodes<TimelineEvent>,
@@ -1103,6 +1100,7 @@ query($id:ID!) {
     reviewThreads(last:40) { totalCount nodes { isResolved path line
       comments(first:20) { nodes { id author { login } body bodyHTML createdAt } } } }
     lastEditedAt isReadByViewer
+    viewerLatestReviewRequest { asCodeOwner }
     timelineItems(last:5, itemTypes:[MERGED_EVENT, CLOSED_EVENT, REVIEW_REQUESTED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT, READY_FOR_REVIEW_EVENT]) {
       nodes { __typename
         ... on MergedEvent { actor { login } createdAt }

@@ -57,7 +57,7 @@ impl Default for NotifyConfig {
 impl NotifyConfig {
     /// Anything would be emitted at all.
     pub fn enabled(&self) -> bool {
-        !self.events.is_empty() && (self.bell || self.desktop != "off")
+        !self.events.is_empty() && (self.bell || !self.desktop.trim().eq_ignore_ascii_case("off"))
     }
 }
 

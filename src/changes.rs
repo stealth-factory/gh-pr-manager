@@ -67,7 +67,7 @@ impl Snapshot {
             review: d.review_decision.clone(),
             mergeable: Some(d.mergeable.clone()),
             edited_at: d.last_edited_at.clone(),
-            asked_me: me.is_some_and(|me| d.requested(me)),
+            asked_me: d.viewer_latest_review_request.as_ref().is_some_and(|v| !v.is_null()),
             mine: me.is_some_and(|me| login_of(&d.author).eq_ignore_ascii_case(me)),
         }
     }
@@ -119,8 +119,9 @@ pub enum Change {
     Verdict { from: Option<String>, to: String },
     ReviewRequested,
     Mergeable { from: Option<String>, to: String },
-    /// Workflow runs of the head commit finished (the Actions tab's polling); `failed` of them failed.
-    Runs { done: usize, failed: usize },
+    /// Workflow runs of the head commit finished (the Actions tab's polling).
+    /// `passed` of them succeeded; `failed` of them failed. The rest finished some other way.
+    Runs { done: usize, failed: usize, passed: usize },
 }
 
 fn plural(n: usize, one: &str) -> String {
@@ -164,7 +165,8 @@ impl Change {
             Change::Mergeable { to, .. } if to == "CONFLICTING" => "conflicts".into(),
             Change::Mergeable { .. } => "conflicts resolved".into(),
             Change::Runs { failed, .. } if *failed > 0 => format!("{failed} run{} failed", if *failed == 1 { "" } else { "s" }),
-            Change::Runs { done, .. } => format!("{done} run{} passed", if *done == 1 { "" } else { "s" }),
+            Change::Runs { done, passed, .. } if *done > 0 && *passed == *done => format!("{done} run{} passed", if *done == 1 { "" } else { "s" }),
+            Change::Runs { done, .. } => format!("{done} run{} finished", if *done == 1 { "" } else { "s" }),
         }
     }
 
@@ -394,7 +396,7 @@ pub fn diff_detail(old: &PrDetail, new: &PrDetail, me: Option<&str>, bots: &[Str
         .filter(|c| !matches!(c, Change::Comments(_) | Change::Reviews(_) | Change::Threads(_)))
         .collect();
     // Review verdicts show up as `Verdict`; count the reviews that carry words.
-    let reviews = marks.reviews.iter().filter(|&&i| new.reviews.iter().nth(i).is_some_and(|r| r.state != "COMMENTED" || !r.body.trim().is_empty())).count();
+    let reviews = marks.reviews.iter().filter(|&&i| new.reviews.iter().nth(i).is_some_and(|r| r.state != "COMMENTED" || !clean_body(&r.body).trim().is_empty())).count();
     let mut counts = Vec::new();
     if !marks.comments.is_empty() {
         counts.push(Change::Comments(marks.comments.len()));
@@ -521,7 +523,13 @@ pub fn emission(desktop: &str, bell: bool, env: &dyn Fn(&str) -> Option<String>,
     let term_program = env("TERM_PROGRAM").unwrap_or_default().to_lowercase();
     let herdr = term_program == "herdr" || has("HERDR_ENV");
     let tmux = has("TMUX");
-    let desktop = match desktop {
+    let key = desktop.trim().to_ascii_lowercase();
+    // An unrecognised value behaves as `auto` (case doesn't matter). `off` stays off.
+    let key = match key.as_str() {
+        "off" | "auto" | "osc9" | "osc777" | "osc99" => key,
+        _ => "auto".into(),
+    };
+    let desktop = match key.as_str() {
         "auto" => {
             let term = env("TERM").unwrap_or_default();
             let lc = env("LC_TERMINAL").unwrap_or_default().to_lowercase();
@@ -546,6 +554,35 @@ pub fn emission(desktop: &str, bell: bool, env: &dyn Fn(&str) -> Option<String>,
 
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Strip HTML comments and carriage returns from GitHub markdown. A review whose body is only
+/// an HTML comment is not shown, so it is not a badge or a digest entry either.
+pub(crate) fn clean_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        match rest[i..].find("-->") {
+            Some(j) => rest = &rest[i + j + 3..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    let out = out.replace('\r', "");
+    let mut lines: Vec<&str> = Vec::new();
+    for l in out.lines() {
+        if l.trim().is_empty() && lines.last().is_none_or(|p| p.trim().is_empty()) {
+            continue;
+        }
+        lines.push(l);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -788,6 +825,24 @@ mod tests {
     }
 
     #[test]
+    fn absorb_takes_the_viewer_review_request_from_the_detail_field() {
+        let d = det(&[], &[], &[], &[("aaa", "bob")]);
+        let mut p = pr(7, "acme/app", "t", "2026-10-01T00:00:00Z");
+        p.id = d.id.clone();
+        p.viewer_latest_review_request = Some(serde_json::json!({ "asCodeOwner": false }));
+        // The detail lists the viewer in `reviewRequests`, but the viewer field is absent: the flag clears.
+        p.absorb(&d, Some("wiiiimm"));
+        assert!(p.viewer_latest_review_request.is_none());
+        assert!(!Snapshot::of_detail(&d, Some("wiiiimm")).asked_me);
+        let mut asked = d.clone();
+        asked.review_requests.nodes.clear();
+        asked.viewer_latest_review_request = Some(serde_json::json!({ "asCodeOwner": true }));
+        p.absorb(&asked, Some("wiiiimm"));
+        assert!(Snapshot::of_summary(&p, Some("wiiiimm")).asked_me);
+        assert!(Snapshot::of_detail(&asked, Some("wiiiimm")).asked_me);
+    }
+
+    #[test]
     fn new_marks_by_time_exclude_viewer_and_bots() {
         let since = Snapshot { updated_at: "2026-10-19T05:00:00Z".into(), head: "bbb".into(), commits: 2, ..Snapshot::default() };
         let d = det(
@@ -851,6 +906,15 @@ mod tests {
     }
 
     #[test]
+    fn html_only_commented_review_is_not_a_change() {
+        let old = det(&[], &[], &[], &[("aaa", "bob")]);
+        let mut new = det(&[], &[("r1", "carol", "COMMENTED", "2026-10-19T10:00:00Z")], &[], &[("aaa", "bob")]);
+        new.reviews.nodes[0].as_mut().unwrap().body = "<!-- bot -->".into();
+        let ch = diff_detail(&old, &new, Some("wiiiimm"), &bots());
+        assert!(ch.iter().all(|c| !matches!(c, Change::Reviews(_))), "{ch:?}");
+    }
+
+    #[test]
     fn checks_changed_skips_pending() {
         let ctx = |name: &str, status: &str, concl: Option<&str>| serde_json::json!({ "__typename": "CheckRun", "name": name, "status": status, "conclusion": concl });
         let mut old = det(&[], &[], &[], &[("aaa", "bob")]);
@@ -867,7 +931,9 @@ mod tests {
         assert_eq!(Change::Comments(2).words(), "2 new comments");
         assert_eq!(Change::Commits { n: 3, head: String::new(), force: false }.words(), "3 commits pushed");
         assert_eq!(Change::Ci { from: None, to: "FAILURE".into() }.words(), "CI failed");
-        assert_eq!(Change::Runs { done: 2, failed: 1 }.label(), "1 run failed");
+        assert_eq!(Change::Runs { done: 2, failed: 1, passed: 1 }.label(), "1 run failed");
+        assert_eq!(Change::Runs { done: 2, failed: 0, passed: 2 }.label(), "2 runs passed");
+        assert_eq!(Change::Runs { done: 1, failed: 0, passed: 0 }.label(), "1 run finished");
     }
 
     #[test]
@@ -896,6 +962,14 @@ mod tests {
         let t = e("auto", false, &[("TMUX", "/tmp/t,1,0"), ("LC_TERMINAL", "iTerm2")], true);
         assert!(t.tmux && t.bytes("x").starts_with("\x1bPtmux;"));
         assert_eq!(e("osc777", false, &[("TERM_PROGRAM", "herdr")], false).desktop, Some(Desktop::Osc777));
+        assert_eq!(e("OSC9", false, &[], false).desktop, Some(Desktop::Osc9));
+        assert_eq!(e("on", false, &[("TERM_PROGRAM", "iTerm.app")], false).desktop, Some(Desktop::Osc9));
+        assert_eq!(e("  OFF ", false, &[], false), Emission { bell: false, desktop: None, tmux: false });
+        let mut cfg = NotifyConfig::default();
+        cfg.desktop = "OFF".into();
+        assert!(!cfg.enabled());
+        cfg.desktop = "OSC9".into();
+        assert!(cfg.enabled());
         assert_eq!(Emission { bell: true, desktop: None, tmux: false }.bytes("x"), "\x07");
     }
 

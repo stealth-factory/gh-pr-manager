@@ -18,7 +18,7 @@ use crate::app::{
     Action, App, ComposeKind, DetailRow, Focus, Hits, Item, LogView, Marks, Modal, RepoItem, Screen, Tab, ToastKind, TreeNode, repo_items,
     scope_matches, search_items,
 };
-use crate::changes::{Change, NewMarks, Snapshot};
+use crate::changes::{Change, NewMarks, Snapshot, clean_body};
 use crate::search::Command;
 use crate::state::Density;
 use crate::github::{Annotation, FileDiff, Job, PrDetail, PrSummary, Step, TimelineEvent, WorkflowRunInfo, login_of};
@@ -2496,35 +2496,6 @@ fn html_lines(html: &str, w: usize, indent: &str, rows: &mut Vec<DetailRow>, img
     }
     rows.extend(out);
     true
-}
-
-/// Strip HTML comments and carriage returns from GitHub markdown.
-fn clean_body(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find("<!--") {
-        out.push_str(&rest[..i]);
-        match rest[i..].find("-->") {
-            Some(j) => rest = &rest[i + j + 3..],
-            None => {
-                rest = "";
-            }
-        }
-    }
-    out.push_str(rest);
-    let out = out.replace('\r', "");
-    // Collapse runs of blank lines.
-    let mut lines: Vec<&str> = Vec::new();
-    for l in out.lines() {
-        if l.trim().is_empty() && lines.last().is_none_or(|p| p.trim().is_empty()) {
-            continue;
-        }
-        lines.push(l);
-    }
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
 }
 
 /// Very light markdown styling: headings, quotes, code fences, bullets and @mentions.
