@@ -3762,10 +3762,23 @@ impl App {
     fn rebuild_stacks(&mut self) {
         // A detail older than the list may describe a stack since changed or dissolved; of the
         // rest, the newest is applied last so it wins.
-        let mut details: Vec<&(PrDetail, Instant)> =
-            self.details.values().filter(|(d, at)| d.stack.is_some() && self.list_at.is_none_or(|l| *at >= l)).collect();
-        details.sort_by_key(|(_, at)| *at);
-        let details: Vec<&PrDetail> = details.into_iter().map(|(d, _)| d).collect();
+        let mut fresh: Vec<&(PrDetail, Instant)> = self.details.values().filter(|(_, at)| self.list_at.is_none_or(|l| *at >= l)).collect();
+        fresh.sort_by_key(|(_, at)| *at);
+        // Each PR's own latest word on its stack: a newer detail of a member that left (or moved
+        // to another stack) voids an older snapshot that still lists it.
+        let own: HashMap<&str, (Option<&str>, Instant)> = fresh.iter().map(|(d, at)| (d.id.as_str(), (d.stack.as_ref().map(|s| s.id.as_str()), *at))).collect();
+        let details: Vec<&PrDetail> = fresh
+            .iter()
+            .filter(|(d, at)| {
+                d.stack.as_ref().is_some_and(|s| {
+                    s.entries
+                        .iter()
+                        .filter_map(|e| e.pull_request.as_ref())
+                        .all(|p| own.get(p.id.as_str()).is_none_or(|(sid, t)| t <= at || *sid == Some(s.id.as_str())))
+                })
+            })
+            .map(|(d, _)| d)
+            .collect();
         let db = &self.default_branches;
         // Unknown default branch: `main` / `master` count as trunks (so a `main → release` PR
         // never becomes everyone's parent).
@@ -6237,8 +6250,12 @@ mod stack_tests {
         app.rebuild_stacks();
         let state7 = |app: &App| app.stacks[0].members.iter().find(|m| m.number == 7).map(|m| m.state.clone());
         assert_eq!(state7(&app).as_deref(), Some("MERGED"));
+        // #3 has since left the stack: its newer detail voids the snapshots that still list it.
+        app.details.insert(list[2].id.clone(), (detail(&list[2], None), now + Duration::from_secs(2)));
+        app.rebuild_stacks();
+        assert_eq!(state7(&app), None);
         // A list loaded since both describes the stack from its own rows until a detail is refetched.
-        app.last_refresh = now + Duration::from_secs(2);
+        app.last_refresh = now + Duration::from_secs(3);
         load(&mut app, list);
         assert_eq!(state7(&app), None);
         assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
@@ -6254,6 +6271,11 @@ mod stack_tests {
         p.base_ref_name = "d".into();
         app.handle(Msg::Detail { id: p.id.clone(), res: Ok((detail(&p, None), None)) });
         assert_eq!(app.chip(&p.id), Some((5, 5, false)));
+        // #1's head branch renamed: #2 no longer sits on it, so #1 leaves the chain.
+        let mut one = app.prs.iter().find(|p| p.number == 1).unwrap().clone();
+        one.head_ref_name = "a2".into();
+        app.handle(Msg::Detail { id: one.id.clone(), res: Ok((detail(&one, None), None)) });
+        assert!(app.chip(&one.id).is_none());
     }
 
     #[tokio::test]

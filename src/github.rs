@@ -977,6 +977,7 @@ impl PrSummary {
             self.mergeable = Some(d.mergeable.clone());
         }
         self.last_edited_at = d.last_edited_at.clone();
+        self.head_ref_name = d.head_ref_name.clone();
         self.base_ref_name = d.base_ref_name.clone();
         self.stack = d.stack.as_ref().map(|s| StackRef { id: s.id.clone(), number: s.number, size: s.size, base_ref_name: s.base_ref_name.clone() });
         self.stack_entry = d.stack_entry.clone();
