@@ -201,8 +201,54 @@ impl Client {
         struct R {
             node: Option<PrDetail>,
         }
-        let (r, rate): (R, _) = self.graphql(DETAIL_QUERY, json!({ "id": id })).await?;
-        Ok((r.node.ok_or_else(|| anyhow!("pull request not found"))?, rate))
+        let (r, mut rate): (R, _) = self.graphql(DETAIL_QUERY, json!({ "id": id })).await?;
+        let mut detail = r.node.ok_or_else(|| anyhow!("pull request not found"))?;
+        // `entries(first:100)` is the largest page GitHub accepts, not the whole stack.
+        self.load_remaining_stack_entries(&mut detail, &mut rate).await?;
+        Ok((detail, rate))
+    }
+
+    /// Follow `stack.entries` until the reported size is loaded. A stuck or empty page stops
+    /// the walk; there is no member ceiling.
+    async fn load_remaining_stack_entries(&self, detail: &mut PrDetail, rate: &mut Option<RateLimit>) -> Result<()> {
+        let mut previous: Option<String> = None;
+        loop {
+            let after = {
+                let Some(stack) = detail.stack.as_ref() else { return Ok(()) };
+                let Some(after) = stack_page_cursor(stack.size, &stack.entries) else { return Ok(()) };
+                after
+            };
+            if previous.as_ref() == Some(&after) {
+                return Ok(());
+            }
+            previous = Some(after.clone());
+            let (page, page_rate) = self.stack_entries_page(&detail.id, &after).await?;
+            if page_rate.is_some() {
+                *rate = page_rate;
+            }
+            let Some(stack) = detail.stack.as_mut() else { return Ok(()) };
+            if !absorb_stack_page(&mut stack.entries, page) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn stack_entries_page(&self, id: &str, after: &str) -> Result<(StackEntries, Option<RateLimit>)> {
+        #[derive(Deserialize)]
+        struct R {
+            node: Option<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Node {
+            stack: Option<Page>,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            entries: StackEntries,
+        }
+        let (r, rate): (R, _) = self.graphql(STACK_ENTRIES_QUERY, json!({ "id": id, "after": after })).await?;
+        let entries = r.node.and_then(|n| n.stack).map(|s| s.entries).unwrap_or_default();
+        Ok((entries, rate))
     }
 
     /// Changed files with patches (REST; GraphQL has no diffs). Capped at 1000 files.
@@ -783,10 +829,12 @@ pub struct Count {
     pub total_count: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PageInfo {
+    #[serde(default)]
     has_next_page: bool,
+    #[serde(default)]
     end_cursor: Option<String>,
 }
 
@@ -891,7 +939,50 @@ pub struct StackDetail {
     #[serde(default)]
     pub base_ref_name: String,
     #[serde(default)]
-    pub entries: Counted<StackEntry>,
+    pub entries: StackEntries,
+}
+
+/// One connection page of `PullRequest.stack.entries`, including the cursor for the next page.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackEntries {
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    page_info: PageInfo,
+    #[serde(default)]
+    pub nodes: Vec<Option<StackEntry>>,
+}
+
+impl StackEntries {
+    pub fn iter(&self) -> impl Iterator<Item = &StackEntry> {
+        self.nodes.iter().flatten()
+    }
+}
+
+/// Cursor for the next page, when this page does not yet cover the stack's reported size.
+/// `first:100` is GitHub's page size; a stack larger than that still returns a cursor.
+fn stack_page_cursor(size: usize, entries: &StackEntries) -> Option<String> {
+    if !entries.page_info.has_next_page {
+        return None;
+    }
+    let reported = size.max(entries.total_count);
+    if reported > 0 && entries.nodes.len() >= reported {
+        return None;
+    }
+    entries.page_info.end_cursor.clone().filter(|c| !c.is_empty())
+}
+
+/// Append one page. An empty page ends the walk so a cursor that never clears cannot spin.
+fn absorb_stack_page(entries: &mut StackEntries, page: StackEntries) -> bool {
+    if page.nodes.is_empty() {
+        entries.page_info.has_next_page = false;
+        return false;
+    }
+    entries.nodes.extend(page.nodes);
+    entries.total_count = entries.total_count.max(page.total_count);
+    entries.page_info = page.page_info;
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1403,7 +1494,7 @@ query($id:ID!) {
     repository { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission
       mentionableUsers(first:100) { nodes { login } } defaultBranchRef { name } }
     stackEntry { position }
-    stack { id number size baseRefName entries(first:100) { totalCount nodes { position pullRequest {
+    stack { id number size baseRefName entries(first:100) { totalCount pageInfo { hasNextPage endCursor } nodes { position pullRequest {
       id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision
       commits(last:1) { nodes { commit { statusCheckRollup { state } } } } } } } }
     statusCheckRollup { state contexts(first:100) { nodes { __typename
@@ -1424,6 +1515,18 @@ query($id:ID!) {
         ... on ReadyForReviewEvent { actor { login } createdAt }
         ... on ReviewRequestedEvent { actor { login } createdAt }
         ... on HeadRefForcePushedEvent { actor { login } createdAt } } }
+  } }
+}"#;
+
+/// The next page of `stack.entries`. Same node fields as `DETAIL_QUERY`; `first:100` is the page
+/// size, and the caller repeats this until `size` is loaded.
+const STACK_ENTRIES_QUERY: &str = r#"
+query($id:ID!, $after:String!) {
+  rateLimit { remaining limit }
+  node(id:$id) { ... on PullRequest {
+    stack { entries(first:100, after:$after) { totalCount pageInfo { hasNextPage endCursor } nodes { position pullRequest {
+      id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision
+      commits(last:1) { nodes { commit { statusCheckRollup { state } } } } } } } }
   } }
 }"#;
 
@@ -1488,10 +1591,35 @@ mod tests {
         assert!(p.stack.is_none() && p.base_ref_name.is_empty());
     }
 
+    fn stack_entries(n: usize, total: usize, next: Option<&str>) -> StackEntries {
+        let nodes: Vec<Value> = (1..=n).map(|i| json!({ "position": i, "pullRequest": null })).collect();
+        serde_json::from_value(json!({
+            "totalCount": total,
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+            "nodes": nodes
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn detail_query_asks_for_the_whole_stack() {
-        assert!(DETAIL_QUERY.contains("entries(first:100)"));
+    fn detail_query_pages_stack_entries() {
+        assert!(DETAIL_QUERY.contains("entries(first:100) { totalCount pageInfo { hasNextPage endCursor }"));
+        assert!(STACK_ENTRIES_QUERY.contains("entries(first:100, after:$after)"));
+        assert!(STACK_ENTRIES_QUERY.contains("pageInfo { hasNextPage endCursor }"));
         assert!(DETAIL_QUERY.contains("defaultBranchRef { name }"));
+        // A stack of 250 is not finished on the first page of 100.
+        let mut page = stack_entries(100, 250, Some("cursor-1"));
+        assert_eq!(stack_page_cursor(250, &page).as_deref(), Some("cursor-1"));
+        assert!(absorb_stack_page(&mut page, stack_entries(100, 250, Some("cursor-2"))));
+        assert_eq!(stack_page_cursor(250, &page).as_deref(), Some("cursor-2"));
+        assert!(absorb_stack_page(&mut page, stack_entries(50, 250, None)));
+        assert!(stack_page_cursor(250, &page).is_none());
+        assert_eq!(page.nodes.len(), 250);
+        // An empty follow-up ends the walk instead of retrying the same cursor.
+        let mut stuck = stack_entries(100, 400, Some("cursor-stuck"));
+        assert!(!absorb_stack_page(&mut stuck, stack_entries(0, 400, Some("cursor-stuck"))));
+        assert!(stack_page_cursor(400, &stuck).is_none());
+        assert_eq!(stuck.nodes.len(), 100);
     }
 
     #[test]
