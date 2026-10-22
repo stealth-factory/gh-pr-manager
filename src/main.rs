@@ -4,6 +4,7 @@ mod config;
 mod editor;
 mod github;
 mod images;
+mod search;
 mod state;
 mod ui;
 

@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.github.com/graphql";
+/// A stalled read must fail, or a palette search stays in flight for the whole session.
+/// Mutations are not bounded: GitHub can still apply the write after the client gives up.
+const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The only hosts an image request may send the token to.
 const TOKEN_HOSTS: [&str; 3] = ["github.com", "api.github.com", "raw.githubusercontent.com"];
 /// Image downloads larger than this are refused.
@@ -88,28 +92,28 @@ impl Client {
         Ok(resp)
     }
 
-    async fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
-        let resp = self
-            .http
-            .post(ENDPOINT)
-            .bearer_auth(&self.token)
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
-            .await?;
+    async fn post(&self, query: &str, variables: Value, timeout: Option<Duration>) -> Result<(reqwest::StatusCode, Value)> {
+        let mut req = self.http.post(ENDPOINT).bearer_auth(&self.token).json(&json!({ "query": query, "variables": variables }));
+        if let Some(limit) = timeout {
+            req = req.timeout(limit);
+        }
+        let resp = req.send().await?;
         let status = resp.status();
-        let mut body: Value = resp.json().await.with_context(|| format!("HTTP {status}"))?;
-        if let Some(errors) = body.get("errors").and_then(Value::as_array)
-            && !errors.is_empty()
-        {
-            let msgs: Vec<&str> = errors.iter().filter_map(|e| e.get("message").and_then(Value::as_str)).collect();
-            bail!("{}", msgs.join("; "));
-        }
-        if !status.is_success() {
-            let msg = body.get("message").and_then(Value::as_str).unwrap_or("request failed");
-            bail!("HTTP {status}: {msg}");
-        }
-        let mut data = body.get_mut("data").map(Value::take).ok_or_else(|| anyhow!("response has no data"))?;
-        let rate = data.get_mut("rateLimit").map(Value::take).and_then(|v| serde_json::from_value(v).ok());
+        let body: Value = resp.json().await.with_context(|| format!("HTTP {status}"))?;
+        Ok((status, body))
+    }
+
+    async fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
+        let (status, body) = self.post(query, variables, Some(GRAPHQL_TIMEOUT)).await?;
+        let (data, rate) = take_data(status, body, false)?;
+        Ok((serde_json::from_value(data)?, rate))
+    }
+
+    /// Like `graphql`, but keeps `data` when every error is `type: NOT_FOUND` (an aliased
+    /// lookup of a PR number that one of the repos doesn't have).
+    async fn graphql_partial<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
+        let (status, body) = self.post(query, variables, Some(GRAPHQL_TIMEOUT)).await?;
+        let (data, rate) = take_data(status, body, true)?;
         Ok((serde_json::from_value(data)?, rate))
     }
 
@@ -128,8 +132,8 @@ impl Client {
         Ok((Viewer { login: r.viewer.login, orgs }, rate))
     }
 
-    /// Fetch one page of PR search results.
-    pub async fn search_page(&self, query: &str, after: Option<String>) -> Result<SearchPage> {
+    /// Fetch one page (`first` ≤ 100) of PR search results.
+    pub async fn search_page(&self, query: &str, after: Option<String>, first: u32) -> Result<SearchPage> {
         #[derive(Deserialize)]
         struct R {
             search: Search,
@@ -141,7 +145,7 @@ impl Client {
             page_info: PageInfo,
             nodes: Vec<Value>,
         }
-        let (r, rate): (R, _) = self.graphql(SEARCH_QUERY, json!({ "q": query, "after": after })).await?;
+        let (r, rate): (R, _) = self.graphql(SEARCH_QUERY, json!({ "q": query, "after": after, "first": first })).await?;
         // Non-PR nodes come back as `{}`; skip anything that doesn't parse.
         let prs = r.search.nodes.into_iter().filter_map(|n| serde_json::from_value::<PrSummary>(n).ok()).collect();
         let next = if r.search.page_info.has_next_page { r.search.page_info.end_cursor } else { None };
@@ -169,6 +173,27 @@ impl Client {
         let c = r.viewer.repositories;
         let next = if c.page_info.has_next_page { c.page_info.end_cursor } else { None };
         Ok(RepoPage { repos: c.nodes.into_iter().flatten().collect(), total: c.total_count, next, rate })
+    }
+
+    /// Descriptions for up to 100 PR ids (search matches them); ids that no longer resolve are skipped.
+    pub async fn pr_bodies(&self, ids: &[String]) -> Result<(Vec<PrBody>, Option<RateLimit>)> {
+        #[derive(Deserialize)]
+        struct R {
+            nodes: Vec<Option<Value>>,
+        }
+        let (r, rate): (R, _) = self.graphql_partial(BODIES_QUERY, json!({ "ids": ids })).await?;
+        let bodies = r.nodes.into_iter().flatten().filter_map(|n| serde_json::from_value::<PrBody>(n).ok()).collect();
+        Ok((bodies, rate))
+    }
+
+    /// PR `n` in each of `repos` (`owner/name`, at most 12), in one request of aliased lookups.
+    /// Repos without that number are left out.
+    pub async fn prs_by_number(&self, repos: &[String], n: u64) -> Result<(Vec<PrSummary>, Option<RateLimit>)> {
+        if repos.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let (data, rate): (Value, _) = self.graphql_partial(&number_query(repos), json!({ "n": n })).await?;
+        Ok((parse_number_hits(&data, repos.len()), rate))
     }
 
     pub async fn pr_detail(&self, id: &str) -> Result<(PrDetail, Option<RateLimit>)> {
@@ -339,7 +364,8 @@ impl Client {
     }
 
     async fn mutate(&self, query: &str, vars: Value) -> Result<()> {
-        let _: (Value, _) = self.graphql(query, vars).await?;
+        let (status, body) = self.post(query, vars, None).await?;
+        take_data(status, body, false)?;
         Ok(())
     }
 }
@@ -505,6 +531,12 @@ pub struct Nodes<T> {
     pub nodes: Vec<Option<T>>,
 }
 
+impl<T> Default for Nodes<T> {
+    fn default() -> Self {
+        Self { nodes: Vec::new() }
+    }
+}
+
 impl<T> Nodes<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.nodes.iter().flatten()
@@ -575,6 +607,24 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
     pub comments: Count,
     pub commits: Nodes<CommitNode<RollupOnly>>,
+    #[serde(default)]
+    pub head_ref_name: String,
+    #[serde(default)]
+    pub labels: Nodes<LabelName>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LabelName {
+    pub name: String,
+}
+
+/// A PR description, fetched lazily for search.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrBody {
+    pub id: String,
+    pub updated_at: String,
+    pub body: String,
 }
 
 impl PrSummary {
@@ -831,22 +881,84 @@ query($after:String) {
     nodes { nameWithOwner isPrivate pushedAt } } }
 }"#;
 
-const SEARCH_QUERY: &str = r#"
-query($q:String!, $after:String) {
-  rateLimit { remaining limit }
-  search(query:$q, type:ISSUE, first:50, after:$after) {
-    issueCount
-    pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest {
-      id number title url isDraft state updatedAt
+/// The fields of a list row; shared by the search and the by-number lookups.
+macro_rules! pr_fields {
+    () => {
+        "id number title url isDraft state updatedAt
       author { login }
       repository { nameWithOwner }
       reviewDecision
       comments { totalCount }
       commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+      headRefName
+      labels(first:10) { nodes { name } }"
+    };
+}
+
+const SEARCH_QUERY: &str = concat!(
+    r#"
+query($q:String!, $after:String, $first:Int!) {
+  rateLimit { remaining limit }
+  search(query:$q, type:ISSUE, first:$first, after:$after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      "#,
+    pr_fields!(),
+    r#"
     } }
   }
-}"#;
+}"#
+);
+
+const BODIES_QUERY: &str = "query($ids:[ID!]!){ rateLimit{remaining limit} nodes(ids:$ids){ ... on PullRequest { id updatedAt body } } }";
+
+/// `r0: repository(owner:"o", name:"n") { nameWithOwner pullRequest(number:$n) { … } } r1: …`
+fn number_query(repos: &[String]) -> String {
+    let mut q = String::from("query($n:Int!) { rateLimit { remaining limit }");
+    for (i, r) in repos.iter().enumerate() {
+        let (owner, name) = r.split_once('/').unwrap_or((r, ""));
+        let lit = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+        q.push_str(&format!(
+            " r{i}: repository(owner:{}, name:{}) {{ nameWithOwner pullRequest(number:$n) {{ {} }} }}",
+            lit(owner),
+            lit(name),
+            pr_fields!()
+        ));
+    }
+    q.push_str(" }");
+    q
+}
+
+/// The PRs in an aliased by-number response, in alias order.
+fn parse_number_hits(data: &Value, n: usize) -> Vec<PrSummary> {
+    (0..n)
+        .filter_map(|i| data.get(format!("r{i}"))?.get("pullRequest").filter(|v| !v.is_null()).cloned())
+        .filter_map(|v| serde_json::from_value::<PrSummary>(v).ok())
+        .collect()
+}
+
+/// Split a GraphQL response into `data` (minus `rateLimit`) and the rate limit. Errors fail it,
+/// except that with `partial` a response whose errors are all `NOT_FOUND` keeps its data.
+fn take_data(status: reqwest::StatusCode, mut body: Value, partial: bool) -> Result<(Value, Option<RateLimit>)> {
+    if let Some(errors) = body.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        let not_found = |e: &Value| e.get("type").and_then(Value::as_str) == Some("NOT_FOUND");
+        let has_data = body.get("data").is_some_and(|d| !d.is_null());
+        if !(partial && has_data && errors.iter().all(not_found)) {
+            let msgs: Vec<&str> = errors.iter().filter_map(|e| e.get("message").and_then(Value::as_str)).collect();
+            bail!("{}", msgs.join("; "));
+        }
+    }
+    if !status.is_success() {
+        let msg = body.get("message").and_then(Value::as_str).unwrap_or("request failed");
+        bail!("HTTP {status}: {msg}");
+    }
+    let mut data = body.get_mut("data").map(Value::take).filter(|d| !d.is_null()).ok_or_else(|| anyhow!("response has no data"))?;
+    let rate = data.get_mut("rateLimit").map(Value::take).and_then(|v| serde_json::from_value(v).ok());
+    Ok((data, rate))
+}
 
 const DETAIL_QUERY: &str = r#"
 query($id:ID!) {
@@ -873,3 +985,46 @@ query($id:ID!) {
     reviewThreads(last:40) { nodes { isResolved path line comments(first:20) { nodes { author { login } body bodyHTML createdAt } } } }
   } }
 }"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_keeps_data_with_not_found_errors() {
+        let body = json!({
+            "data": { "rateLimit": { "remaining": 4999, "limit": 5000 }, "r0": { "nameWithOwner": "a/b", "pullRequest": null }, "r1": null },
+            "errors": [
+                { "type": "NOT_FOUND", "path": ["r0", "pullRequest"], "message": "Could not resolve to a PullRequest with the number of 14." },
+                { "type": "NOT_FOUND", "path": ["r1"], "message": "Could not resolve to a Repository with the name 'a/c'." }
+            ]
+        });
+        let (data, rate) = take_data(reqwest::StatusCode::OK, body.clone(), true).unwrap();
+        assert_eq!(rate.unwrap().remaining, 4999);
+        assert!(data["rateLimit"].is_null());
+        assert!(parse_number_hits(&data, 2).is_empty());
+        // Without `partial` the same response fails.
+        assert!(take_data(reqwest::StatusCode::OK, body, false).is_err());
+        // Any other error fails even with `partial`.
+        let other = json!({ "data": { "r0": null }, "errors": [{ "type": "NOT_FOUND", "message": "x" }, { "type": "FORBIDDEN", "message": "nope" }] });
+        assert_eq!(take_data(reqwest::StatusCode::OK, other, true).unwrap_err().to_string(), "x; nope");
+        let no_data = json!({ "data": null, "errors": [{ "type": "NOT_FOUND", "message": "gone" }] });
+        assert!(take_data(reqwest::StatusCode::OK, no_data, true).is_err());
+    }
+
+    #[test]
+    fn number_query_aliases_each_repo() {
+        let q = number_query(&["acme/one".to_string(), "acme/two".to_string()]);
+        assert!(q.contains(r#"r0: repository(owner:"acme", name:"one")"#), "{q}");
+        assert!(q.contains(r#"r1: repository(owner:"acme", name:"two")"#), "{q}");
+        assert_eq!(q.matches("pullRequest(number:$n)").count(), 2);
+        assert!(q.contains("headRefName"));
+        let pr = json!({ "id": "P1", "number": 14, "title": "t", "url": "u", "isDraft": false, "state": "OPEN", "updatedAt": "2026-01-01T00:00:00Z",
+            "author": null, "repository": { "nameWithOwner": "acme/two" }, "reviewDecision": null, "comments": { "totalCount": 0 },
+            "commits": { "nodes": [] }, "headRefName": "feat", "labels": { "nodes": [{ "name": "bug" }] } });
+        let data = json!({ "r0": { "nameWithOwner": "acme/one", "pullRequest": null }, "r1": { "nameWithOwner": "acme/two", "pullRequest": pr } });
+        let hits = parse_number_hits(&data, 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].number, hits[0].head_ref_name.as_str(), hits[0].labels.iter().next().unwrap().name.as_str()), (14, "feat", "bug"));
+    }
+}

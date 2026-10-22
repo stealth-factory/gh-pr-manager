@@ -23,6 +23,23 @@ pub struct Config {
     pub images: String,
     /// Most terminal rows one inline image may take.
     pub image_max_rows: u16,
+    /// The `/` search palette.
+    pub search: SearchConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Search GitHub while typing; `false` searches only on Ctrl-g (or Enter with no local hits).
+    pub live: bool,
+    /// Fetch PR descriptions in the background so search can match them.
+    pub bodies: bool,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { live: true, bodies: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +62,7 @@ impl Default for Config {
             default_repo: None,
             images: "auto".into(),
             image_max_rows: 20,
+            search: SearchConfig::default(),
         }
     }
 }
