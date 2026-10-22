@@ -374,6 +374,9 @@ impl Client {
     /// A REST call with a JSON body under the stacks API version; the status and body come back
     /// as they are (callers decide what an error is). Records the rate limit like `rest_send`.
     async fn rest_json(&self, method: reqwest::Method, url: &str, body: Option<Value>) -> Result<(reqwest::StatusCode, Value)> {
+        // reqwest has no default timeout: a stalled merge-async poll would hold the PR busy. Only
+        // reads get one; a timed-out mutation may still have happened, so it isn't cut short.
+        let read = method == reqwest::Method::GET;
         let mut req = self
             .http
             .request(method, url)
@@ -383,8 +386,10 @@ impl Client {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        // reqwest has no default timeout: a stalled merge-async poll would hold the PR busy.
-        let resp = req.timeout(GRAPHQL_TIMEOUT).send().await?;
+        if read {
+            req = req.timeout(GRAPHQL_TIMEOUT);
+        }
+        let resp = req.send().await?;
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
         if let (Some(remaining), Some(limit)) = (header("x-ratelimit-remaining"), header("x-ratelimit-limit"))
             && let Ok(mut r) = self.rest_rate.lock()

@@ -694,6 +694,8 @@ pub struct App {
     pub side_state: ListState,
     pub details: HashMap<String, (PrDetail, Instant)>,
     pub detail_loading: HashSet<String>,
+    /// When each in-flight detail request started: its reply is as fresh as that, not as its arrival.
+    detail_asked: HashMap<String, Instant>,
     pub detail_errors: HashMap<String, String>,
     /// Scroll of the active tab's content.
     pub detail_scroll: usize,
@@ -862,6 +864,7 @@ impl App {
             side_state: ListState::default(),
             details: HashMap::new(),
             detail_loading: HashSet::new(),
+            detail_asked: HashMap::new(),
             detail_errors: HashMap::new(),
             detail_scroll: 0,
             info_scroll: 0,
@@ -1033,6 +1036,7 @@ impl App {
         if !self.detail_loading.insert(id.to_string()) {
             return;
         }
+        self.detail_asked.insert(id.to_string(), Instant::now());
         let (client, tx, id) = (self.client.clone(), self.tx.clone(), id.to_string());
         tokio::spawn(async move {
             let res = client.pr_detail(&id).await;
@@ -1765,6 +1769,7 @@ impl App {
             }
             Msg::Detail { id, res } => {
                 self.detail_loading.remove(&id);
+                let asked = self.detail_asked.remove(&id);
                 let keep = self.selected_pr().map(|p| p.id.clone());
                 match res {
                     Ok((d, rate)) => {
@@ -1806,7 +1811,7 @@ impl App {
                             chained |= old.as_ref() != Some(&b.name);
                         }
                         let stacked = chained || d.stack.is_some() || self.membership.contains_key(&id);
-                        self.details.insert(id.clone(), (d, Instant::now()));
+                        self.details.insert(id.clone(), (d, asked.unwrap_or_else(Instant::now)));
                         if stacked {
                             self.rebuild_stacks_keep();
                         }
@@ -6259,6 +6264,28 @@ mod stack_tests {
         load(&mut app, list);
         assert_eq!(state7(&app), None);
         assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn a_detail_asked_for_before_the_list_does_not_override_it() {
+        let mut app = test_app();
+        let mut list = chain();
+        for (i, pos) in [(0usize, 3usize), (2, 2)] {
+            list[i].stack = Some(StackRef { id: "PRS_1".into(), number: 12, size: 3, base_ref_name: "main".into() });
+            list[i].stack_entry = Some(StackEntryRef { position: pos });
+        }
+        let entry = |n: u64, pos: usize| json!({ "position": pos, "pullRequest": { "id": format!("acme/app#{n}"), "number": n, "title": format!("pr {n}"),
+            "state": "OPEN", "headRefName": format!("h{n}"), "baseRefName": "main", "headRefOid": format!("oid{n}") } });
+        let stack = json!({ "id": "PRS_1", "number": 12, "size": 3, "baseRefName": "main", "entries": { "nodes": [entry(7, 1), entry(3, 2), entry(4, 3)] } });
+        // #3's detail was requested, then a list load started and answered before it.
+        let asked = Instant::now();
+        app.detail_asked.insert(list[2].id.clone(), asked);
+        app.last_refresh = asked + Duration::from_secs(1);
+        load(&mut app, list.clone());
+        app.handle(Msg::Detail { id: list[2].id.clone(), res: Ok((detail(&list[2], Some(stack)), None)) });
+        assert_eq!(app.details[&list[2].id].1, asked);
+        // The older snapshot doesn't apply: #7, which only it knew, isn't in the stack.
+        assert!(app.stacks.iter().flat_map(|s| &s.members).all(|m| m.number != 7));
     }
 
     #[tokio::test]
