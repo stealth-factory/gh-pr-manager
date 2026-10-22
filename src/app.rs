@@ -1872,11 +1872,15 @@ impl App {
             Msg::Files { id, sha, res } => {
                 self.files_loading.remove(&id);
                 let head = self.details.get(&id).map(|(d, _)| d.head_ref_oid.clone());
+                // The Stack tab asks for a member at the head its stack reports, which can be
+                // newer than that member's own cached detail.
+                let stack_head = self.stacks.iter().find_map(|s| s.member(&id)).map(|m| m.head_oid.as_str()).filter(|h| !h.is_empty());
                 // The request captured the head it was started for. A newer head can land
                 // while it is in flight, and `files_loading` stops that newer fetch from
                 // starting. Drop the stale reply and fetch the head now on screen.
-                if !files_match_head(head.as_deref(), &sha) {
+                if !files_match_head(head.as_deref(), &sha) && stack_head != Some(sha.as_str()) {
                     self.ensure_files(false);
+                    self.ensure_stack_data();
                     return;
                 }
                 match res {
@@ -6289,6 +6293,29 @@ mod stack_tests {
         assert_eq!(app.details[&list[2].id].1, asked);
         // Neither its snapshot nor its row update applies: the list's view of the stack stands.
         assert_eq!(app.stacks[0].members.iter().map(|m| m.number).collect::<Vec<_>>(), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn stack_tab_files_follow_the_stack_head() {
+        let mut app = test_app();
+        let mut list = chain();
+        for (i, pos) in [(0usize, 3usize), (2, 2)] {
+            list[i].stack = Some(StackRef { id: "PRS_1".into(), number: 12, size: 3, base_ref_name: "main".into() });
+            list[i].stack_entry = Some(StackEntryRef { position: pos });
+        }
+        load(&mut app, list.clone());
+        let entry = |n: u64, pos: usize, oid: &str| json!({ "position": pos, "pullRequest": { "id": format!("acme/app#{n}"), "number": n, "title": format!("pr {n}"),
+            "state": "OPEN", "headRefName": format!("h{n}"), "baseRefName": "main", "headRefOid": oid } });
+        let stack = json!({ "id": "PRS_1", "number": 12, "size": 3, "baseRefName": "main", "entries": { "nodes": [entry(7, 1, "new7"), entry(3, 2, "oid3"), entry(4, 3, "oid4")] } });
+        // #7's own cached detail predates its latest push, which #3's newer snapshot knows.
+        let now = Instant::now();
+        let mut seven = pr(7, "acme/app", "pr 7", "2026-10-19T00:00:00Z");
+        seven.head_ref_oid = "old7".into();
+        app.details.insert(seven.id.clone(), (detail(&seven, None), now));
+        app.details.insert(list[2].id.clone(), (detail(&list[2], Some(stack)), now + Duration::from_secs(1)));
+        app.rebuild_stacks();
+        app.handle(Msg::Files { id: seven.id.clone(), sha: "new7".into(), res: Ok(Vec::new()) });
+        assert_eq!(app.files.get(&seven.id).map(|f| f.2.as_str()), Some("new7"));
     }
 
     #[tokio::test]
