@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.github.com/graphql";
+/// A stalled read must fail, or a palette search stays in flight for the whole session.
+/// Mutations are not bounded: GitHub can still apply the write after the client gives up.
+const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The only hosts an image request may send the token to.
 const TOKEN_HOSTS: [&str; 3] = ["github.com", "api.github.com", "raw.githubusercontent.com"];
 /// Image downloads larger than this are refused.
@@ -88,21 +92,19 @@ impl Client {
         Ok(resp)
     }
 
-    async fn post(&self, query: &str, variables: Value) -> Result<(reqwest::StatusCode, Value)> {
-        let resp = self
-            .http
-            .post(ENDPOINT)
-            .bearer_auth(&self.token)
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
-            .await?;
+    async fn post(&self, query: &str, variables: Value, timeout: Option<Duration>) -> Result<(reqwest::StatusCode, Value)> {
+        let mut req = self.http.post(ENDPOINT).bearer_auth(&self.token).json(&json!({ "query": query, "variables": variables }));
+        if let Some(limit) = timeout {
+            req = req.timeout(limit);
+        }
+        let resp = req.send().await?;
         let status = resp.status();
         let body: Value = resp.json().await.with_context(|| format!("HTTP {status}"))?;
         Ok((status, body))
     }
 
     async fn graphql<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
-        let (status, body) = self.post(query, variables).await?;
+        let (status, body) = self.post(query, variables, Some(GRAPHQL_TIMEOUT)).await?;
         let (data, rate) = take_data(status, body, false)?;
         Ok((serde_json::from_value(data)?, rate))
     }
@@ -110,7 +112,7 @@ impl Client {
     /// Like `graphql`, but keeps `data` when every error is `type: NOT_FOUND` (an aliased
     /// lookup of a PR number that one of the repos doesn't have).
     async fn graphql_partial<T: DeserializeOwned>(&self, query: &str, variables: Value) -> Result<(T, Option<RateLimit>)> {
-        let (status, body) = self.post(query, variables).await?;
+        let (status, body) = self.post(query, variables, Some(GRAPHQL_TIMEOUT)).await?;
         let (data, rate) = take_data(status, body, true)?;
         Ok((serde_json::from_value(data)?, rate))
     }
@@ -362,7 +364,8 @@ impl Client {
     }
 
     async fn mutate(&self, query: &str, vars: Value) -> Result<()> {
-        let _: (Value, _) = self.graphql(query, vars).await?;
+        let (status, body) = self.post(query, vars, None).await?;
+        take_data(status, body, false)?;
         Ok(())
     }
 }
