@@ -354,9 +354,9 @@ pub struct Visit {
     pub started: Instant,
     pub since: Option<Seen>,
     pub marks: NewMarks,
-    /// Checks whose outcome changed, and runs that finished, while it was open.
+    /// Checks whose outcome changed, and workflow runs `(id, attempt)` that finished, while it was open.
     pub checks: HashSet<String>,
-    pub runs: HashSet<u64>,
+    pub runs: HashSet<(u64, u64)>,
     /// Badge totals already shown, per tab (`SetTab`, `n`/`p`).
     pub ack: HashMap<Tab, usize>,
     /// The detail last taken as read (its fetch time).
@@ -3301,14 +3301,18 @@ impl App {
     }
 
     /// Workflow runs of PR `id`'s head that finished since its last runs load: the Actions
-    /// badge, and the digest.
+    /// badge, and the digest. A re-run keeps the run id and bumps `run_attempt`.
     fn runs_finished(&mut self, id: &str, sha: &str, runs: &[crate::github::WorkflowRunInfo]) {
         let Some(prev) = self.runs.get(id).filter(|e| e.sha == sha) else { return };
-        let before: HashMap<u64, &str> = prev.runs.iter().map(|r| (r.id, r.status())).collect();
+        let before: HashMap<u64, (&str, u64)> = prev.runs.iter().map(|r| (r.id, (r.status(), r.run_attempt))).collect();
         // A run that appears already completed was missed between polls; the first load of a head stays quiet.
         let done: Vec<&crate::github::WorkflowRunInfo> = runs
             .iter()
-            .filter(|r| r.head_sha == sha && r.status() == "completed" && before.get(&r.id).is_none_or(|s| *s != "completed"))
+            .filter(|r| {
+                r.head_sha == sha
+                    && r.status() == "completed"
+                    && before.get(&r.id).is_none_or(|(status, attempt)| *status != "completed" || *attempt < r.run_attempt)
+            })
             .collect();
         if done.is_empty() {
             return;
@@ -3316,7 +3320,7 @@ impl App {
         let failed = done.iter().filter(|r| matches!(r.conclusion.as_deref(), Some("failure" | "timed_out" | "startup_failure" | "action_required"))).count();
         let passed = done.iter().filter(|r| r.conclusion.as_deref() == Some("success")).count();
         if let Some(v) = self.visit.as_mut().filter(|v| v.id == id) {
-            v.runs.extend(done.iter().map(|r| r.id));
+            v.runs.extend(done.iter().map(|r| (r.id, r.run_attempt)));
         }
         if !self.own(id) {
             let prs = self.prs.clone();
@@ -5206,6 +5210,17 @@ mod change_tests {
         app.handle(msg(run("completed", Some("failure"))));
         assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run failed");
         assert_eq!(app.tab_badge(Tab::Actions).as_deref(), Some("+1"));
+        // A completed re-run keeps the run id and raises the attempt.
+        app.digest = None;
+        let mut again = run("completed", Some("success"));
+        again.run_attempt = 2;
+        app.handle(msg(again.clone()));
+        assert_eq!(app.digest.as_ref().unwrap().items[0].1, "#1 1 run passed");
+        assert_eq!(app.tab_badge(Tab::Actions).as_deref(), Some("+2"));
+        app.digest = None;
+        app.handle(msg(again));
+        assert!(app.digest.is_none());
+        assert_eq!(app.tab_badge(Tab::Actions).as_deref(), Some("+2"));
         // Started and finished between two polls: it was never seen in progress.
         app.digest = None;
         let mut quick = run("completed", Some("success"));
@@ -5300,6 +5315,27 @@ mod change_tests {
         app.details.get_mut(&id).unwrap().0.reviews.nodes.push(Some(review));
         app.visit.as_mut().unwrap().marks.reviews.push(0);
         assert_eq!(app.tab_badge(Tab::Conversation).as_deref(), Some("+2"));
+    }
+
+    #[tokio::test]
+    async fn empty_approval_is_a_reviews_jump_target() {
+        let (mut app, list, _) = open_with_news().await;
+        let id = list[0].id.clone();
+        let review = serde_json::from_value(json!({
+            "id": "rappr", "author": { "login": "eve" }, "state": "APPROVED", "body": "", "bodyHTML": "", "submittedAt": "2026-10-19T04:00:00Z"
+        }))
+        .unwrap();
+        app.details.get_mut(&id).unwrap().0.reviews.nodes.push(Some(review));
+        app.visit.as_mut().unwrap().marks.reviews.push(0);
+        assert_eq!(app.tab_badge(Tab::Reviews).as_deref(), Some("+1"));
+        app.tab = Tab::Reviews;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = (0..24).map(|y| (0..120).map(|x| term.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("1 new since you last looked"), "{text}");
+        assert_eq!(app.hits.new_rows.len(), 1, "{:?}", app.hits.new_rows);
+        key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.new_cursor.map(|c| c.0), Some(0));
     }
 
     #[test]

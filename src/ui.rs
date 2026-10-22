@@ -2043,39 +2043,48 @@ fn conversation_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &m
 fn reviews_lines(d: &PrDetail, w: usize, rows: &mut Vec<DetailRow>, img: &mut Imgs, news: Option<News>) {
     let empty = NewMarks::default();
     let marks = news.map_or(&empty, |n| n.marks);
-    // Latest verdict per reviewer (and whether it's new): a later COMMENTED doesn't override an approval.
-    let mut latest: Vec<(String, String, bool)> = Vec::new();
+    // Latest verdict per reviewer: a later COMMENTED doesn't override an approval.
+    // `bare` is a new verdict with no summary text, so this row is its jump target.
+    let mut latest: Vec<(String, String, bool, bool)> = Vec::new();
     for (i, r) in d.reviews.iter().enumerate() {
         let who = login_of(&r.author).to_string();
         let new = marks.reviews.contains(&i) && r.state != "COMMENTED";
+        let bare = new && clean_body(&r.body).trim().is_empty();
         match latest.iter_mut().find(|(a, ..)| *a == who) {
-            Some(e) if r.state != "COMMENTED" => *e = (who, r.state.clone(), new),
+            Some(e) if r.state != "COMMENTED" => *e = (who, r.state.clone(), new, bare),
             Some(_) => {}
-            None => latest.push((who, r.state.clone(), new)),
+            None => latest.push((who, r.state.clone(), new, bare)),
         }
     }
     let pending: Vec<_> = d.review_requests.iter().filter_map(|r| r.requested_reviewer.as_ref()).map(|r| r.display()).collect();
+    let with_body: Vec<_> = d.reviews.iter().enumerate().filter(|(_, r)| !clean_body(&r.body).trim().is_empty()).collect();
+    let threads: Vec<_> = d.review_threads.iter().enumerate().collect();
+    // One divider, before the first new entry drawn (a bare verdict, then summaries, then threads).
+    let n_new = with_body.iter().filter(|(i, _)| marks.reviews.contains(i)).count() + latest.iter().filter(|(_, _, _, bare)| *bare).count() + marks.threads.len();
+    let mut divider = Divider::new(n_new);
     rows.push((Line::from(vec![Span::styled("Reviewers", Style::new().bold()), Span::raw("  "), review_span(d.review_decision.as_deref())]), Vec::new()));
     if latest.is_empty() && pending.is_empty() {
         rows.push((Line::styled("  No reviews yet.", Style::new().fg(DIM).italic()), Vec::new()));
     }
-    for (who, state, new) in &latest {
+    for (who, state, new, bare) in &latest {
+        if let Some(n) = divider.mark(*bare).divider {
+            new_divider(rows, n, w);
+        }
         let mut l = vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), review_state_span(state)];
         if *new {
             l.push(Span::raw("  "));
             l.push(Span::styled("NEW", Style::new().fg(NEW).bold()));
         }
+        let at = rows.len();
         rows.push((Line::from(l), Vec::new()));
+        if *bare {
+            tag_new(rows, at);
+        }
     }
     for who in &pending {
         rows.push((Line::from(vec![Span::raw("  "), Span::styled(format!("{who:<28}"), Style::new().fg(Color::Blue)), Span::styled("◔ awaiting review", Style::new().fg(Color::Yellow))]), Vec::new()));
     }
 
-    let with_body: Vec<_> = d.reviews.iter().enumerate().filter(|(_, r)| !clean_body(&r.body).trim().is_empty()).collect();
-    let threads: Vec<_> = d.review_threads.iter().enumerate().collect();
-    // One divider, before the first new entry drawn (summaries come before threads).
-    let n_new = with_body.iter().filter(|(i, _)| marks.reviews.contains(i)).count() + marks.threads.len();
-    let mut divider = Divider::new(n_new);
     if !with_body.is_empty() {
         section(rows, &format!("Review summaries ({})", with_body.len()), w);
         for (i, r) in with_body {
