@@ -425,12 +425,15 @@ jobs:
       - name: Notify the shared APT repository of this published release
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
+          # github.token is not a default shell variable. Name this one
+          # so the comparison below is defined under set -u.
+          DEFAULT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # GITHUB_TOKEN cannot dispatch to another repository. The
           # expression keeps it as the last fallback; refuse that case
           # instead of calling apt-repo with it.
-          if [ "$GH_TOKEN" = "$GITHUB_TOKEN" ]; then
+          if [ "$GH_TOKEN" = "$DEFAULT_TOKEN" ]; then
             echo "::error::Org GitHub App token was not minted and GH_TOKEN is unset. repository_dispatch to stealth-factory/apt-repo needs one of them (Contents write)."
             exit 1
           fi
@@ -487,12 +490,15 @@ jobs:
       - name: Update the shared Homebrew tap
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
+          # github.token is not a default shell variable. Name this one
+          # so the comparison below is defined under set -u.
+          DEFAULT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # GITHUB_TOKEN cannot write stealth-factory/homebrew-tap. The
           # expression keeps it as the last fallback; refuse that case
           # rather than sending the Contents API a token that will 404.
-          if [ "$GH_TOKEN" = "$GITHUB_TOKEN" ]; then
+          if [ "$GH_TOKEN" = "$DEFAULT_TOKEN" ]; then
             echo "::error::Org GitHub App token was not minted and GH_TOKEN is unset. Contents write on stealth-factory/homebrew-tap needs one of them."
             exit 1
           fi
