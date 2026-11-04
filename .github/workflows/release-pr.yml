@@ -31,18 +31,36 @@ jobs:
   prepare:
     runs-on: ubuntu-22.04
     steps:
+      # Mint in this job. An installation token lasts an hour and must not
+      # be passed in from another job.
+      - id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # Push the release branch and open or update its pull request.
+          # workflows: write because the branch is reset from main, so the
+          # force-push can carry workflow files that already landed there.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # The whole history and every tag: the version is computed from
           # the commits since the last one.
           fetch-depth: 0
-          # A user PAT (GH_TOKEN, or RELEASE_TOKEN) is what makes the
-          # release PR an ordinary pull request. Opened with GITHUB_TOKEN
+          # An App installation token makes the release PR an ordinary pull
+          # request, so pull_request workflows run. Opened with GITHUB_TOKEN
           # it is github-actions[bot], and GitHub holds ci for a maintainer
-          # click. Nothing downstream depends on the PAT: tag-release.yml
-          # starts the build with an explicit dispatch rather than relying
-          # on a tag push to trigger one.
-          token: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN || github.token }}
+          # click. GH_TOKEN is the fallback until that secret is removed.
+          # The push goes to the release branch. Every on: push workflow in
+          # this repo is limited to main, so the force-push does not start
+          # one. The commit is not marked [skip ci]: the pull request must
+          # still run ci. tag-release.yml starts the build with an
+          # explicit dispatch rather than a tag push.
+          token: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
 
       - name: Install git-cliff
         run: |
@@ -140,24 +158,40 @@ jobs:
           # And prove the bumped tree is coherent before anyone is asked to
           # merge it. --locked fails if the lock and the manifests disagree,
           # which is the one way this step can go wrong and the one thing
-          # nothing downstream would catch in time if the PAT is unset and
-          # the PR is opened by GITHUB_TOKEN (GitHub then holds ci for
-          # approval). Without this, a bad bump would surface after the
-          # merge had already been tagged, leaving a tag with no release
-          # attached to it.
+          # nothing downstream would catch in time if the App token and
+          # GH_TOKEN are both unset and the PR is opened by GITHUB_TOKEN
+          # (GitHub then holds ci for approval). Without this, a bad bump
+          # would surface after the merge had already been tagged, leaving
+          # a tag with no release attached to it.
           cargo metadata --locked --format-version 1 > /dev/null
           echo "manifests and lock agree at ${NEXT}"
+
+      # Only when the App token was minted and this run will commit. The
+      # PAT and GITHUB_TOKEN fallbacks keep the github-actions[bot]
+      # identity below. A push with nothing to release does not need it.
+      - name: Git identity
+        if: steps.app.outputs.token != '' && steps.next.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(gh api "/users/${SLUG}[bot]" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
 
       - name: Open or update the release PR
         if: steps.next.outputs.release == 'yes'
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
           NEXT: ${{ steps.next.outputs.next }}
         run: |
           set -euo pipefail
           branch="release"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$APP_SLUG" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fi
           git checkout -B "$branch"
           git add CHANGELOG.md Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
@@ -221,10 +255,11 @@ jobs:
             --json number --jq '.[0].number // empty' 2>/dev/null || true)
           # REST, not `gh pr edit` / `gh pr create`. Those two go through
           # GraphQL that asks for the org's login, name and slug, which a
-          # classic PAT with `repo` does not have (`read:org`). The token
-          # that opens this PR as a user is that PAT; git push already
-          # succeeded with it, then `gh pr edit` died, leaving the branch
-          # moved and the PR title stale. /pulls does not ask for the org.
+          # classic PAT with `repo` does not have (`read:org`). The
+          # GH_TOKEN fallback is that PAT; git push already succeeded with
+          # it, then `gh pr edit` died, leaving the branch moved and the
+          # PR title stale. /pulls does not ask for the org. The App token
+          # stays on the same path.
           repo="${GITHUB_REPOSITORY}"
           title="release: v${NEXT}"
           if [ -n "$open" ]; then

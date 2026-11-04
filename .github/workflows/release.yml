@@ -406,13 +406,38 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Mint here, not in publish: the token lasts an hour and this job
+      # needs Contents write on apt-repo, which publish does not.
+      - id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: stealth-factory
+          repositories: apt-repo
+          # repository_dispatch needs Contents write on apt-repo, not Actions.
+          permission-contents: write
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Notify the shared APT repository of this published release
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN }}
-        run: node debian/notify-apt.js
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
+          # github.token is not a default shell variable. Name this one
+          # so the comparison below is defined under set -u.
+          DEFAULT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GITHUB_TOKEN cannot dispatch to another repository. The
+          # expression keeps it as the last fallback; refuse that case
+          # instead of calling apt-repo with it.
+          if [ "$GH_TOKEN" = "$DEFAULT_TOKEN" ]; then
+            echo "::error::Org GitHub App token was not minted and GH_TOKEN is unset. repository_dispatch to stealth-factory/apt-repo needs one of them (Contents write)."
+            exit 1
+          fi
+          node debian/notify-apt.js
 
   homebrew:
     needs: publish
@@ -424,6 +449,18 @@ jobs:
       group: ${{ startsWith(github.ref, 'refs/tags/v') && 'homebrew-tap-gh-pr-manager' || format('homebrew-tap-gh-pr-manager-{0}', github.run_id) }}
       cancel-in-progress: false
     steps:
+      # Mint here. Contents write is on the tap only. The release download
+      # later in this job still uses this repo's GITHUB_TOKEN.
+      - id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: stealth-factory
+          repositories: homebrew-tap
+          permission-contents: write
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -452,11 +489,17 @@ jobs:
 
       - name: Update the shared Homebrew tap
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_TOKEN || github.token }}
+          # github.token is not a default shell variable. Name this one
+          # so the comparison below is defined under set -u.
+          DEFAULT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Set GH_TOKEN or RELEASE_TOKEN with Contents write access to stealth-factory/homebrew-tap"
+          # GITHUB_TOKEN cannot write stealth-factory/homebrew-tap. The
+          # expression keeps it as the last fallback; refuse that case
+          # rather than sending the Contents API a token that will 404.
+          if [ "$GH_TOKEN" = "$DEFAULT_TOKEN" ]; then
+            echo "::error::Org GitHub App token was not minted and GH_TOKEN is unset. Contents write on stealth-factory/homebrew-tap needs one of them."
             exit 1
           fi
           bash homebrew/update-tap.sh "${GITHUB_REF_NAME#v}" homebrew-artifacts
