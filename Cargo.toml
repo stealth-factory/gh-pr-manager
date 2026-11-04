@@ -4,7 +4,7 @@ name = "gh-pr-manager"
 # the release PR; tag-release.yml tags the merge commit `v<this>`; npm,
 # Homebrew and the .deb all take their version from that tag. Never bump it
 # by hand - see docs/releasing.md.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A mouse-friendly terminal UI for browsing and managing GitHub pull requests"
 license = "AGPL-3.0-or-later"
