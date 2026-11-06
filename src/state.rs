@@ -28,6 +28,8 @@ pub struct State {
     pub seen: HashMap<String, Seen>,
     /// Sort unread PRs to the top of the list.
     pub unread_first: bool,
+    /// Keep each stack's PRs together in the list, bottom first (docs/stacks.md).
+    pub group_stacks: bool,
 }
 
 impl Default for State {
@@ -40,6 +42,7 @@ impl Default for State {
             recent_searches: Vec::new(),
             seen: HashMap::new(),
             unread_first: false,
+            group_stacks: true,
         }
     }
 }

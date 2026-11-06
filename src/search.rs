@@ -846,12 +846,20 @@ pub enum Command {
     MarkAllRead,
     UnreadFirst,
     NextNew,
+    StackView,
+    StackPrev,
+    StackNext,
+    StackUpdate,
+    StackLink,
+    StackMerge,
+    StackBrowser,
+    GroupStacks,
     Help,
     Quit,
 }
 
 impl Command {
-    pub const ALL: [Command; 22] = [
+    pub const ALL: [Command; 30] = [
         Command::Comment,
         Command::Merge,
         Command::Approve,
@@ -872,6 +880,14 @@ impl Command {
         Command::MarkAllRead,
         Command::UnreadFirst,
         Command::NextNew,
+        Command::StackView,
+        Command::StackPrev,
+        Command::StackNext,
+        Command::StackUpdate,
+        Command::StackLink,
+        Command::StackMerge,
+        Command::StackBrowser,
+        Command::GroupStacks,
         Command::Help,
         Command::Quit,
     ];
@@ -898,6 +914,14 @@ impl Command {
             Command::MarkAllRead => "Mark all read",
             Command::UnreadFirst => "Sort unread first (on / off)",
             Command::NextNew => "Next new entry (NEW since you last looked)",
+            Command::StackView => "Stack: view",
+            Command::StackPrev => "Stack: previous PR",
+            Command::StackNext => "Stack: next PR",
+            Command::StackUpdate => "Stack: update branch onto parent",
+            Command::StackLink => "Stack: link into a GitHub stack",
+            Command::StackMerge => "Stack: merge up to here…",
+            Command::StackBrowser => "Stack: open on GitHub",
+            Command::GroupStacks => "Group by stack (on / off)",
             Command::Help => "Help",
             Command::Quit => "Quit",
         }
@@ -923,6 +947,13 @@ impl Command {
             Command::MarkAllRead => "U",
             Command::UnreadFirst => "",
             Command::NextNew => "n",
+            Command::StackView => "8",
+            Command::StackPrev => "<",
+            Command::StackNext => ">",
+            Command::StackUpdate => "b",
+            Command::StackLink => "L",
+            Command::StackMerge => "M",
+            Command::StackBrowser | Command::GroupStacks => "",
             Command::Help => "?",
             Command::Quit => "q",
         }
@@ -941,6 +972,13 @@ impl Command {
                 | Command::CopyCheckout
                 | Command::CopyUrl
                 | Command::OnlyRepo
+                | Command::StackView
+                | Command::StackPrev
+                | Command::StackNext
+                | Command::StackUpdate
+                | Command::StackLink
+                | Command::StackMerge
+                | Command::StackBrowser
         )
     }
 }
@@ -1024,6 +1062,10 @@ pub(crate) mod tests {
             last_edited_at: None,
             is_read_by_viewer: None,
             viewer_latest_review_request: None,
+            base_ref_name: "main".into(),
+            is_cross_repository: false,
+            stack: None,
+            stack_entry: None,
         }
     }
 

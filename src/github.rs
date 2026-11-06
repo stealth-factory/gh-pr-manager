@@ -201,8 +201,54 @@ impl Client {
         struct R {
             node: Option<PrDetail>,
         }
-        let (r, rate): (R, _) = self.graphql(DETAIL_QUERY, json!({ "id": id })).await?;
-        Ok((r.node.ok_or_else(|| anyhow!("pull request not found"))?, rate))
+        let (r, mut rate): (R, _) = self.graphql(DETAIL_QUERY, json!({ "id": id })).await?;
+        let mut detail = r.node.ok_or_else(|| anyhow!("pull request not found"))?;
+        // `entries(first:100)` is the largest page GitHub accepts, not the whole stack.
+        self.load_remaining_stack_entries(&mut detail, &mut rate).await?;
+        Ok((detail, rate))
+    }
+
+    /// Follow `stack.entries` until the reported size is loaded. A stuck or empty page stops
+    /// the walk; there is no member ceiling.
+    async fn load_remaining_stack_entries(&self, detail: &mut PrDetail, rate: &mut Option<RateLimit>) -> Result<()> {
+        let mut previous: Option<String> = None;
+        loop {
+            let after = {
+                let Some(stack) = detail.stack.as_ref() else { return Ok(()) };
+                let Some(after) = stack_page_cursor(stack.size, &stack.entries) else { return Ok(()) };
+                after
+            };
+            if previous.as_ref() == Some(&after) {
+                return Ok(());
+            }
+            previous = Some(after.clone());
+            let (page, page_rate) = self.stack_entries_page(&detail.id, &after).await?;
+            if page_rate.is_some() {
+                *rate = page_rate;
+            }
+            let Some(stack) = detail.stack.as_mut() else { return Ok(()) };
+            if !absorb_stack_page(&mut stack.entries, page) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn stack_entries_page(&self, id: &str, after: &str) -> Result<(StackEntries, Option<RateLimit>)> {
+        #[derive(Deserialize)]
+        struct R {
+            node: Option<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Node {
+            stack: Option<Page>,
+        }
+        #[derive(Deserialize)]
+        struct Page {
+            entries: StackEntries,
+        }
+        let (r, rate): (R, _) = self.graphql(STACK_ENTRIES_QUERY, json!({ "id": id, "after": after })).await?;
+        let entries = r.node.and_then(|n| n.stack).map(|s| s.entries).unwrap_or_default();
+        Ok((entries, rate))
     }
 
     /// Changed files with patches (REST; GraphQL has no diffs). Capped at 1000 files.
@@ -368,6 +414,227 @@ impl Client {
         take_data(status, body, false)?;
         Ok(())
     }
+
+    // ---------- stacks (docs/stacks.md) ----------
+
+    /// A REST call with a JSON body under the stacks API version; the status and body come back
+    /// as they are (callers decide what an error is). Records the rate limit like `rest_send`.
+    async fn rest_json(&self, method: reqwest::Method, url: &str, body: Option<Value>) -> Result<(reqwest::StatusCode, Value)> {
+        // reqwest has no default timeout: a stalled merge-async poll would hold the PR busy. Only
+        // reads get one; a timed-out mutation may still have happened, so it isn't cut short.
+        let read = method == reqwest::Method::GET;
+        let mut req = self
+            .http
+            .request(method, url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", STACKS_API_VERSION);
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        if read {
+            req = req.timeout(GRAPHQL_TIMEOUT);
+        }
+        let resp = req.send().await?;
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+        if let (Some(remaining), Some(limit)) = (header("x-ratelimit-remaining"), header("x-ratelimit-limit"))
+            && let Ok(mut r) = self.rest_rate.lock()
+        {
+            *r = Some(RateLimit { remaining, limit });
+        }
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// `aheadBy`/`behindBy` of each `(child head, its base)` pair, in one aliased query.
+    /// Branches that no longer exist (a merged parent's deleted head) are left out.
+    pub async fn compare_links(&self, nwo: &str, pairs: &[(String, String)]) -> Result<(Vec<crate::stacks::Link>, Option<RateLimit>)> {
+        if pairs.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let (data, rate): (Value, _) = self.graphql_partial(&compare_query(nwo, pairs), json!({})).await?;
+        Ok((parse_links(&data, pairs), rate))
+    }
+
+    /// The files of `base...head` (REST compare; the same shape as `pulls/{n}/files`, GitHub
+    /// stops at 300 files).
+    pub async fn compare_files(&self, nwo: &str, base: &str, head: &str) -> Result<Vec<FileDiff>> {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            files: Vec<FileDiff>,
+        }
+        let url = format!("https://api.github.com/repos/{nwo}/compare/{}...{}?per_page=100", path_encode(base), path_encode(head));
+        let r: R = self.rest_get(&url).await?.json().await?;
+        Ok(r.files)
+    }
+
+    /// Bring a PR's branch up to date with its base, refusing if the head moved since `head_oid`.
+    pub async fn update_branch(&self, pr_id: &str, head_oid: &str, method: UpdateMethod) -> Result<()> {
+        self.mutate(
+            "mutation($id:ID!,$oid:GitObjectID,$m:PullRequestBranchUpdateMethod){ updatePullRequestBranch(input:{pullRequestId:$id, expectedHeadOid:$oid, updateMethod:$m}){ clientMutationId } }",
+            json!({ "id": pr_id, "oid": head_oid, "m": method.api_name() }),
+        )
+        .await
+    }
+
+    /// Link open PRs (bottom first) into a native stack; returns the stack's number.
+    pub async fn create_stack(&self, nwo: &str, numbers: &[u64]) -> Result<u64> {
+        let url = format!("https://api.github.com/repos/{nwo}/stacks");
+        let (status, body) = self.rest_json(reqwest::Method::POST, &url, Some(json!({ "pull_requests": numbers }))).await?;
+        parse_created_stack(status, &body)
+    }
+
+    /// Start an asynchronous merge of PR `n` (with its open downstack when it's stacked).
+    pub async fn merge_async(&self, nwo: &str, n: u64, sha: &str, method: MergeMethod) -> Result<MergeJob> {
+        let url = format!("https://api.github.com/repos/{nwo}/pulls/{n}/merge-async");
+        let (status, body) = self.rest_json(reqwest::Method::PUT, &url, Some(merge_async_body(sha, method))).await?;
+        parse_merge_job(status, &body)
+    }
+
+    pub async fn merge_async_status(&self, nwo: &str, n: u64, uuid: &str) -> Result<MergeJob> {
+        let url = format!("https://api.github.com/repos/{nwo}/pulls/{n}/merge-async/{}", path_encode(uuid));
+        let (status, body) = self.rest_json(reqwest::Method::GET, &url, None).await?;
+        parse_merge_job(status, &body)
+    }
+}
+
+/// The stacks and merge-async endpoints are documented under this REST version.
+const STACKS_API_VERSION: &str = "2026-03-10";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMethod {
+    Merge,
+    Rebase,
+}
+
+impl UpdateMethod {
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::Merge => "MERGE",
+            Self::Rebase => "REBASE",
+        }
+    }
+}
+
+/// Update a branch by rebase, falling back to a merge of the base when GitHub refuses the
+/// rebase (`canBeRebased` is false on many chained PRs). Any other failure (network, rate
+/// limit, a moved head) is reported as is, never retried as a merge. `update` runs one attempt.
+pub async fn rebase_or_merge<F, Fut>(update: F) -> Result<String>
+where
+    F: Fn(UpdateMethod) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    match update(UpdateMethod::Rebase).await {
+        Ok(()) => Ok("Branch rebased onto its base".into()),
+        Err(rebase) if !format!("{rebase:#}").to_lowercase().contains("rebase") => Err(rebase.context("couldn't rebase the branch")),
+        Err(rebase) => match update(UpdateMethod::Merge).await {
+            Ok(()) => Ok(format!("Rebase refused ({}); merged the base in instead", first_line(&format!("{rebase:#}")))),
+            Err(merge) => Err(anyhow!("couldn't update the branch: rebase: {}; merge: {}", first_line(&format!("{rebase:#}")), first_line(&format!("{merge:#}")))),
+        },
+    }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or(s)
+}
+
+/// Where an asynchronous merge stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeJob {
+    /// `pending`, `merged`, `enqueued` or `failed`.
+    pub status: String,
+    pub uuid: Option<String>,
+    /// GitHub's message (the failure reason when `failed`).
+    pub message: Option<String>,
+}
+
+fn merge_async_body(sha: &str, method: MergeMethod) -> Value {
+    json!({ "sha": sha, "merge_method": method.api_name().to_lowercase(), "merge_action": "default" })
+}
+
+/// 200 (already done), 202 (accepted) and 409 (one is already pending: keep following it)
+/// carry a job; anything else is an error with GitHub's message.
+fn parse_merge_job(status: reqwest::StatusCode, body: &Value) -> Result<MergeJob> {
+    let ok = status.is_success() || status == reqwest::StatusCode::CONFLICT;
+    let job_status = body.get("status").and_then(Value::as_str);
+    match (ok, job_status) {
+        (true, Some(st)) => {
+            let details = body.get("details");
+            let field = |k: &str| details.and_then(|d| d.get(k)).or_else(|| body.get(k)).and_then(Value::as_str).map(String::from);
+            // A failed job documents its reason under `error`; older replies used `message`.
+            Ok(MergeJob { status: st.to_string(), uuid: field("uuid"), message: field("error").or_else(|| field("message")) })
+        }
+        _ => bail!("{}", rest_error(status, body)),
+    }
+}
+
+/// The stack number from a `POST /stacks` reply.
+fn parse_created_stack(status: reqwest::StatusCode, body: &Value) -> Result<u64> {
+    if !status.is_success() {
+        bail!("{}", rest_error(status, body));
+    }
+    body.get("number").and_then(Value::as_u64).ok_or_else(|| anyhow!("GitHub didn't return the new stack's number"))
+}
+
+/// `HTTP 422: message (detail; detail)`, naming the "stacks not enabled" case plainly.
+fn rest_error(status: reqwest::StatusCode, body: &Value) -> String {
+    let msg = body.get("message").and_then(Value::as_str).unwrap_or("request failed");
+    let details: Vec<String> = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|errs| errs.iter().filter_map(|e| e.as_str().map(String::from).or_else(|| e.get("message").and_then(Value::as_str).map(String::from))).collect())
+        .unwrap_or_default();
+    let all = std::iter::once(msg.to_string()).chain(details.iter().cloned()).collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut out = format!("HTTP {}: {msg}", status.as_u16());
+    if !details.is_empty() {
+        out.push_str(&format!(" ({})", details.join("; ")));
+    }
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY && all.contains("not enabled") {
+        out = format!("Stacked PRs are not enabled for this repository — {out}");
+    }
+    out
+}
+
+/// Percent-encode a path segment, keeping `/` (branch names) readable.
+fn path_encode(s: &str) -> String {
+    s.split('/').map(url_encode).collect::<Vec<_>>().join("/")
+}
+
+/// `l0: ref(qualifiedName:"refs/heads/child") { compare(headRef:"base") { aheadBy behindBy status } } …`
+fn compare_query(nwo: &str, pairs: &[(String, String)]) -> String {
+    let lit = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    let (owner, name) = nwo.split_once('/').unwrap_or((nwo, ""));
+    let mut q = format!("query {{ rateLimit {{ remaining limit }} repository(owner:{}, name:{}) {{", lit(owner), lit(name));
+    for (i, (child, base)) in pairs.iter().enumerate() {
+        q.push_str(&format!(
+            " l{i}: ref(qualifiedName:{}) {{ compare(headRef:{}) {{ aheadBy behindBy status }} }}",
+            lit(&format!("refs/heads/{child}")),
+            lit(base)
+        ));
+    }
+    q.push_str(" } }");
+    q
+}
+
+fn parse_links(data: &Value, pairs: &[(String, String)]) -> Vec<crate::stacks::Link> {
+    let repo = data.get("repository");
+    pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (child, base))| {
+            let c = repo?.get(format!("l{i}"))?.get("compare").filter(|c| !c.is_null())?;
+            let n = |k: &str| c.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+            Some(crate::stacks::Link {
+                child: child.clone(),
+                parent: base.clone(),
+                ahead: n("aheadBy"),
+                behind: n("behindBy"),
+                status: c.get("status").and_then(Value::as_str).unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,10 +829,12 @@ pub struct Count {
     pub total_count: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PageInfo {
+    #[serde(default)]
     has_next_page: bool,
+    #[serde(default)]
     end_cursor: Option<String>,
 }
 
@@ -631,6 +900,128 @@ pub struct PrSummary {
     /// Set while the viewer's review is requested.
     #[serde(default)]
     pub viewer_latest_review_request: Option<Value>,
+    // Stacks (docs/stacks.md).
+    #[serde(default)]
+    pub base_ref_name: String,
+    /// Head branch lives in a fork, so it never chains.
+    #[serde(default)]
+    pub is_cross_repository: bool,
+    /// The native GitHub stack it belongs to, and its 1-based position (1 = bottom).
+    #[serde(default)]
+    pub stack: Option<StackRef>,
+    #[serde(default)]
+    pub stack_entry: Option<StackEntryRef>,
+}
+
+/// `PullRequest.stack` in the list query.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackRef {
+    pub id: String,
+    pub number: u64,
+    pub size: usize,
+    #[serde(default)]
+    pub base_ref_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StackEntryRef {
+    pub position: usize,
+}
+
+/// `PullRequest.stack` in the detail query, with its entries.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackDetail {
+    pub id: String,
+    pub number: u64,
+    pub size: usize,
+    #[serde(default)]
+    pub base_ref_name: String,
+    #[serde(default)]
+    pub entries: StackEntries,
+}
+
+/// One connection page of `PullRequest.stack.entries`, including the cursor for the next page.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackEntries {
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    page_info: PageInfo,
+    #[serde(default)]
+    pub nodes: Vec<Option<StackEntry>>,
+}
+
+impl StackEntries {
+    pub fn iter(&self) -> impl Iterator<Item = &StackEntry> {
+        self.nodes.iter().flatten()
+    }
+}
+
+/// Cursor for the next page, when this page does not yet cover the stack's reported size.
+/// `first:100` is GitHub's page size; a stack larger than that still returns a cursor.
+fn stack_page_cursor(size: usize, entries: &StackEntries) -> Option<String> {
+    if !entries.page_info.has_next_page {
+        return None;
+    }
+    let reported = size.max(entries.total_count);
+    if reported > 0 && entries.nodes.len() >= reported {
+        return None;
+    }
+    entries.page_info.end_cursor.clone().filter(|c| !c.is_empty())
+}
+
+/// Append one page. An empty page ends the walk so a cursor that never clears cannot spin.
+fn absorb_stack_page(entries: &mut StackEntries, page: StackEntries) -> bool {
+    if page.nodes.is_empty() {
+        entries.page_info.has_next_page = false;
+        return false;
+    }
+    entries.nodes.extend(page.nodes);
+    entries.total_count = entries.total_count.max(page.total_count);
+    entries.page_info = page.page_info;
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackEntry {
+    pub position: usize,
+    pub pull_request: Option<StackMemberPr>,
+}
+
+/// The signal fields of a stack member (it may not be in the loaded list).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackMemberPr {
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub head_ref_name: String,
+    #[serde(default)]
+    pub base_ref_name: String,
+    #[serde(default)]
+    pub head_ref_oid: String,
+    #[serde(default)]
+    pub mergeable: Option<String>,
+    #[serde(default)]
+    pub merge_state_status: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub commits: LastCommit,
+}
+
+impl StackMemberPr {
+    pub fn ci_state(&self) -> Option<&str> {
+        self.commits.nodes.iter().flatten().last()?.commit.status_check_rollup.as_ref().map(|r| r.state.as_str())
+    }
 }
 
 /// `commits(last:1)`: the head commit's CI rollup plus the PR's commit count.
@@ -682,6 +1073,10 @@ impl PrSummary {
             self.mergeable = Some(d.mergeable.clone());
         }
         self.last_edited_at = d.last_edited_at.clone();
+        self.head_ref_name = d.head_ref_name.clone();
+        self.base_ref_name = d.base_ref_name.clone();
+        self.stack = d.stack.as_ref().map(|s| StackRef { id: s.id.clone(), number: s.number, size: s.size, base_ref_name: s.base_ref_name.clone() });
+        self.stack_entry = d.stack_entry.clone();
         if d.is_read_by_viewer.is_some() {
             self.is_read_by_viewer = d.is_read_by_viewer;
         }
@@ -744,6 +1139,11 @@ pub struct PrDetail {
     /// The last few merge/close/review-request/force-push/ready events, for "merged by alice".
     #[serde(default)]
     pub timeline_items: Nodes<TimelineEvent>,
+    // Stacks (docs/stacks.md).
+    #[serde(default)]
+    pub stack: Option<StackDetail>,
+    #[serde(default)]
+    pub stack_entry: Option<StackEntryRef>,
 }
 
 impl PrDetail {
@@ -821,6 +1221,8 @@ pub struct DetailRepo {
     pub rebase_merge_allowed: bool,
     pub viewer_permission: Option<String>,
     pub mentionable_users: Nodes<Login>,
+    #[serde(default)]
+    pub default_branch_ref: Option<Named>,
 }
 
 impl DetailRepo {
@@ -1006,7 +1408,8 @@ macro_rules! pr_fields {
       labels(first:10) { nodes { name } }
       reviews { totalCount } reviewThreads { totalCount } reviewRequests { totalCount }
       headRefOid mergeable lastEditedAt isReadByViewer
-      viewerLatestReviewRequest { asCodeOwner }"
+      viewerLatestReviewRequest { asCodeOwner }
+      baseRefName isCrossRepository stack { id number size baseRefName } stackEntry { position }"
     };
 }
 
@@ -1089,7 +1492,11 @@ query($id:ID!) {
       ... on User { login } ... on Bot { login } ... on Mannequin { login } ... on Team { name } } } }
     participants(first:50) { nodes { login } }
     repository { nameWithOwner mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerPermission
-      mentionableUsers(first:100) { nodes { login } } }
+      mentionableUsers(first:100) { nodes { login } } defaultBranchRef { name } }
+    stackEntry { position }
+    stack { id number size baseRefName entries(first:100) { totalCount pageInfo { hasNextPage endCursor } nodes { position pullRequest {
+      id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision
+      commits(last:1) { nodes { commit { statusCheckRollup { state } } } } } } } }
     statusCheckRollup { state contexts(first:100) { nodes { __typename
       ... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { workflow { name } } } }
       ... on StatusContext { context state targetUrl } } } }
@@ -1108,6 +1515,18 @@ query($id:ID!) {
         ... on ReadyForReviewEvent { actor { login } createdAt }
         ... on ReviewRequestedEvent { actor { login } createdAt }
         ... on HeadRefForcePushedEvent { actor { login } createdAt } } }
+  } }
+}"#;
+
+/// The next page of `stack.entries`. Same node fields as `DETAIL_QUERY`; `first:100` is the page
+/// size, and the caller repeats this until `size` is loaded.
+const STACK_ENTRIES_QUERY: &str = r#"
+query($id:ID!, $after:String!) {
+  rateLimit { remaining limit }
+  node(id:$id) { ... on PullRequest {
+    stack { entries(first:100, after:$after) { totalCount pageInfo { hasNextPage endCursor } nodes { position pullRequest {
+      id number title state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision
+      commits(last:1) { nodes { commit { statusCheckRollup { state } } } } } } } }
   } }
 }"#;
 
@@ -1151,5 +1570,136 @@ mod tests {
         let hits = parse_number_hits(&data, 2);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].number, hits[0].head_ref_name.as_str(), hits[0].labels.iter().next().unwrap().name.as_str()), (14, "feat", "bug"));
+    }
+
+    #[test]
+    fn list_rows_carry_stack_fields() {
+        assert!(SEARCH_QUERY.contains("stack { id number size baseRefName } stackEntry { position }"));
+        assert!(SEARCH_QUERY.contains("first:$first"));
+        assert!(!SEARCH_QUERY.contains("entries("), "entries in the list query would double its cost");
+        let pr = json!({ "id": "P2", "number": 194, "title": "t", "url": "u", "isDraft": false, "state": "MERGED", "updatedAt": "2026-09-12T11:53:37Z",
+            "author": null, "repository": { "nameWithOwner": "stealth-factory/opscope" }, "reviewDecision": null, "comments": { "totalCount": 0 },
+            "commits": { "nodes": [] }, "headRefName": "feature/ops-98", "baseRefName": "feature/ops-96", "isCrossRepository": false,
+            "stack": { "id": "PRS_kwDOT3dPIs4AEFq1", "number": 196, "size": 2, "baseRefName": "main" }, "stackEntry": { "position": 2 } });
+        let p: PrSummary = serde_json::from_value(pr).unwrap();
+        assert_eq!((p.stack.as_ref().unwrap().number, p.stack.as_ref().unwrap().size, p.stack_entry.as_ref().unwrap().position), (196, 2, 2));
+        assert_eq!(p.base_ref_name, "feature/ops-96");
+        // An unstacked row (stack: null) and an old shape without the fields both parse.
+        let plain = json!({ "id": "P1", "number": 1, "title": "t", "url": "u", "isDraft": false, "state": "OPEN", "updatedAt": "x",
+            "author": null, "repository": { "nameWithOwner": "a/b" }, "reviewDecision": null, "comments": { "totalCount": 0 }, "commits": { "nodes": [] }, "stack": null });
+        let p: PrSummary = serde_json::from_value(plain).unwrap();
+        assert!(p.stack.is_none() && p.base_ref_name.is_empty());
+    }
+
+    fn stack_entries(n: usize, total: usize, next: Option<&str>) -> StackEntries {
+        let nodes: Vec<Value> = (1..=n).map(|i| json!({ "position": i, "pullRequest": null })).collect();
+        serde_json::from_value(json!({
+            "totalCount": total,
+            "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+            "nodes": nodes
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn detail_query_pages_stack_entries() {
+        assert!(DETAIL_QUERY.contains("entries(first:100) { totalCount pageInfo { hasNextPage endCursor }"));
+        assert!(STACK_ENTRIES_QUERY.contains("entries(first:100, after:$after)"));
+        assert!(STACK_ENTRIES_QUERY.contains("pageInfo { hasNextPage endCursor }"));
+        assert!(DETAIL_QUERY.contains("defaultBranchRef { name }"));
+        // A stack of 250 is not finished on the first page of 100.
+        let mut page = stack_entries(100, 250, Some("cursor-1"));
+        assert_eq!(stack_page_cursor(250, &page).as_deref(), Some("cursor-1"));
+        assert!(absorb_stack_page(&mut page, stack_entries(100, 250, Some("cursor-2"))));
+        assert_eq!(stack_page_cursor(250, &page).as_deref(), Some("cursor-2"));
+        assert!(absorb_stack_page(&mut page, stack_entries(50, 250, None)));
+        assert!(stack_page_cursor(250, &page).is_none());
+        assert_eq!(page.nodes.len(), 250);
+        // An empty follow-up ends the walk instead of retrying the same cursor.
+        let mut stuck = stack_entries(100, 400, Some("cursor-stuck"));
+        assert!(!absorb_stack_page(&mut stuck, stack_entries(0, 400, Some("cursor-stuck"))));
+        assert!(stack_page_cursor(400, &stuck).is_none());
+        assert_eq!(stuck.nodes.len(), 100);
+    }
+
+    #[test]
+    fn compare_links_query_and_parse() {
+        let pairs = vec![("feat/universal-search".to_string(), "feat/release".to_string()), ("feat/gone".to_string(), "feat/universal-search".to_string())];
+        let q = compare_query("stealth-factory/gh-pr-manager", &pairs);
+        assert!(q.contains(r#"repository(owner:"stealth-factory", name:"gh-pr-manager")"#), "{q}");
+        assert!(q.contains(r#"l0: ref(qualifiedName:"refs/heads/feat/universal-search") { compare(headRef:"feat/release") { aheadBy behindBy status } }"#), "{q}");
+        assert!(q.contains("l1: ref("));
+        // As GitHub answered for #2 of the chain; l1's branch was deleted (NOT_FOUND, null).
+        let data = json!({ "repository": { "l0": { "compare": { "aheadBy": 2, "behindBy": 1, "status": "DIVERGED" } }, "l1": null } });
+        let links = parse_links(&data, &pairs);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].child.as_str(), links[0].parent.as_str(), links[0].ahead, links[0].behind), ("feat/universal-search", "feat/release", 2, 1));
+        assert_eq!(crate::stacks::needs_rebase(&links, "feat/universal-search"), Some(2));
+    }
+
+    #[test]
+    fn path_encoding_keeps_slashes() {
+        assert_eq!(path_encode("feat/a b#1"), "feat/a%20b%231");
+    }
+
+    #[test]
+    fn merge_async_replies() {
+        use reqwest::StatusCode as S;
+        let body = merge_async_body("abc", MergeMethod::Squash);
+        assert_eq!(body, json!({ "sha": "abc", "merge_method": "squash", "merge_action": "default" }));
+        let pending = json!({ "status": "pending", "details": { "message": "Merge request accepted", "uuid": "u-1", "merge_method": "squash",
+            "merge_action": "default", "expected_head_sha": "abc" } });
+        assert_eq!(parse_merge_job(S::ACCEPTED, &pending).unwrap(), MergeJob { status: "pending".into(), uuid: Some("u-1".into()), message: Some("Merge request accepted".into()) });
+        // 409: another request is pending; follow its uuid.
+        assert_eq!(parse_merge_job(S::CONFLICT, &pending).unwrap().uuid.as_deref(), Some("u-1"));
+        let merged = json!({ "status": "merged", "details": { "message": "Pull request merged", "sha": "def" } });
+        assert_eq!(parse_merge_job(S::OK, &merged).unwrap().status, "merged");
+        let failed = json!({ "status": "failed", "details": { "message": "Required status check \"ci\" is failing" } });
+        let job = parse_merge_job(S::OK, &failed).unwrap();
+        assert_eq!(crate::stacks::merge_step(&job, std::time::Duration::ZERO), crate::stacks::MergeStep::Failed("Required status check \"ci\" is failing".into()));
+        // The documented shape: `details.error`.
+        let failed = json!({ "status": "failed", "details": { "uuid": "u-1", "error": "Merge conflict" } });
+        assert_eq!(parse_merge_job(S::OK, &failed).unwrap().message.as_deref(), Some("Merge conflict"));
+        let draft = json!({ "message": "Pull request is in draft state", "documentation_url": "x" });
+        assert_eq!(parse_merge_job(S::BAD_REQUEST, &draft).unwrap_err().to_string(), "HTTP 400: Pull request is in draft state");
+    }
+
+    #[test]
+    fn create_stack_replies() {
+        use reqwest::StatusCode as S;
+        assert_eq!(parse_created_stack(S::CREATED, &json!({ "id": 1, "number": 201, "base": { "ref": "main" }, "open": true })).unwrap(), 201);
+        let not_enabled = json!({ "message": "Validation Failed", "errors": [{ "message": "Stacked pull requests are not enabled for this repository" }] });
+        let e = parse_created_stack(S::UNPROCESSABLE_ENTITY, &not_enabled).unwrap_err().to_string();
+        assert!(e.starts_with("Stacked PRs are not enabled for this repository"), "{e}");
+        assert!(e.contains("HTTP 422: Validation Failed (Stacked pull requests are not enabled"), "{e}");
+        let gap = json!({ "message": "Validation Failed", "errors": ["Pull request #3 base ref does not match the head ref of #2"] });
+        assert_eq!(parse_created_stack(S::UNPROCESSABLE_ENTITY, &gap).unwrap_err().to_string(), "HTTP 422: Validation Failed (Pull request #3 base ref does not match the head ref of #2)");
+        assert!(parse_created_stack(S::CREATED, &json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn update_branch_falls_back_to_merge() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let msg = rebase_or_merge(|m| {
+            calls.lock().unwrap().push(m);
+            async move { if m == UpdateMethod::Rebase { Err(anyhow!("Rebase not possible: merge conflict")) } else { Ok(()) } }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![UpdateMethod::Rebase, UpdateMethod::Merge]);
+        assert_eq!(msg, "Rebase refused (Rebase not possible: merge conflict); merged the base in instead");
+        assert_eq!(rebase_or_merge(|_| async { Ok(()) }).await.unwrap(), "Branch rebased onto its base");
+        // Only a refused rebase falls back; anything else is reported without a merge attempt.
+        let calls = std::sync::Mutex::new(Vec::new());
+        let e = rebase_or_merge(|m| {
+            calls.lock().unwrap().push(m);
+            async { Err(anyhow!("head moved")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(format!("{e:#}"), "couldn't rebase the branch: head moved");
+        assert_eq!(*calls.lock().unwrap(), vec![UpdateMethod::Rebase]);
+        let e = rebase_or_merge(|m| async move { Err(anyhow!(if m == UpdateMethod::Rebase { "Rebase not possible" } else { "conflict" })) }).await.unwrap_err();
+        assert_eq!(e.to_string(), "couldn't update the branch: rebase: Rebase not possible; merge: conflict");
     }
 }
